@@ -2,47 +2,73 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
+	flags "github.com/jessevdk/go-flags"
+	"github.com/viant/mcp-protocol/authorization"
+	oauthmeta "github.com/viant/mcp-protocol/oauth2/meta"
 	"github.com/viant/mcp-protocol/schema"
 	"github.com/viant/mcp-toolbox/outlook/mcp"
 	mcpsrv "github.com/viant/mcp/server"
+	serverauth "github.com/viant/mcp/server/auth"
 	"github.com/viant/scy"
+	"github.com/viant/scy/auth/flow"
 	"github.com/viant/scy/cred"
 	_ "github.com/viant/scy/kms/blowfish"
 )
 
-var (
-	addr     = flag.String("addr", ":7788", "HTTP listen address")
-	clientID = flag.String("client-id", envOr("OUTLOOK_CLIENT_ID", ""), "Azure AD application (client) ID")
-	tenantID = flag.String("tenant-id", envOr("OUTLOOK_TENANT_ID", "organizations"), "Tenant ID or 'organizations'")
-	storage  = flag.String("storage", defaultStorageDir(), "Directory for auth records/cache")
-	azureRef = flag.String("azure-ref", envOr("OUTLOOK_AZURE_REF", ""), "scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)")
-)
+// Options defines CLI flags for the Outlook MCP server.
+type Options struct {
+	HTTPAddr       string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
+	ClientID       string `long:"client-id" description:"Azure AD application (client) ID"`
+	TenantID       string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
+	Storage        string `long:"storage" description:"Directory for auth records/cache"`
+	AzureRef       string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
+	Oauth2Config   string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
+	BFFRedirectURI string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
+}
 
 func main() {
-	os.Args = []string{"", "-addr", ":7788", "-storage", "$HOME/.config/mcp-outlook", "-azure-ref", "~/.secret/azure.enc|blowfish://default"}
-	flag.Parse()
-	if *clientID == "" && *azureRef == "" {
+	// Parse flags
+	var opts Options
+	if _, err := flags.NewParser(&opts, flags.Default).Parse(); err != nil {
+		os.Exit(2)
+	}
+	// Apply simple defaults and env fallbacks
+	if opts.Storage == "" {
+		opts.Storage = defaultStorageDir()
+	}
+	if opts.TenantID == "" {
+		opts.TenantID = envOr("OUTLOOK_TENANT_ID", "organizations")
+	}
+	if opts.ClientID == "" {
+		opts.ClientID = envOr("OUTLOOK_CLIENT_ID", "")
+	}
+	if opts.AzureRef == "" {
+		opts.AzureRef = envOr("OUTLOOK_AZURE_REF", "")
+	}
+	if opts.Oauth2Config == "" {
+		opts.Oauth2Config = envOr("OUTLOOK_OAUTH2_CONFIG", "")
+	}
+	if opts.ClientID == "" && opts.AzureRef == "" {
 		log.Fatal("missing --client-id/OUTLOOK_CLIENT_ID (or provide --azure-ref / OUTLOOK_AZURE_REF)")
 	}
 
 	// Derive callback base URL from listen address.
 	baseURL := "http://localhost"
-	if *addr != "" {
-		hostport := *addr
+	if opts.HTTPAddr != "" {
+		hostport := opts.HTTPAddr
 		if hostport[0] == ':' {
 			hostport = "localhost" + hostport
 		}
 		baseURL = "http://" + hostport
 	}
 	// If azure-ref provided, derive missing values from secret (clientID, tenantID).
-	if *azureRef != "" {
-		res := scy.EncodedResource(*azureRef).Decode(context.Background(), cred.Azure{})
+	if opts.AzureRef != "" {
+		res := scy.EncodedResource(opts.AzureRef).Decode(context.Background(), cred.Azure{})
 		sec, err := scy.New().Load(context.Background(), res)
 		if err != nil {
 			log.Fatalf("failed to load azure-ref secret: %v", err)
@@ -51,20 +77,20 @@ func main() {
 		if !ok {
 			log.Fatal("azure-ref secret is not of type cred.Azure (expected JSON with ClientID, TenantID, EncryptedClientSecret)")
 		}
-		if *clientID == "" && az.ClientID != "" {
-			*clientID = az.ClientID
+		if opts.ClientID == "" && az.ClientID != "" {
+			opts.ClientID = az.ClientID
 		}
-		if (*tenantID == "" || *tenantID == "organizations") && az.TenantID != "" {
-			*tenantID = az.TenantID
+		if (opts.TenantID == "" || opts.TenantID == "organizations") && az.TenantID != "" {
+			opts.TenantID = az.TenantID
 		}
 	}
 
 	svc := mcp.NewService(&mcp.Config{
-		ClientID:        *clientID,
-		TenantID:        *tenantID,
-		StorageDir:      strings.Replace(*storage, "$HOME", os.Getenv("HOME"), 1),
+		ClientID:        opts.ClientID,
+		TenantID:        opts.TenantID,
+		StorageDir:      strings.Replace(opts.Storage, "$HOME", os.Getenv("HOME"), 1),
 		CallbackBaseURL: baseURL,
-		AzureRef:        scy.EncodedResource(*azureRef),
+		AzureRef:        scy.EncodedResource(opts.AzureRef),
 	})
 
 	// Protected resource metadata for hosts that support OAuth2 challenge (future use)
@@ -82,22 +108,62 @@ func main() {
 	//
 	//authService, _ := auth.New(&auth.Config{Policy: protected})
 
-	server, err := mcpsrv.New(
+	// Build server options baseline
+	options := []mcpsrv.Option{
 		mcpsrv.WithImplementation(schema.Implementation{Name: "mcp-outlook", Version: "0.1.0"}),
 		mcpsrv.WithNewHandler(mcp.NewHandler(svc)),
-		mcpsrv.WithEndpointAddress(*addr),
+		mcpsrv.WithEndpointAddress(opts.HTTPAddr),
 		mcpsrv.WithRootRedirect(true),
-		//	mcpsrv.WithAuthorizer(authService.Middleware),
-		//	mcpsrv.WithProtectedResourcesHandler(authService.ProtectedResourcesHandler),
+		mcpsrv.WithStreamableURI("/mcp"),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/device/", svc.DeviceHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/pending", svc.PendingListHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/pending/clear", svc.PendingClearHandler()),
-	)
+	}
+
+	// Optional server-level OAuth2
+	if v := strings.TrimSpace(opts.Oauth2Config); v != "" {
+		res := scy.EncodedResource(v).Decode(context.Background(), cred.Oauth2Config{})
+		sec, err := scy.New().Load(context.Background(), res)
+		if err != nil {
+			log.Fatalf("failed to load oauth2config: %v", err)
+		}
+		oc, ok := sec.Target.(*cred.Oauth2Config)
+		if !ok {
+			log.Fatalf("invalid oauth2config secret type")
+		}
+		authPolicy := &authorization.Policy{
+			Global: &authorization.Authorization{ProtectedResourceMetadata: &oauthmeta.ProtectedResourceMetadata{
+				AuthorizationServers: []string{oc.Config.Endpoint.AuthURL},
+			}},
+			// Keep Outlook auth endpoints public; protect /mcp
+			ExcludeURI: "/outlook/auth/",
+		}
+		header := flow.AuthorizationExchangeHeader
+		bff := &serverauth.BackendForFrontend{Client: &oc.Config, AuthorizationExchangeHeader: header}
+		if opts.BFFRedirectURI != "" {
+			bff.RedirectURI = opts.BFFRedirectURI
+		}
+		authSvc, err := serverauth.New(&serverauth.Config{Policy: authPolicy, BackendForFrontend: bff})
+		if err != nil {
+			log.Fatalf("failed to init auth service: %v", err)
+		}
+		options = append(options,
+			mcpsrv.WithAuthorizer(authSvc.Middleware),
+			mcpsrv.WithProtectedResourcesHandler(authSvc.ProtectedResourcesHandler),
+		)
+	}
+
+	server, err := mcpsrv.New(options...)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := server.HTTP(context.Background(), *addr).ListenAndServe(); err != nil {
-		log.Fatal(err)
+	if opts.HTTPAddr != "" {
+		// Enable streamable HTTP so /mcp endpoint is active
+		server.UseStreamableHTTP(true)
+		log.Printf("mcp-outlook listening on HTTP %s (streamable /mcp)", opts.HTTPAddr)
+		if err := server.HTTP(context.Background(), opts.HTTPAddr).ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 

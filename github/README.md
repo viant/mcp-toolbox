@@ -5,5 +5,5 @@ GitHub MCP
 - MCP tools: `github/mcp`
 
 Run:
-  go run ./github/cmd/github-mcp -addr :7789 -client-id YOUR_CLIENT_ID -storage "$HOME/.config/mcp-github"
+  go run ./github/cmd/github-mcp -a :7789 
 

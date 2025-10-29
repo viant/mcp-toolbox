@@ -13,8 +13,8 @@ import (
 	"os"
 	"strings"
 	"sync"
-    "time"
-    "unicode/utf8"
+	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/viant/jsonrpc"
@@ -52,11 +52,11 @@ type Service struct {
 	waitMu  sync.Mutex
 	waiters map[string][]chan struct{}
 
-    // cached tunables
-    tunWaitOnce  sync.Once
-    tunCoolOnce  sync.Once
-    tunWait      time.Duration
-    tunCooldown  time.Duration
+	// cached tunables
+	tunWaitOnce sync.Once
+	tunCoolOnce sync.Once
+	tunWait     time.Duration
+	tunCooldown time.Duration
 }
 
 // treeCacheEntry holds cached tree entries with expiration.
@@ -132,11 +132,14 @@ func (s *Service) tokenKeyRepoOAuth(ns, alias, domain, owner, name, clientID str
 }
 
 // repoKey builds a cache key for a repository scoped to domain/owner/name.
-func (s *Service) repoKey(domain, owner, name string) string {
+func (s *Service) repoKey(ns, domain, owner, name string) string {
 	if domain == "" {
 		domain = "github.com"
 	}
-	return domain + "|" + owner + "|" + name
+	if ns == "" {
+		ns = "default"
+	}
+	return ns + "|" + domain + "|" + owner + "|" + name
 }
 func (s *Service) loadToken(ns, alias, domain string) string {
 	key := s.tokenKey(ns, alias, domain)
@@ -410,7 +413,7 @@ func (s *Service) startDeviceFlow(ctx context.Context, alias, domain string, pro
 			}
 			s.saveToken(ns2, alias, domain, tr.AccessToken)
 			s.clearElicitedAll(alias, domain)
-			s.notifyToken(alias, domain)
+			s.notifyToken(ns2, alias, domain)
 			return tr.AccessToken, nil
 		}
 		if tr.Error == "authorization_pending" || tr.Error == "slow_down" {
@@ -437,7 +440,7 @@ func timeAfterSeconds(n int) <-chan struct{} {
 }
 
 func (s *Service) DeviceHandler() http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		if len(parts) != 4 {
 			http.Error(w, "invalid path", http.StatusBadRequest)
@@ -594,13 +597,13 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		}
 		if owner != "" && repo != "" {
 			s.saveTokenRepo(ns, alias, domain, owner, repo, token, oauthKey)
-			log.Printf("[github] token ingest: saved repo token; alias=%s domain=%s owner=%s repo=%s oauth=%v", alias, domain, owner, repo, oauthKey)
+			log.Printf("[github] token ingest: saved repo token; ns=%s alias=%s domain=%s owner=%s repo=%s oauth=%v", ns, alias, domain, owner, repo, oauthKey)
 		} else {
 			s.saveTokenDomain(ns, alias, domain, token, oauthKey)
-			log.Printf("[github] token ingest: saved domain token; alias=%s domain=%s oauth=%v", alias, domain, oauthKey)
+			log.Printf("[github] token ingest: saved domain token; ns=%s alias=%s domain=%s oauth=%v", ns, alias, domain, oauthKey)
 		}
 		s.clearElicitedAll(alias, domain)
-		s.notifyToken(alias, domain)
+		s.notifyToken(ns, alias, domain)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 	}
@@ -709,7 +712,10 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 					}
 					s.saveToken(ns2, alias, domain, tr.AccessToken)
 					s.clearElicitedAll(alias, domain)
-					s.notifyToken(alias, domain)
+					s.notifyToken(ns2, alias, domain)
+					if serviceDebug() {
+						log.Printf("[github] device flow: saved domain token; ns=%s alias=%s domain=%s", ns2, alias, domain)
+					}
 					return
 				}
 				if tr.Error == "authorization_pending" || tr.Error == "slow_down" {
@@ -803,16 +809,16 @@ func (s *Service) VerifyHandler() http.HandlerFunc {
 			http.Error(w, "verify: default branch: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
-        // Resolve commit tree; tolerate 422 by attempting heads/ prefix and finally skipping
-        if _, err := cli.GetCommitTreeSHA(r.Context(), token, owner, name, def); err != nil {
-            // try heads/def and refs/heads/def implicitly handled inside GetCommitTreeSHA; if still errors, proceed
-            if serviceDebug() {
-                log.Printf("[github] verify: commit/tree check failed for %s/%s@%s: %v; tolerating", owner, name, def, err)
-            }
-        }
-        w.Header().Set("Content-Type", "application/json")
-        _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "defaultBranch": def})
-    }
+		// Resolve commit tree; tolerate 422 by attempting heads/ prefix and finally skipping
+		if _, err := cli.GetCommitTreeSHA(r.Context(), token, owner, name, def); err != nil {
+			// try heads/def and refs/heads/def implicitly handled inside GetCommitTreeSHA; if still errors, proceed
+			if serviceDebug() {
+				log.Printf("[github] verify: commit/tree check failed for %s/%s@%s: %v; tolerating", owner, name, def, err)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "defaultBranch": def})
+	}
 }
 
 // OOBHandler serves a page to collect credentials: bearer token, basic creds, or start device flow.
@@ -1079,45 +1085,47 @@ func (s *Service) sessionOrNamespace(ctx context.Context) string {
 
 // WaitTimeout returns maximum time to wait for credentials; configurable via GITHUB_MCP_WAIT_SECS (default 300s).
 func (s *Service) WaitTimeout() time.Duration {
-    s.tunWaitOnce.Do(func() {
-        if v := strings.TrimSpace(os.Getenv("GITHUB_MCP_WAIT_SECS")); v != "" {
-            if n, err := time.ParseDuration(v + "s"); err == nil {
-                s.tunWait = n
-            }
-        }
-        if s.tunWait == 0 {
-            s.tunWait = 300 * time.Second
-        }
-    })
-    return s.tunWait
+	s.tunWaitOnce.Do(func() {
+		if v := strings.TrimSpace(os.Getenv("GITHUB_MCP_WAIT_SECS")); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil {
+				s.tunWait = n
+			}
+		}
+		if s.tunWait == 0 {
+			s.tunWait = 300 * time.Second
+		}
+	})
+	return s.tunWait
 }
 
 // ElicitCooldown returns cooldown between repeated elicitations; configurable via GITHUB_MCP_ELICIT_COOLDOWN_SECS (default 60s).
 func (s *Service) ElicitCooldown() time.Duration {
-    s.tunCoolOnce.Do(func() {
-        if v := strings.TrimSpace(os.Getenv("GITHUB_MCP_ELICIT_COOLDOWN_SECS")); v != "" {
-            if n, err := time.ParseDuration(v + "s"); err == nil {
-                s.tunCooldown = n
-            }
-        }
-        if s.tunCooldown == 0 {
-            s.tunCooldown = 60 * time.Second
-        }
-    })
-    return s.tunCooldown
+	s.tunCoolOnce.Do(func() {
+		if v := strings.TrimSpace(os.Getenv("GITHUB_MCP_ELICIT_COOLDOWN_SECS")); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil {
+				s.tunCooldown = n
+			}
+		}
+		if s.tunCooldown == 0 {
+			s.tunCooldown = 60 * time.Second
+		}
+	})
+	return s.tunCooldown
 }
 
-func (s *Service) tokenWaitKey(alias, domain string) string { return joinKey("wait", alias, domain) }
+func (s *Service) tokenWaitKey(ns, alias, domain string) string {
+	return joinKey("wait", ns, alias, domain)
+}
 
 // notifyToken wakes any goroutines waiting for a token for (alias,domain).
-func (s *Service) notifyToken(alias, domain string) {
-	key := s.tokenWaitKey(alias, domain)
+func (s *Service) notifyToken(ns, alias, domain string) {
+	key := s.tokenWaitKey(ns, alias, domain)
 	s.waitMu.Lock()
 	lst := s.waiters[key]
 	delete(s.waiters, key)
 	s.waitMu.Unlock()
 	if serviceDebug() {
-		log.Printf("[github] notifyToken alias=%s domain=%s waiters=%d", alias, domain, len(lst))
+		log.Printf("[github] notifyToken ns=%s alias=%s domain=%s waiters=%d", ns, alias, domain, len(lst))
 	}
 	for _, ch := range lst {
 		close(ch)
@@ -1125,10 +1133,10 @@ func (s *Service) notifyToken(alias, domain string) {
 }
 
 func serviceDebug() bool {
-    // Enable debug logs only when GITHUB_MCP_DEBUG is truthy
-    // (any non-empty value other than 0/false)
-    v := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG")))
-    return v != "" && v != "0" && v != "false"
+	// Enable debug logs only when GITHUB_MCP_DEBUG is truthy
+	// (any non-empty value other than 0/false)
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG")))
+	return v != "" && v != "0" && v != "false"
 }
 
 // maybeElicitOnce emits a single OOB prompt per (ns,alias,domain) within a cooldown window.
@@ -1200,7 +1208,7 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	if t := s.loadTokenPreferred(ns, alias, domain, owner, name); t != "" {
 		return true
 	}
-	key := s.tokenWaitKey(alias, domain)
+	key := s.tokenWaitKey(ns, alias, domain)
 	ch := make(chan struct{}, 1)
 	s.waitMu.Lock()
 	s.waiters[key] = append(s.waiters[key], ch)
@@ -1210,7 +1218,7 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	}
 	// Re-check in case token arrived before registration
 	if t := s.loadTokenPreferred(ns, alias, domain, owner, name); t != "" {
-		s.notifyToken(alias, domain)
+		s.notifyToken(ns, alias, domain)
 		return true
 	}
 	timer := time.NewTimer(timeout)
@@ -1404,74 +1412,86 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 				alias = inf
 			}
 		}
-		// As a last resort, default to owner (so flow can proceed to token resolution/prompt).
-		if alias == "" && owner != "" {
-			alias = owner
-		}
+		// Do not force alias to owner when no token exists.
+		// Leave alias empty so helpers default to a stable alias ("default") for elicitation/wait.
 	}
 	// Execute with token using the retry helper to enable elicitation if no token exists.
 	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*ListRepoOutput, error) {
 		// If recursive requested, prefer Git Trees API for performance.
 		if in.Recursive {
-        // Resolve default branch first if ref empty; if provided ref is invalid, fallback to contents DFS.
-        cli := adapter.New(domain)
-        ref, err := t.ResolveRef(ctx, cli, token, owner, name, ref)
-        if err != nil {
-            return nil, err
-        }
-        if serviceDebug() {
-            log.Printf("[github] list: resolved ref=%q domain=%s owner=%s repo=%s path=%q", ref, domain, owner, name, in.Path)
-        }
-        // Eagerly validate a user-supplied ref; if invalid, switch to default branch to avoid slow DFS.
-        if strings.TrimSpace(t.Ref) != "" {
-            if err := cli.ValidateRef(ctx, token, owner, name, ref); err != nil {
-                if def, derr := cli.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
-                    ref = def
-                }
-            }
-        }
-        treeSha, err := cli.GetCommitTreeSHA(ctx, token, owner, name, ref)
-        if err != nil {
-            // If commit resolution fails on GHE (e.g., 422), fallback to a contents-based recursive walk.
-            if serviceDebug() { log.Printf("[github] GetCommitTreeSHA failed for ref=%q: %v; falling back to contents DFS", ref, err) }
-            walker := s.makeContentAPI(domain)
-            startPath := strings.Trim(strings.TrimPrefix(in.Path, "/"), "/")
-            if serviceDebug() { log.Printf("[github] list: DFS start ref=%q path=%q", ref, startPath) }
-            // Simple DFS over directories using Contents API
-            var out ListRepoOutput
-            var stack = []string{startPath}
-            visited := map[string]bool{}
-            for len(stack) > 0 {
-                n := len(stack) - 1
-                dir := stack[n]
-                stack = stack[:n]
-                if visited[dir] { continue }
-                visited[dir] = true
-                items, werr := walker.ListContents(ctx, token, owner, name, dir, ref)
-                if werr != nil {
-                    // Retry with default branch if available
-                    if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
-                        items, werr = walker.ListContents(ctx, token, owner, name, dir, def)
-                        if werr == nil {
-                            ref = def
-                        }
-                    }
-                    if werr != nil { return nil, werr }
-                }
-                for _, it := range items {
-                    // Filter by in.Contains/include/exclude later; we need full paths
-                    if it.Type == "dir" { stack = append(stack, strings.Trim(strings.TrimPrefix(it.Path, "/"), "/")) }
-                    if it.Type == "file" || it.Type == "dir" {
-                        if !passIncludeExclude(it.Path, in.Include, in.Exclude) { continue }
-                        if c := strings.ToLower(strings.TrimSpace(in.Contains)); c != "" {
-                            if !strings.Contains(strings.ToLower(it.Path), c) && !strings.Contains(strings.ToLower(it.Name), c) { continue }
-                        }
-                        out.Items = append(out.Items, AssetItem{Type: it.Type, Name: pathBase(it.Path), Path: it.Path, Size: it.Size, Sha: it.Sha})
-                    }
-                }
-            }
-            return &out, nil
-        }
+			// Resolve default branch first if ref empty; if provided ref is invalid, fallback to contents DFS.
+			cli := adapter.New(domain)
+			ref, err := t.ResolveRef(ctx, cli, token, owner, name, ref)
+			if err != nil {
+				return nil, err
+			}
+			if serviceDebug() {
+				log.Printf("[github] list: resolved ref=%q domain=%s owner=%s repo=%s path=%q", ref, domain, owner, name, in.Path)
+			}
+			// Eagerly validate a user-supplied ref; if invalid, switch to default branch to avoid slow DFS.
+			if strings.TrimSpace(t.Ref) != "" {
+				if err := cli.ValidateRef(ctx, token, owner, name, ref); err != nil {
+					if def, derr := cli.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
+						ref = def
+					}
+				}
+			}
+			treeSha, err := cli.GetCommitTreeSHA(ctx, token, owner, name, ref)
+			if err != nil {
+				// If commit resolution fails on GHE (e.g., 422), fallback to a contents-based recursive walk.
+				if serviceDebug() {
+					log.Printf("[github] GetCommitTreeSHA failed for ref=%q: %v; falling back to contents DFS", ref, err)
+				}
+				walker := s.makeContentAPI(domain)
+				startPath := strings.Trim(strings.TrimPrefix(in.Path, "/"), "/")
+				if serviceDebug() {
+					log.Printf("[github] list: DFS start ref=%q path=%q", ref, startPath)
+				}
+				// Simple DFS over directories using Contents API
+				var out ListRepoOutput
+				var stack = []string{startPath}
+				visited := map[string]bool{}
+				for len(stack) > 0 {
+					n := len(stack) - 1
+					dir := stack[n]
+					stack = stack[:n]
+					if visited[dir] {
+						continue
+					}
+					visited[dir] = true
+					items, werr := walker.ListContents(ctx, token, owner, name, dir, ref)
+					if werr != nil {
+						// Retry with default branch if available
+						if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
+							items, werr = walker.ListContents(ctx, token, owner, name, dir, def)
+							if werr == nil {
+								ref = def
+							}
+						}
+						if werr != nil {
+							return nil, werr
+						}
+					}
+					for _, it := range items {
+						// Filter by in.Contains/include/exclude later; we need full paths
+						if it.Type == "dir" {
+							stack = append(stack, strings.Trim(strings.TrimPrefix(it.Path, "/"), "/"))
+						}
+						if it.Type == "file" || it.Type == "dir" {
+							if !passIncludeExclude(it.Path, in.Include, in.Exclude) {
+								continue
+							}
+							if c := strings.ToLower(strings.TrimSpace(in.Contains)); c != "" {
+								if !strings.Contains(strings.ToLower(it.Path), c) && !strings.Contains(strings.ToLower(it.Name), c) {
+									continue
+								}
+							}
+							out.Items = append(out.Items, AssetItem{Type: it.Type, Name: pathBase(it.Path), Path: it.Path, Size: it.Size, Sha: it.Sha})
+						}
+					}
+				}
+				return &out, nil
+			}
 			// Determine if this is a root request (full-tree). If so, try cache by domain/owner/repo.
 			startPath := strings.TrimPrefix(in.Path, "/")
 			prefix := strings.Trim(startPath, "/")
@@ -1480,7 +1500,11 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			useCache := prefix == ""
 			cacheKey := ""
 			if useCache {
-				cacheKey = s.repoKey(domain, owner, name)
+				nsCache, _ := s.auth.Namespace(ctx)
+				if nsCache == "" {
+					nsCache = "default"
+				}
+				cacheKey = s.repoKey(nsCache, domain, owner, name)
 				s.treeMu.RLock()
 				cached, ok := s.treeCache[cacheKey]
 				s.treeMu.RUnlock()
@@ -1529,36 +1553,40 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 				if !passIncludeExclude(e.Path, include, exclude) {
 					continue
 				}
-        			typ := e.Type
-        			if typ == "tree" {
-        				typ = "dir"
-        			} else if typ == "blob" {
-        				typ = "file"
-        			}
+				typ := e.Type
+				if typ == "tree" {
+					typ = "dir"
+				} else if typ == "blob" {
+					typ = "file"
+				}
 				out.Items = append(out.Items, AssetItem{Type: typ, Name: pathBase(e.Path), Path: e.Path, Size: e.Size, Sha: e.Sha})
 			}
 			return &out, nil
 		}
 
-        // Non-recursive: single directory via contents API
-        cli := s.makeContentAPI(domain)
-        startPath := strings.TrimPrefix(in.Path, "/")
-        // Resolve ref if empty to avoid GHE default-branch ambiguities
-        useRef := strings.TrimSpace(in.Ref)
-        if useRef == "" {
-            cliRef := adapter.New(domain)
-            if def, err := (&GitTarget{Ref: ""}).ResolveRef(ctx, cliRef, token, owner, name, ""); err == nil && def != "" {
-                useRef = def
-            }
-        }
-        if serviceDebug() { log.Printf("[github] list: contents ref=%q path=%q", useRef, startPath) }
-        items, err := cli.ListContents(ctx, token, owner, name, startPath, useRef)
-        if err != nil {
-            if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
-                items, err = cli.ListContents(ctx, token, owner, name, startPath, def)
-            }
-            if err != nil { return nil, err }
-        }
+		// Non-recursive: single directory via contents API
+		cli := s.makeContentAPI(domain)
+		startPath := strings.TrimPrefix(in.Path, "/")
+		// Resolve ref if empty to avoid GHE default-branch ambiguities
+		useRef := strings.TrimSpace(in.Ref)
+		if useRef == "" {
+			cliRef := adapter.New(domain)
+			if def, err := (&GitTarget{Ref: ""}).ResolveRef(ctx, cliRef, token, owner, name, ""); err == nil && def != "" {
+				useRef = def
+			}
+		}
+		if serviceDebug() {
+			log.Printf("[github] list: contents ref=%q path=%q", useRef, startPath)
+		}
+		items, err := cli.ListContents(ctx, token, owner, name, startPath, useRef)
+		if err != nil {
+			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
+				items, err = cli.ListContents(ctx, token, owner, name, startPath, def)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
 		contains := strings.ToLower(strings.TrimSpace(in.Contains))
 		include := in.Include
 		exclude := in.Exclude
@@ -1576,12 +1604,6 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 	})
 }
 
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
 func pathBase(p string) string {
 	if i := strings.LastIndex(p, "/"); i >= 0 {
 		return p[i+1:]
@@ -1669,79 +1691,97 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 				alias = inf
 			}
 		}
-		// As a last resort, default to owner
-		if alias == "" && owner != "" {
-			alias = owner
-		}
+		// Do not force alias to owner when no token exists; prefer stable default in helpers.
 	}
-    cli := s.makeContentAPI(domain)
-    data, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]byte, error) {
-        // Resolve ref to default if empty using authenticated call
-        useRef := strings.TrimSpace(ref)
-        if useRef == "" {
-            cliRef := adapter.New(domain)
-            if def, err := (&GitTarget{Ref: ""}).ResolveRef(ctx, cliRef, token, owner, name, ""); err == nil && def != "" {
-                useRef = def
-            }
-        }
-        if serviceDebug() { log.Printf("[github] download: using ref=%q path=%q", useRef, in.Path) }
-        p := strings.TrimPrefix(in.Path, "/")
-        // First try contents API
-        if data, err := cli.GetFileContent(ctx, token, owner, name, p, useRef); err == nil {
-            return data, nil
-        }
-        if serviceDebug() { log.Printf("[github] download: contents failed for ref=%q path=%q; falling back to contents-dir+blob", useRef, p) }
-        // Fallback: list parent directory via contents on default branch to obtain file SHA, then fetch blob by SHA
-        parent := p
-        if idx := strings.LastIndex(parent, "/"); idx >= 0 { parent = parent[:idx] } else { parent = "" }
-        def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name)
-        if derr != nil { return nil, derr }
-        items, err := cli.ListContents(ctx, token, owner, name, parent, def)
-        if err != nil { return nil, err }
-        var sha string
-        for _, it := range items {
-            if it.Path == p && it.Sha != "" { sha = it.Sha; break }
-        }
-        if sha == "" {
-            return nil, fmt.Errorf("get content failed: %s", "sha not found in parent listing on default branch")
-        }
-        return adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
-    })
-    if err != nil {
-        return nil, err
-    }
-    // Auto-detect text vs binary. Populate only one of Text or Content.
-    if isProbablyText(data) {
-        return &DownloadOutput{Text: string(data)}, nil
-    }
-    return &DownloadOutput{Content: data}, nil
+	cli := s.makeContentAPI(domain)
+	data, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]byte, error) {
+		// Resolve ref to default if empty using authenticated call
+		useRef := strings.TrimSpace(ref)
+		if useRef == "" {
+			cliRef := adapter.New(domain)
+			if def, err := (&GitTarget{Ref: ""}).ResolveRef(ctx, cliRef, token, owner, name, ""); err == nil && def != "" {
+				useRef = def
+			}
+		}
+		if serviceDebug() {
+			log.Printf("[github] download: using ref=%q path=%q", useRef, in.Path)
+		}
+		p := strings.TrimPrefix(in.Path, "/")
+		// First try contents API
+		if data, err := cli.GetFileContent(ctx, token, owner, name, p, useRef); err == nil {
+			return data, nil
+		}
+		if serviceDebug() {
+			log.Printf("[github] download: contents failed for ref=%q path=%q; falling back to contents-dir+blob", useRef, p)
+		}
+		// Fallback: list parent directory via contents on default branch to obtain file SHA, then fetch blob by SHA
+		parent := p
+		if idx := strings.LastIndex(parent, "/"); idx >= 0 {
+			parent = parent[:idx]
+		} else {
+			parent = ""
+		}
+		def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name)
+		if derr != nil {
+			return nil, derr
+		}
+		items, err := cli.ListContents(ctx, token, owner, name, parent, def)
+		if err != nil {
+			return nil, err
+		}
+		var sha string
+		for _, it := range items {
+			if it.Path == p && it.Sha != "" {
+				sha = it.Sha
+				break
+			}
+		}
+		if sha == "" {
+			return nil, fmt.Errorf("get content failed: %s", "sha not found in parent listing on default branch")
+		}
+		return adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Auto-detect text vs binary. Populate only one of Text or Content.
+	if isProbablyText(data) {
+		return &DownloadOutput{Text: string(data)}, nil
+	}
+	return &DownloadOutput{Content: data}, nil
 }
 
 // isProbablyText reports whether b looks like UTF-8 text with a low ratio of control characters.
 func isProbablyText(b []byte) bool {
-    if len(b) == 0 { return true }
-    // Treat as text if valid UTF-8 and contains no NUL bytes and few non-printable runes.
-    if !utf8.Valid(b) { return false }
-    // Sample up to first 4KB to keep it cheap.
-    sample := b
-    if len(sample) > 4096 { sample = sample[:4096] }
-    // Count control runes excluding common whitespace (tab, newline, carriage return).
-    var control, total int
-    for len(sample) > 0 {
-        r, size := utf8.DecodeRune(sample)
-        sample = sample[size:]
-        total++
-        if r == '\n' || r == '\r' || r == '\t' {
-            continue
-        }
-        if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-            control++
-            if control > 8 { // a few control chars allowed; above that assume binary
-                return false
-            }
-        }
-    }
-    return true
+	if len(b) == 0 {
+		return true
+	}
+	// Treat as text if valid UTF-8 and contains no NUL bytes and few non-printable runes.
+	if !utf8.Valid(b) {
+		return false
+	}
+	// Sample up to first 4KB to keep it cheap.
+	sample := b
+	if len(sample) > 4096 {
+		sample = sample[:4096]
+	}
+	// Count control runes excluding common whitespace (tab, newline, carriage return).
+	var control, total int
+	for len(sample) > 0 {
+		r, size := utf8.DecodeRune(sample)
+		sample = sample[size:]
+		total++
+		if r == '\n' || r == '\r' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			control++
+			if control > 8 { // a few control chars allowed; above that assume binary
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *Service) normalizeAlias(a string) string { return a }
