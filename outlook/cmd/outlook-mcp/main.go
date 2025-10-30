@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,21 +26,22 @@ type Options struct {
 	HTTPAddr       string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
 	ClientID       string `long:"client-id" description:"Azure AD application (client) ID"`
 	TenantID       string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
-	Storage        string `long:"storage" description:"Directory for auth records/cache"`
+	SecretsBase    string `long:"secretsBase" description:"AFS/scy base URL for persisting auth records (e.g., mem://localhost/mcp-outlook)"`
 	AzureRef       string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
 	Oauth2Config   string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
 	BFFRedirectURI string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
+	UseIdToken     bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
 }
 
 func main() {
-	// Parse flags
+
 	var opts Options
 	if _, err := flags.NewParser(&opts, flags.Default).Parse(); err != nil {
 		os.Exit(2)
 	}
 	// Apply simple defaults and env fallbacks
-	if opts.Storage == "" {
-		opts.Storage = defaultStorageDir()
+	if opts.SecretsBase == "" {
+		opts.SecretsBase = "mem://localhost/mcp-outlook"
 	}
 	if opts.TenantID == "" {
 		opts.TenantID = envOr("OUTLOOK_TENANT_ID", "organizations")
@@ -49,9 +51,6 @@ func main() {
 	}
 	if opts.AzureRef == "" {
 		opts.AzureRef = envOr("OUTLOOK_AZURE_REF", "")
-	}
-	if opts.Oauth2Config == "" {
-		opts.Oauth2Config = envOr("OUTLOOK_OAUTH2_CONFIG", "")
 	}
 	if opts.ClientID == "" && opts.AzureRef == "" {
 		log.Fatal("missing --client-id/OUTLOOK_CLIENT_ID (or provide --azure-ref / OUTLOOK_AZURE_REF)")
@@ -88,7 +87,7 @@ func main() {
 	svc := mcp.NewService(&mcp.Config{
 		ClientID:        opts.ClientID,
 		TenantID:        opts.TenantID,
-		StorageDir:      strings.Replace(opts.Storage, "$HOME", os.Getenv("HOME"), 1),
+		SecretsBase:     strings.Replace(opts.SecretsBase, "$HOME", os.Getenv("HOME"), 1),
 		CallbackBaseURL: baseURL,
 		AzureRef:        scy.EncodedResource(opts.AzureRef),
 	})
@@ -132,21 +131,57 @@ func main() {
 			log.Fatalf("invalid oauth2config secret type")
 		}
 		authPolicy := &authorization.Policy{
-			Global: &authorization.Authorization{ProtectedResourceMetadata: &oauthmeta.ProtectedResourceMetadata{
-				AuthorizationServers: []string{oc.Config.Endpoint.AuthURL},
-			}},
-			// Keep Outlook auth endpoints public; protect /mcp
-			ExcludeURI: "/outlook/auth/",
+			Global: &authorization.Authorization{
+				UseIdToken: opts.UseIdToken,
+				ProtectedResourceMetadata: &oauthmeta.ProtectedResourceMetadata{
+					AuthorizationServers: []string{oc.Config.Endpoint.AuthURL},
+				}},
+			// Match sqlkit: allow SSE/UI without auth; protect /mcp
+			ExcludeURI: "/sse,/ui/interaction/",
 		}
 		header := flow.AuthorizationExchangeHeader
 		bff := &serverauth.BackendForFrontend{Client: &oc.Config, AuthorizationExchangeHeader: header}
-		if opts.BFFRedirectURI != "" {
-			bff.RedirectURI = opts.BFFRedirectURI
-		}
 		authSvc, err := serverauth.New(&serverauth.Config{Policy: authPolicy, BackendForFrontend: bff})
 		if err != nil {
 			log.Fatalf("failed to init auth service: %v", err)
 		}
+
+		// Add an always-on logging authorizer wrapper to classify presented tokens and BFF cookie.
+		type statusWriter struct {
+			http.ResponseWriter
+			code int
+		}
+		//logMiddleware := func(next http.Handler) http.Handler {
+		//	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//		ah := strings.TrimSpace(r.Header.Get("Authorization"))
+		//		kind := "none"
+		//		hasBFF := false
+		//		if c, err := r.Cookie("BFF-Auth-Session"); err == nil && c != nil && c.Value != "" {
+		//			hasBFF = true
+		//		}
+		//		if strings.HasPrefix(strings.ToLower(ah), "bearer ") {
+		//			parts := strings.SplitN(ah, " ", 2)
+		//			if len(parts) == 2 {
+		//				tok := strings.TrimSpace(parts[1])
+		//				var claims jwt.MapClaims
+		//				if _, _, err := new(jwt.Parser).ParseUnverified(tok, &claims); err == nil {
+		//					if _, ok := claims["scp"]; ok {
+		//						kind = "access"
+		//					} else {
+		//						kind = "id-or-unknown"
+		//					}
+		//				} else {
+		//					kind = "unparseable"
+		//				}
+		//			}
+		//		}
+		//		sw := &statusWriter{ResponseWriter: w, code: 200}
+		//		authNext := authSvc.Middleware(next)
+		//		authNext.ServeHTTP(http.ResponseWriter(sw), r)
+		//		// Print request/response summary
+		//			r.Method, r.URL.Path, r.RemoteAddr, sw.code, kind, opts.UseIdToken, hasBFF)
+		//	})
+		//}
 		options = append(options,
 			mcpsrv.WithAuthorizer(authSvc.Middleware),
 			mcpsrv.WithProtectedResourcesHandler(authSvc.ProtectedResourcesHandler),
@@ -160,7 +195,6 @@ func main() {
 	if opts.HTTPAddr != "" {
 		// Enable streamable HTTP so /mcp endpoint is active
 		server.UseStreamableHTTP(true)
-		log.Printf("mcp-outlook listening on HTTP %s (streamable /mcp)", opts.HTTPAddr)
 		if err := server.HTTP(context.Background(), opts.HTTPAddr).ListenAndServe(); err != nil {
 			log.Fatal(err)
 		}

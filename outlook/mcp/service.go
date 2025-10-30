@@ -1,41 +1,41 @@
 package mcp
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "html"
-    "net/http"
-    "regexp"
-    "strings"
-    "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"html"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
 
-    protoclient "github.com/viant/mcp-protocol/client"
+	protoclient "github.com/viant/mcp-protocol/client"
 
-    "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-    oa "github.com/viant/mcp-toolbox/auth"
-    "github.com/viant/mcp-toolbox/outlook/graph"
-    "github.com/viant/scy"
-    "github.com/viant/scy/cred"
-    "sync"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	oa "github.com/viant/mcp-toolbox/auth"
+	"github.com/viant/mcp-toolbox/outlook/graph"
+	"github.com/viant/scy"
+	"github.com/viant/scy/cred"
+	"sync"
 )
 
 // Service wires graph manager and optional UI/secret helpers.
 type Service struct {
-    graphMgr *graph.Manager
-    baseURL  string
-    // ui/secrets can be added when we introduce OOB UI forms later.
-    useText    bool
-    pending    *PendingAuths
-    auth       *oa.Service
-    azure      *cred.Azure
-    tenantID   string
-    clientID   string
-    storageDir string
+	graphMgr *graph.Manager
+	baseURL  string
+	// ui/secrets can be added when we introduce OOB UI forms later.
+	useText     bool
+	pending     *PendingAuths
+	auth        *oa.Service
+	azure       *cred.Azure
+	tenantID    string
+	clientID    string
+	secretsBase string
 
-    // service-level lazy cache of DeviceCodeCredential per namespace+alias
-    credMu sync.RWMutex
-    creds  map[string]*azidentity.DeviceCodeCredential
+	// service-level lazy cache of DeviceCodeCredential per namespace+alias
+	credMu sync.RWMutex
+	creds  map[string]*azidentity.DeviceCodeCredential
 }
 
 func NewService(cfg *Config) *Service {
@@ -62,18 +62,18 @@ func NewService(cfg *Config) *Service {
 	tenantID := cfg.TenantID
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
-    return &Service{
-        graphMgr:   graph.NewManager(clientID, cfg.StorageDir),
-        baseURL:    cfg.CallbackBaseURL,
-        useText:    useText,
-        pending:    NewPendingAuths(),
-        auth:       oa.New(),
-        azure:      az,
-        tenantID:   tenantID,
-        clientID:   clientID,
-        storageDir: cfg.StorageDir,
-        creds:      map[string]*azidentity.DeviceCodeCredential{},
-    }
+	return &Service{
+		graphMgr:    graph.NewManager(clientID, cfg.SecretsBase),
+		baseURL:     cfg.CallbackBaseURL,
+		useText:     useText,
+		pending:     NewPendingAuths(),
+		auth:        oa.New(),
+		azure:       az,
+		tenantID:    tenantID,
+		clientID:    clientID,
+		secretsBase: cfg.SecretsBase,
+		creds:       map[string]*azidentity.DeviceCodeCredential{},
+	}
 }
 
 func (s *Service) RegisterHTTP(mux *http.ServeMux) {
@@ -226,7 +226,7 @@ func (s *Service) Pending() *PendingAuths       { return s.pending }
 func (s *Service) Auth() *oa.Service            { return s.auth }
 func (s *Service) TenantID() string             { return s.tenantID }
 func (s *Service) ClientID() string             { return s.clientID }
-func (s *Service) StorageDir() string           { return s.storageDir }
+func (s *Service) SecretsBase() string          { return s.secretsBase }
 
 // NewOperationsHook allows passing protocol client operations if needed later.
 func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
@@ -234,25 +234,27 @@ func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
 // Credential returns an azidentity.DeviceCodeCredential cached per account alias.
 // It delegates acquisition to the graph manager on cache miss and stores it until process restart.
 func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
-    ns, _ := s.auth.Namespace(ctx)
-    if ns == "" { ns = "default" }
-    key := ns + "|" + alias
-    s.credMu.RLock()
-    if c := s.creds[key]; c != nil {
-        s.credMu.RUnlock()
-        return c, nil
-    }
-    s.credMu.RUnlock()
-    cred, err := s.graphMgr.Credential(ctx, alias, tenantID, scopes, prompt)
-    if err != nil {
-        return nil, err
-    }
-    s.credMu.Lock()
-    if existing := s.creds[key]; existing != nil {
-        s.credMu.Unlock()
-        return existing, nil
-    }
-    s.creds[key] = cred
-    s.credMu.Unlock()
-    return cred, nil
+	ns, _ := s.auth.Namespace(ctx)
+	if ns == "" {
+		ns = "default"
+	}
+	key := ns + "|" + alias
+	s.credMu.RLock()
+	if c := s.creds[key]; c != nil {
+		s.credMu.RUnlock()
+		return c, nil
+	}
+	s.credMu.RUnlock()
+	cred, err := s.graphMgr.Credential(ctx, alias, tenantID, scopes, prompt)
+	if err != nil {
+		return nil, err
+	}
+	s.credMu.Lock()
+	if existing := s.creds[key]; existing != nil {
+		s.credMu.Unlock()
+		return existing, nil
+	}
+	s.creds[key] = cred
+	s.credMu.Unlock()
+	return cred, nil
 }

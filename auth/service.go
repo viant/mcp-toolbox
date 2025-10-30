@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -23,7 +25,8 @@ type Service struct {
 // Namespace extracts the subject/email from an auth token placed in context by MCP auth middleware.
 func (s *Service) Namespace(ctx context.Context) (string, error) {
 	if s == nil {
-		return "default", nil
+		ns := "default"
+		return ns, nil
 	}
 	tokenValue := ctx.Value(authorization.TokenKey)
 	if tokenValue == nil {
@@ -44,6 +47,7 @@ func (s *Service) Namespace(ctx context.Context) (string, error) {
 			tokenString = strings.TrimSpace(v[len("Bearer "):])
 		}
 	}
+	// token kind classification removed with log suppression
 	if s.Parse != nil && s.Extract != nil {
 		if claims, err := s.Parse(tokenString); err == nil {
 			if ns, ok := s.Extract(claims); ok && ns != "" {
@@ -51,8 +55,31 @@ func (s *Service) Namespace(ctx context.Context) (string, error) {
 			}
 		}
 	}
+	// Fallback: derive a stable per-token namespace to avoid cross-user leakage.
+	// Use MD5 of the token string to keep it opaque.
+	if tokenString != "" {
+		sum := md5.Sum([]byte(tokenString))
+		ns := "tkn-" + hex.EncodeToString(sum[:])
+		return ns, nil
+	}
 	return s.DefaultNamespace, nil
 }
+
+func classifyToken(tok string) string {
+	if strings.TrimSpace(tok) == "" {
+		return "none"
+	}
+	var claimMap jwt.MapClaims
+	if _, _, err := new(jwt.Parser).ParseUnverified(tok, &claimMap); err != nil {
+		return "unparseable"
+	}
+	if _, ok := claimMap["scp"]; ok { // common on access tokens
+		return "access"
+	}
+	return "id-or-unknown"
+}
+
+// nsDbg removed: logging is always on to aid diagnosis per request.
 
 // New returns a default Service that extracts "email" or "sub" without verification.
 func New() *Service {

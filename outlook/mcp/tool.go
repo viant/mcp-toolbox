@@ -1,20 +1,19 @@
 package mcp
 
 import (
-    "context"
-    _ "embed"
-    "encoding/json"
-    "fmt"
-    "log"
-    "regexp"
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"regexp"
 
-    "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-    "github.com/google/uuid"
-    "github.com/viant/jsonrpc"
-    "github.com/viant/mcp-protocol/schema"
-    protoserver "github.com/viant/mcp-protocol/server"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/google/uuid"
+	"github.com/viant/jsonrpc"
+	"github.com/viant/mcp-protocol/schema"
+	protoserver "github.com/viant/mcp-protocol/server"
 
-    "github.com/viant/mcp-toolbox/outlook/graph"
+	"github.com/viant/mcp-toolbox/outlook/graph"
 )
 
 //go:embed tools/outlookListMail.md
@@ -46,8 +45,6 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			_, _ = ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
 				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: m.VerificationURL},
 			}})
-		} else {
-			log.Printf("Sign in to Outlook: open %s and enter code %s", m.VerificationURL, m.UserCode)
 		}
 		return nil
 	}
@@ -60,69 +57,114 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 				VerificationURL: extractURL(msg),
 				Message:         msg,
 			}
-			err := userPrompt(ctx, deviceCodeMessage)
-			if err != nil {
-				log.Printf("Sign in to Outlook: %s", msg)
-			}
+			_ = userPrompt(ctx, deviceCodeMessage)
 		}
 	}
 
-    mailSvc := graph.NewMailService(svc.GraphManager())
-    calSvc := graph.NewCalendarService(svc.GraphManager())
-    taskSvc := graph.NewTaskService(svc.GraphManager())
+	mailSvc := graph.NewMailService(svc.GraphManager())
+	calSvc := graph.NewCalendarService(svc.GraphManager())
+	taskSvc := graph.NewTaskService(svc.GraphManager())
 
-    // List mail
-    if err := protoserver.RegisterTool[*graph.ListMailInput, *graph.ListMailOutput](base.Registry, "outlookListMail", outlookListMailDesc, func(ctx context.Context, in *graph.ListMailInput) (*schema.CallToolResult, *jsonrpc.Error) {
-        if in.Account.Alias == "" { return buildErrorResult("account.alias is required") }
-        if in.Account.TenantID == "" { in.Account.TenantID = svc.TenantID() }
-        out, err := mailSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
-        if err != nil { return buildErrorResult(err.Error()) }
-        return buildSuccessResult(svc, out)
-    }); err != nil { return err }
+	// List mail
+	if err := protoserver.RegisterTool[*graph.ListMailInput, *graph.ListMailOutput](base.Registry, "outlookListMail", outlookListMailDesc, func(ctx context.Context, in *graph.ListMailInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if in.Account.Alias == "" {
+			return buildErrorResult("account.alias is required")
+		}
+		if in.Account.TenantID == "" {
+			in.Account.TenantID = svc.TenantID()
+		}
+		out, err := mailSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResult(svc, out)
+	}); err != nil {
+		return err
+	}
 
-    // Send mail
-    if err := protoserver.RegisterTool[*graph.SendEmailInput, *struct{}](base.Registry, "outlookSendMail", outlookSendMailDesc, func(ctx context.Context, in *graph.SendEmailInput) (*schema.CallToolResult, *jsonrpc.Error) {
-        if in.Account.Alias == "" { return buildErrorResult("account.alias is required") }
-        if in.Account.TenantID == "" { in.Account.TenantID = svc.TenantID() }
-        if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), msgPrompt(ctx)); err != nil { return buildErrorResult(err.Error()) }
-        return buildSuccessResult(svc, map[string]any{"status": "sent"})
-    }); err != nil { return err }
+	// Send mail
+	if err := protoserver.RegisterTool[*graph.SendEmailInput, *struct{}](base.Registry, "outlookSendMail", outlookSendMailDesc, func(ctx context.Context, in *graph.SendEmailInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if in.Account.Alias == "" {
+			return buildErrorResult("account.alias is required")
+		}
+		if in.Account.TenantID == "" {
+			in.Account.TenantID = svc.TenantID()
+		}
+		if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), msgPrompt(ctx)); err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResult(svc, map[string]any{"status": "sent"})
+	}); err != nil {
+		return err
+	}
 
-    // List events
-    if err := protoserver.RegisterTool[*graph.ListEventsInput, *graph.ListEventsOutput](base.Registry, "outlookListEvents", outlookListEventsDesc, func(ctx context.Context, in *graph.ListEventsInput) (*schema.CallToolResult, *jsonrpc.Error) {
-        if in.Account.Alias == "" { return buildErrorResult("account.alias is required") }
-        if in.Account.TenantID == "" { in.Account.TenantID = svc.TenantID() }
-        out, err := calSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
-        if err != nil { return buildErrorResult(err.Error()) }
-        return buildSuccessResult(svc, out)
-    }); err != nil { return err }
+	// List events
+	if err := protoserver.RegisterTool[*graph.ListEventsInput, *graph.ListEventsOutput](base.Registry, "outlookListEvents", outlookListEventsDesc, func(ctx context.Context, in *graph.ListEventsInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if in.Account.Alias == "" {
+			return buildErrorResult("account.alias is required")
+		}
+		if in.Account.TenantID == "" {
+			in.Account.TenantID = svc.TenantID()
+		}
+		out, err := calSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResult(svc, out)
+	}); err != nil {
+		return err
+	}
 
-    // Create event
-    if err := protoserver.RegisterTool[*graph.CreateEventInput, *graph.CalendarEvent](base.Registry, "outlookCreateEvent", outlookCreateEventDesc, func(ctx context.Context, in *graph.CreateEventInput) (*schema.CallToolResult, *jsonrpc.Error) {
-        if in.Account.Alias == "" { return buildErrorResult("account.alias is required") }
-        if in.Account.TenantID == "" { in.Account.TenantID = svc.TenantID() }
-        out, err := calSvc.Create(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
-        if err != nil { return buildErrorResult(err.Error()) }
-        return buildSuccessResult(svc, out)
-    }); err != nil { return err }
+	// Create event
+	if err := protoserver.RegisterTool[*graph.CreateEventInput, *graph.CalendarEvent](base.Registry, "outlookCreateEvent", outlookCreateEventDesc, func(ctx context.Context, in *graph.CreateEventInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if in.Account.Alias == "" {
+			return buildErrorResult("account.alias is required")
+		}
+		if in.Account.TenantID == "" {
+			in.Account.TenantID = svc.TenantID()
+		}
+		out, err := calSvc.Create(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResult(svc, out)
+	}); err != nil {
+		return err
+	}
 
-    // List tasks
-    if err := protoserver.RegisterTool[*graph.ListTasksInput, *graph.ListTasksOutput](base.Registry, "outlookListTasks", outlookListTasksDesc, func(ctx context.Context, in *graph.ListTasksInput) (*schema.CallToolResult, *jsonrpc.Error) {
-        if in.Account.Alias == "" { return buildErrorResult("account.alias is required") }
-        if in.Account.TenantID == "" { in.Account.TenantID = svc.TenantID() }
-        out, err := taskSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
-        if err != nil { return buildErrorResult(err.Error()) }
-        return buildSuccessResult(svc, out)
-    }); err != nil { return err }
+	// List tasks
+	if err := protoserver.RegisterTool[*graph.ListTasksInput, *graph.ListTasksOutput](base.Registry, "outlookListTasks", outlookListTasksDesc, func(ctx context.Context, in *graph.ListTasksInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if in.Account.Alias == "" {
+			return buildErrorResult("account.alias is required")
+		}
+		if in.Account.TenantID == "" {
+			in.Account.TenantID = svc.TenantID()
+		}
+		out, err := taskSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResult(svc, out)
+	}); err != nil {
+		return err
+	}
 
-    // Create task
-    if err := protoserver.RegisterTool[*graph.CreateTaskInput, *graph.Task](base.Registry, "outlookCreateTask", outlookCreateTaskDesc, func(ctx context.Context, in *graph.CreateTaskInput) (*schema.CallToolResult, *jsonrpc.Error) {
-        if in.Account.Alias == "" { return buildErrorResult("account.alias is required") }
-        if in.Account.TenantID == "" { in.Account.TenantID = svc.TenantID() }
-        out, err := taskSvc.Create(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
-        if err != nil { return buildErrorResult(err.Error()) }
-        return buildSuccessResult(svc, out)
-    }); err != nil { return err }
+	// Create task
+	if err := protoserver.RegisterTool[*graph.CreateTaskInput, *graph.Task](base.Registry, "outlookCreateTask", outlookCreateTaskDesc, func(ctx context.Context, in *graph.CreateTaskInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if in.Account.Alias == "" {
+			return buildErrorResult("account.alias is required")
+		}
+		if in.Account.TenantID == "" {
+			in.Account.TenantID = svc.TenantID()
+		}
+		out, err := taskSvc.Create(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResult(svc, out)
+	}); err != nil {
+		return err
+	}
 
 	return nil
 }

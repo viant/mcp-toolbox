@@ -13,8 +13,8 @@ type Config struct {
 	// Optional authority/issuer URL; defaults to https://login.microsoftonline.com.
 	Authority string `json:"authority,omitempty"`
 
-	// StorageDir is where auth records/caches are persisted per account alias.
-	StorageDir string `json:"storageDir,omitempty"`
+	// SecretsBase is an AFS/scy base URL where auth records are persisted per namespace+alias.
+	SecretsBase string `json:"secretsBase,omitempty"`
 
 	// CallbackBaseURL is used to generate absolute URLs for OOB flows.
 	// Example: http://localhost:7788

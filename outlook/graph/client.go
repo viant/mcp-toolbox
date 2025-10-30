@@ -10,14 +10,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache"
-	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
-	oaauth "github.com/viant/mcp-toolbox/auth"
-	"log"
+	"bytes"
+	"io"
 	"sort"
 	"sync"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
+	"github.com/viant/afs"
+	oaauth "github.com/viant/mcp-toolbox/auth"
 )
 
 // Manager provides Microsoft Graph client instances per account alias.
@@ -51,6 +53,16 @@ func (m *Manager) authRecordPath(ns, alias string) string {
 	return filepath.Join(m.storageDir, fmt.Sprintf("%s_%s_auth_record.json", safePart(ns), safePart(alias)))
 }
 
+// authRecordURL returns a storage URL for the auth record. Supports mem:// and file paths.
+func (m *Manager) authRecordURL(ns, alias string) string {
+	base := strings.TrimRight(os.ExpandEnv(m.storageDir), "/")
+	name := fmt.Sprintf("%s_%s_auth_record.json", safePart(ns), safePart(alias))
+	if strings.HasPrefix(base, "mem://") || strings.HasPrefix(base, "file://") {
+		return base + "/" + name
+	}
+	return filepath.Join(base, name)
+}
+
 func safePart(s string) string {
 	s = strings.TrimSpace(os.ExpandEnv(s))
 	// Replace characters unsafe for filenames or caches
@@ -63,7 +75,12 @@ func (m *Manager) ensureDirs() error {
 	if m.storageDir == "" {
 		return errors.New("storageDir is required")
 	}
-	return os.MkdirAll(m.storageDir, 0o700)
+	// Use AFS to ensure storage directory exists; no file:// scheme required
+	base := expandPath(m.storageDir)
+	if base == "" {
+		return errors.New("storageDir is required")
+	}
+	return afs.New().Create(context.Background(), base, 0o700, true)
 }
 
 func expandPath(p string) string {
@@ -95,21 +112,21 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 		ns = "default"
 	}
 	// Load record if present
-	recPath := m.authRecordPath(ns, alias)
+	// afs-only I/O: use recURL; skip local path
+	recURL := m.authRecordURL(ns, alias)
 	var rec azidentity.AuthenticationRecord
 	haveRec := false
-	if b, err := os.ReadFile(recPath); err == nil {
-		_ = json.Unmarshal(b, &rec)
-		haveRec = true
+	if rc, err := afs.New().OpenURL(ctx, recURL); err == nil && rc != nil {
+		if data, rerr := io.ReadAll(rc); rerr == nil {
+			_ = json.Unmarshal(data, &rec)
+			haveRec = true
+		}
+		_ = rc.Close()
 	}
-	aCache, err := cache.New(&cache.Options{Name: "mcp-outlook-" + safePart(ns) + "-" + safePart(alias)})
-	if err != nil {
-		return true
-	}
+	// removed log.Printf diagnostics
 	opts := &azidentity.DeviceCodeCredentialOptions{
 		TenantID:   tenantID,
 		ClientID:   m.clientID,
-		Cache:      aCache,
 		UserPrompt: func(context.Context, azidentity.DeviceCodeMessage) error { return nil },
 	}
 	if haveRec {
@@ -122,7 +139,9 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	_, err = cred.GetToken(ctx2, policy.TokenRequestOptions{Scopes: scopes})
-	return err != nil
+	need := err != nil
+	// removed log.Printf diagnostics
+	return need
 }
 
 // Client returns a ready-to-use GraphServiceClient with given scopes.
@@ -132,9 +151,11 @@ func (m *Manager) Client(ctx context.Context, alias, tenantID string, scopes []s
 		ns = "default"
 	}
 	key := m.clientKey(ns, alias, tenantID, scopes)
+	// removed log.Printf diagnostics
 	m.mu.RLock()
 	if cli, ok := m.clients[key]; ok {
 		m.mu.RUnlock()
+		// removed log.Printf diagnostics
 		return cli, nil
 	}
 	m.mu.RUnlock()
@@ -154,6 +175,7 @@ func (m *Manager) Client(ctx context.Context, alias, tenantID string, scopes []s
 		m.mu.Lock()
 		m.creds[ns+"|"+alias] = cred
 		m.mu.Unlock()
+		// removed log.Printf diagnostics
 	}
 	client, err := msgraphsdk.NewGraphServiceClientWithCredentials(cred, scopes)
 	if err != nil {
@@ -167,6 +189,7 @@ func (m *Manager) Client(ctx context.Context, alias, tenantID string, scopes []s
 	}
 	m.clients[key] = client
 	m.mu.Unlock()
+	// removed log.Printf diagnostics
 	return client, nil
 }
 
@@ -182,8 +205,9 @@ func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
 	if ns == "" {
 		ns = "default"
 	}
-	_, err := os.Stat(m.authRecordPath(ns, alias))
-	return err == nil
+	recURL := m.authRecordURL(ns, alias)
+	ok, _ := afs.New().Exists(ctx, recURL)
+	return ok
 }
 
 // StartDeviceLogin launches the device code authentication in background.
@@ -214,19 +238,18 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 	if ns == "" {
 		ns = "default"
 	}
-	recPath := m.authRecordPath(ns, alias)
+	// afs-only I/O: use recURL; skip local path
 	var rec azidentity.AuthenticationRecord
 	haveRec := false
-	if b, err := os.ReadFile(recPath); err == nil {
-		_ = json.Unmarshal(b, &rec)
-		haveRec = true
+	if rc, err := afs.New().OpenURL(ctx, m.authRecordURL(ns, alias)); err == nil && rc != nil {
+		if data, rerr := io.ReadAll(rc); rerr == nil {
+			_ = json.Unmarshal(data, &rec)
+			haveRec = true
+		}
+		_ = rc.Close()
 	}
 
 	// Persist tokens via azidentity/cache (Keychain on macOS).
-	aCache, err := cache.New(&cache.Options{Name: "mcp-outlook-" + safePart(ns) + "-" + safePart(alias)})
-	if err != nil {
-		return nil, azidentity.AuthenticationRecord{}, err
-	}
 	// Always provide a prompt callback (to avoid SDK printing to stdout and
 	// to surface the device code message via our UI when interaction is needed).
 	var userPrompt = func(_ context.Context, m azidentity.DeviceCodeMessage) error {
@@ -238,7 +261,6 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 	opts := &azidentity.DeviceCodeCredentialOptions{
 		TenantID:   tenantID,
 		ClientID:   m.clientID,
-		Cache:      aCache,
 		UserPrompt: userPrompt,
 	}
 	if haveRec {
@@ -261,10 +283,9 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 				return nil, azidentity.AuthenticationRecord{}, err
 			}
 			if b, err := json.Marshal(rec); err == nil {
-				_ = os.WriteFile(recPath, b, 0o600)
-				if outlookDebug() {
-					log.Printf("[outlook] saved auth record; ns=%s alias=%s path=%s", ns, alias, recPath)
-				}
+				recURL := m.authRecordURL(ns, alias)
+				_ = afs.New().Upload(ctx, recURL, 0o600, bytes.NewReader(b))
+				// removed log.Printf diagnostics
 			}
 		}
 	} else {
@@ -274,10 +295,9 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 			return nil, azidentity.AuthenticationRecord{}, err
 		}
 		if b, err := json.Marshal(rec); err == nil {
-			_ = os.WriteFile(recPath, b, 0o600)
-			if outlookDebug() {
-				log.Printf("[outlook] saved auth record; ns=%s alias=%s path=%s", ns, alias, recPath)
-			}
+			recURL := m.authRecordURL(ns, alias)
+			_ = afs.New().Upload(ctx, recURL, 0o600, bytes.NewReader(b))
+			// removed log.Printf diagnostics
 		}
 	}
 	return cred, rec, nil

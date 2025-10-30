@@ -29,6 +29,13 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 
 	token := svc.loadToken(ns, aliasEff, domainEff)
 	if token == "" {
+		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
+			token = t
+			// hydrate memory for future calls
+			svc.saveToken(ns, aliasEff, domainEff, token)
+		}
+	}
+	if token == "" {
 		if prompt != nil {
 			// Elicit once and wait briefly for token to arrive
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, "", "", prompt)
@@ -83,6 +90,13 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	}
 
 	token := svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+	if token == "" {
+		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, owner, name); t != "" {
+			token = t
+			// hydrate memory
+			svc.saveTokenRepo(ns, aliasEff, domainEff, owner, name, token, false)
+		}
+	}
 	if token == "" {
 		if prompt != nil {
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, owner, name, prompt)

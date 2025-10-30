@@ -1,13 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"log"
+	"io"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/viant/afs"
 	"github.com/viant/jsonrpc"
 	protoclient "github.com/viant/mcp-protocol/client"
 	oa "github.com/viant/mcp-toolbox/auth"
@@ -57,6 +59,9 @@ type Service struct {
 	tunCoolOnce sync.Once
 	tunWait     time.Duration
 	tunCooldown time.Duration
+
+	// secrets persistence
+	secretsBase string
 }
 
 // treeCacheEntry holds cached tree entries with expiration.
@@ -84,6 +89,7 @@ func NewService(cfg *Config) *Service {
 		elicited:       map[string]time.Time{},
 		elicitedGlobal: map[string]time.Time{},
 		waiters:        map[string][]chan struct{}{},
+		secretsBase:    strings.TrimRight(os.ExpandEnv(cfg.SecretsBase), "/"),
 	}
 }
 
@@ -101,6 +107,57 @@ func (s *Service) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/github/auth/check", s.TokenCheckHandler())
 	mux.HandleFunc("/github/auth/oob", s.OOBHandler())
 	mux.HandleFunc("/github/auth/verify", s.VerifyHandler())
+}
+
+func (s *Service) tokenURL(ns, alias, domain, owner, repo string) string {
+	base := s.secretsBase
+	if base == "" {
+		return ""
+	}
+	if domain == "" {
+		domain = "github.com"
+	}
+	parts := []string{base, "github", safePart(ns), safePart(alias), safePart(domain)}
+	if owner != "" && repo != "" {
+		parts = append(parts, safePart(owner), safePart(repo))
+	}
+	parts = append(parts, "token")
+	return strings.Join(parts, "/")
+}
+
+func (s *Service) persistToken(ctx context.Context, ns, alias, domain, owner, repo, token string) {
+	if s.secretsBase == "" || token == "" {
+		return
+	}
+	if url := s.tokenURL(ns, alias, domain, owner, repo); url != "" {
+		_ = afs.New().Upload(ctx, url, 0o600, bytes.NewReader([]byte(token)))
+	}
+}
+
+func (s *Service) loadTokenFromSecrets(ctx context.Context, ns, alias, domain, owner, repo string) string {
+	if s.secretsBase == "" {
+		return ""
+	}
+	// prefer repo-level
+	tryURLs := []string{}
+	if owner != "" && repo != "" {
+		tryURLs = append(tryURLs, s.tokenURL(ns, alias, domain, owner, repo))
+	}
+	tryURLs = append(tryURLs, s.tokenURL(ns, alias, domain, "", ""))
+	for _, u := range tryURLs {
+		if u == "" {
+			continue
+		}
+		rc, err := afs.New().OpenURL(ctx, u)
+		if err == nil && rc != nil {
+			data, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			if len(data) > 0 {
+				return string(data)
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Service) tokenKey(ns, alias, domain string) string {
@@ -412,6 +469,7 @@ func (s *Service) startDeviceFlow(ctx context.Context, alias, domain string, pro
 				ns2 = ns
 			}
 			s.saveToken(ns2, alias, domain, tr.AccessToken)
+			s.persistToken(ctx, ns2, alias, domain, "", "", tr.AccessToken)
 			s.clearElicitedAll(alias, domain)
 			s.notifyToken(ns2, alias, domain)
 			return tr.AccessToken, nil
@@ -551,7 +609,6 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		}
 		if alias == "" {
 			http.Error(w, "alias required", http.StatusBadRequest)
-			log.Printf("[github] token ingest: missing alias; domain=%s", domain)
 			return
 		}
 		// Prefer JSON body token if provided; fall back to Authorization header
@@ -566,16 +623,11 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 				} else if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
 					token = strings.TrimSpace(parts[1])
 				}
-				if token != "" {
-					log.Printf("[github] token ingest: Authorization header parsed; alias=%s domain=%s", alias, domain)
-				} else {
-					log.Printf("[github] token ingest: Authorization header present but unparsable; alias=%s domain=%s", alias, domain)
-				}
+				// removed log.Printf diagnostics
 			}
 		}
 		if token == "" {
 			http.Error(w, "access token missing", http.StatusBadRequest)
-			log.Printf("[github] token ingest: missing token; alias=%s domain=%s", alias, domain)
 			return
 		}
 		// Validate credentials against GitHub before saving to avoid storing invalid tokens.
@@ -597,10 +649,10 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		}
 		if owner != "" && repo != "" {
 			s.saveTokenRepo(ns, alias, domain, owner, repo, token, oauthKey)
-			log.Printf("[github] token ingest: saved repo token; ns=%s alias=%s domain=%s owner=%s repo=%s oauth=%v", ns, alias, domain, owner, repo, oauthKey)
+			s.persistToken(r.Context(), ns, alias, domain, owner, repo, token)
 		} else {
 			s.saveTokenDomain(ns, alias, domain, token, oauthKey)
-			log.Printf("[github] token ingest: saved domain token; ns=%s alias=%s domain=%s oauth=%v", ns, alias, domain, oauthKey)
+			s.persistToken(r.Context(), ns, alias, domain, "", "", token)
 		}
 		s.clearElicitedAll(alias, domain)
 		s.notifyToken(ns, alias, domain)
@@ -713,9 +765,7 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 					s.saveToken(ns2, alias, domain, tr.AccessToken)
 					s.clearElicitedAll(alias, domain)
 					s.notifyToken(ns2, alias, domain)
-					if serviceDebug() {
-						log.Printf("[github] device flow: saved domain token; ns=%s alias=%s domain=%s", ns2, alias, domain)
-					}
+					// removed log.Printf diagnostics
 					return
 				}
 				if tr.Error == "authorization_pending" || tr.Error == "slow_down" {
@@ -753,7 +803,6 @@ func (s *Service) TokenCheckHandler() http.HandlerFunc {
 			ns = "default"
 		}
 		has := s.loadTokenPreferred(ns, alias, domain, owner, repo) != ""
-		log.Printf("[github] token check: alias=%s domain=%s owner=%s repo=%s has=%v", alias, domain, owner, repo, has)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"hasToken": has})
 	}
@@ -812,9 +861,7 @@ func (s *Service) VerifyHandler() http.HandlerFunc {
 		// Resolve commit tree; tolerate 422 by attempting heads/ prefix and finally skipping
 		if _, err := cli.GetCommitTreeSHA(r.Context(), token, owner, name, def); err != nil {
 			// try heads/def and refs/heads/def implicitly handled inside GetCommitTreeSHA; if still errors, proceed
-			if serviceDebug() {
-				log.Printf("[github] verify: commit/tree check failed for %s/%s@%s: %v; tolerating", owner, name, def, err)
-			}
+			// removed log.Printf diagnostics
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "defaultBranch": def})
@@ -1124,9 +1171,7 @@ func (s *Service) notifyToken(ns, alias, domain string) {
 	lst := s.waiters[key]
 	delete(s.waiters, key)
 	s.waitMu.Unlock()
-	if serviceDebug() {
-		log.Printf("[github] notifyToken ns=%s alias=%s domain=%s waiters=%d", ns, alias, domain, len(lst))
-	}
+	// removed log.Printf diagnostics
 	for _, ch := range lst {
 		close(ch)
 	}
@@ -1151,25 +1196,19 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 	cooldown := s.ElicitCooldown()
 	s.elicitMu.Lock()
 	if t, ok := s.elicited[keySess]; ok && now.Sub(t) < cooldown {
-		if serviceDebug() {
-			log.Printf("[github] elicit skip: session cooldown sess=%s alias=%s domain=%s", sess, alias, domain)
-		}
+		// removed log.Printf diagnostics
 		s.elicitMu.Unlock()
 		return
 	}
 	if t, ok := s.elicitedGlobal[keyGlob]; ok && now.Sub(t) < cooldown {
-		if serviceDebug() {
-			log.Printf("[github] elicit skip: global cooldown alias=%s domain=%s", alias, domain)
-		}
+		// removed log.Printf diagnostics
 		s.elicitMu.Unlock()
 		return
 	}
 	s.elicited[keySess] = now
 	s.elicitedGlobal[keyGlob] = now
 	s.elicitMu.Unlock()
-	if serviceDebug() {
-		log.Printf("[github] elicit emit: sess=%s alias=%s domain=%s owner=%s repo=%s", sess, alias, domain, owner, name)
-	}
+	// removed log.Printf diagnostics
 	base := s.BaseURL()
 	q := neturl.Values{}
 	q.Set("alias", alias)
@@ -1198,9 +1237,7 @@ func (s *Service) clearElicitedAll(alias, domain string) {
 	// clear global key elicit|alias|domain
 	delete(s.elicitedGlobal, joinKey("elicit", alias, domain))
 	s.elicitMu.Unlock()
-	if serviceDebug() {
-		log.Printf("[github] elicit cleared for alias=%s domain=%s", alias, domain)
-	}
+	// removed log.Printf diagnostics
 }
 
 // waitForToken blocks until a token is saved for alias/domain (any repo), or context/timeout occurs.
@@ -1213,9 +1250,7 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	s.waitMu.Lock()
 	s.waiters[key] = append(s.waiters[key], ch)
 	s.waitMu.Unlock()
-	if serviceDebug() {
-		log.Printf("[github] waitForToken start ns=%s alias=%s domain=%s owner=%s repo=%s timeout=%s", ns, alias, domain, owner, name, timeout)
-	}
+	// removed log.Printf diagnostics
 	// Re-check in case token arrived before registration
 	if t := s.loadTokenPreferred(ns, alias, domain, owner, name); t != "" {
 		s.notifyToken(ns, alias, domain)
@@ -1225,19 +1260,13 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		if serviceDebug() {
-			log.Printf("[github] waitForToken canceled ns=%s alias=%s domain=%s", ns, alias, domain)
-		}
+		// removed log.Printf diagnostics
 		return false
 	case <-timer.C:
-		if serviceDebug() {
-			log.Printf("[github] waitForToken timeout ns=%s alias=%s domain=%s", ns, alias, domain)
-		}
+		// removed log.Printf diagnostics
 		return false
 	case <-ch:
-		if serviceDebug() {
-			log.Printf("[github] waitForToken notified ns=%s alias=%s domain=%s", ns, alias, domain)
-		}
+		// removed log.Printf diagnostics
 		return true
 	}
 }
@@ -1245,6 +1274,11 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 // Public methods: ListRepos, ListRepoIssues, ListRepoPRs
 func (s *Service) ListRepos(ctx context.Context, in *ListReposInput, prompt func(string)) (*ListReposOutput, error) {
 	alias := s.normalizeAlias(in.Account.Alias)
+	if alias == "" {
+		if inf, _ := s.inferAlias(ctx, in.Account.Domain, "", ""); inf != "" {
+			alias = inf
+		}
+	}
 	cli := adapter.New(in.Account.Domain)
 	repos, err := withCredentialRetry(ctx, s, alias, in.Account.Domain, prompt, func(token string) ([]adapter.Repo, error) {
 		return cli.ListRepos(ctx, token, in.Visibility, in.Affiliation, in.PerPage)
@@ -1260,9 +1294,13 @@ func (s *Service) ListRepos(ctx context.Context, in *ListReposInput, prompt func
 }
 func (s *Service) ListRepoIssues(ctx context.Context, in *ListRepoIssuesInput, prompt func(string)) (*ListRepoIssuesOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
-	domain, owner, name, _, alias, err := t.Init(s)
+	domain, owner, name, _, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := adapter.New(domain)
 	issues, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]adapter.Issue, error) {
@@ -1279,9 +1317,13 @@ func (s *Service) ListRepoIssues(ctx context.Context, in *ListRepoIssuesInput, p
 }
 func (s *Service) ListRepoPRs(ctx context.Context, in *ListRepoPRsInput, prompt func(string)) (*ListRepoPRsOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
-	domain, owner, name, _, alias, err := t.Init(s)
+	domain, owner, name, _, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := adapter.New(domain)
 	pulls, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]adapter.PullRequest, error) {
@@ -1300,9 +1342,13 @@ func (s *Service) ListRepoPRs(ctx context.Context, in *ListRepoPRsInput, prompt 
 // CreateIssue creates a new issue in a repository.
 func (s *Service) CreateIssue(ctx context.Context, in *CreateIssueInput, prompt func(string)) (*CreateIssueOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
-	domain, owner, name, _, alias, err := t.Init(s)
+	domain, owner, name, _, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := adapter.New(domain)
 	issue, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (adapter.Issue, error) {
@@ -1317,9 +1363,13 @@ func (s *Service) CreateIssue(ctx context.Context, in *CreateIssueInput, prompt 
 // CreatePR opens a pull request.
 func (s *Service) CreatePR(ctx context.Context, in *CreatePRInput, prompt func(string)) (*CreatePROutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
-	domain, owner, name, _, alias, err := t.Init(s)
+	domain, owner, name, _, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := adapter.New(domain)
 	pr, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (adapter.PullRequest, error) {
@@ -1334,9 +1384,13 @@ func (s *Service) CreatePR(ctx context.Context, in *CreatePRInput, prompt func(s
 // AddComment adds a comment to an issue or PR (PR comments use issue comments endpoint).
 func (s *Service) AddComment(ctx context.Context, in *AddCommentInput, prompt func(string)) (*AddCommentOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
-	domain, owner, name, _, alias, err := t.Init(s)
+	domain, owner, name, _, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := adapter.New(domain)
 	cm, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (adapter.Comment, error) {
@@ -1351,9 +1405,13 @@ func (s *Service) AddComment(ctx context.Context, in *AddCommentInput, prompt fu
 // ListComments lists comments for an issue or PR.
 func (s *Service) ListComments(ctx context.Context, in *ListCommentsInput, prompt func(string)) (*ListCommentsOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
-	domain, owner, name, _, alias, err := t.Init(s)
+	domain, owner, name, _, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := adapter.New(domain)
 	items, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]adapter.Comment, error) {
@@ -1372,6 +1430,11 @@ func (s *Service) ListComments(ctx context.Context, in *ListCommentsInput, promp
 // SearchIssues runs a GitHub issues/PRs search query.
 func (s *Service) SearchIssues(ctx context.Context, in *SearchIssuesInput, prompt func(string)) (*SearchIssuesOutput, error) {
 	alias := s.normalizeAlias(in.Account.Alias)
+	if alias == "" {
+		if inf, _ := s.inferAlias(ctx, in.Account.Domain, "", ""); inf != "" {
+			alias = inf
+		}
+	}
 	cli := adapter.New(in.Account.Domain)
 	issues, err := withCredentialRetry(ctx, s, alias, in.Account.Domain, prompt, func(token string) ([]adapter.Issue, error) {
 		return cli.SearchIssues(ctx, token, in.Query, in.PerPage)
@@ -1392,28 +1455,13 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 		return nil, fmt.Errorf("input is nil")
 	}
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo, Ref: in.Ref}
-	domain, owner, name, ref, alias, err := t.Init(s)
+	domain, owner, name, ref, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
 	}
-	if alias == "" {
-		// Prefer alias derived from URL owner when that alias already has a token.
-		if ns, _ := s.auth.Namespace(ctx); true {
-			if ns == "" {
-				ns = "default"
-			}
-			if tok := s.loadTokenPreferred(ns, owner, domain, owner, name); tok != "" {
-				alias = owner
-			}
-		}
-		// Try token-based inference next
-		if alias == "" {
-			if inf, _ := s.inferAlias(ctx, domain, owner, name); inf != "" {
-				alias = inf
-			}
-		}
-		// Do not force alias to owner when no token exists.
-		// Leave alias empty so helpers default to a stable alias ("default") for elicitation/wait.
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	// Execute with token using the retry helper to enable elicitation if no token exists.
 	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*ListRepoOutput, error) {
@@ -1425,9 +1473,7 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			if err != nil {
 				return nil, err
 			}
-			if serviceDebug() {
-				log.Printf("[github] list: resolved ref=%q domain=%s owner=%s repo=%s path=%q", ref, domain, owner, name, in.Path)
-			}
+			// removed log.Printf diagnostics
 			// Eagerly validate a user-supplied ref; if invalid, switch to default branch to avoid slow DFS.
 			if strings.TrimSpace(t.Ref) != "" {
 				if err := cli.ValidateRef(ctx, token, owner, name, ref); err != nil {
@@ -1439,14 +1485,10 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			treeSha, err := cli.GetCommitTreeSHA(ctx, token, owner, name, ref)
 			if err != nil {
 				// If commit resolution fails on GHE (e.g., 422), fallback to a contents-based recursive walk.
-				if serviceDebug() {
-					log.Printf("[github] GetCommitTreeSHA failed for ref=%q: %v; falling back to contents DFS", ref, err)
-				}
+				// removed log.Printf diagnostics
 				walker := s.makeContentAPI(domain)
 				startPath := strings.Trim(strings.TrimPrefix(in.Path, "/"), "/")
-				if serviceDebug() {
-					log.Printf("[github] list: DFS start ref=%q path=%q", ref, startPath)
-				}
+				// removed log.Printf diagnostics
 				// Simple DFS over directories using Contents API
 				var out ListRepoOutput
 				var stack = []string{startPath}
@@ -1575,9 +1617,7 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 				useRef = def
 			}
 		}
-		if serviceDebug() {
-			log.Printf("[github] list: contents ref=%q path=%q", useRef, startPath)
-		}
+		// removed log.Printf diagnostics
 		items, err := cli.ListContents(ctx, token, owner, name, startPath, useRef)
 		if err != nil {
 			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
@@ -1671,27 +1711,13 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 		return nil, fmt.Errorf("input is nil")
 	}
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo, Ref: in.Ref}
-	domain, owner, name, ref, alias, err := t.Init(s)
+	domain, owner, name, ref, _, err := t.Init(s)
 	if err != nil {
 		return nil, err
 	}
-	if alias == "" {
-		// Prefer alias derived from URL owner when that alias already has a token.
-		if ns, _ := s.auth.Namespace(ctx); true {
-			if ns == "" {
-				ns = "default"
-			}
-			if tok := s.loadTokenPreferred(ns, owner, domain, owner, name); tok != "" {
-				alias = owner
-			}
-		}
-		// Try token-based inference next
-		if alias == "" {
-			if inf, _ := s.inferAlias(ctx, domain, owner, name); inf != "" {
-				alias = inf
-			}
-		}
-		// Do not force alias to owner when no token exists; prefer stable default in helpers.
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
 	}
 	cli := s.makeContentAPI(domain)
 	data, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]byte, error) {
@@ -1703,17 +1729,13 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 				useRef = def
 			}
 		}
-		if serviceDebug() {
-			log.Printf("[github] download: using ref=%q path=%q", useRef, in.Path)
-		}
+		// removed log.Printf diagnostics
 		p := strings.TrimPrefix(in.Path, "/")
 		// First try contents API
 		if data, err := cli.GetFileContent(ctx, token, owner, name, p, useRef); err == nil {
 			return data, nil
 		}
-		if serviceDebug() {
-			log.Printf("[github] download: contents failed for ref=%q path=%q; falling back to contents-dir+blob", useRef, p)
-		}
+		// removed log.Printf diagnostics
 		// Fallback: list parent directory via contents on default branch to obtain file SHA, then fetch blob by SHA
 		parent := p
 		if idx := strings.LastIndex(parent, "/"); idx >= 0 {

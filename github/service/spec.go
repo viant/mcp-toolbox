@@ -41,7 +41,7 @@ func (t *GitTarget) Init(s *Service) (domain, owner, name, ref, alias string, er
 		name = t.Repo.Name
 	}
 	ref = strings.TrimSpace(t.Ref)
-    alias = s.normalizeAlias(t.Account.Alias)
+	alias = s.normalizeAlias(t.Account.Alias)
 	if owner == "" || name == "" {
 		return "", "", "", "", "", fmt.Errorf("repo.owner and repo.name are required (or provide url)")
 	}
@@ -59,4 +59,26 @@ func (t *GitTarget) ResolveRef(ctx context.Context, cli *adapter.Client, token, 
 		return "", err
 	}
 	return def, nil
+}
+
+// GetAlias returns the effective alias for repo-scoped operations using only target data.
+// Order of precedence:
+// 1) Explicit account.alias if provided.
+// 2) If exactly one stored alias has a token for this repo, use that alias (inference).
+// 3) Default to "owner/repo" derived from the target.
+func (t *GitTarget) GetAlias(ctx context.Context, s *Service) (string, error) {
+	domain, owner, name, _, alias, err := t.Init(s)
+	if err != nil {
+		return "", err
+	}
+	if alias != "" {
+		return alias, nil
+	}
+	if owner == "" || name == "" {
+		return "", nil
+	}
+	if inf, _ := s.inferAlias(ctx, domain, owner, name); inf != "" {
+		return inf, nil
+	}
+	return owner + "/" + name, nil
 }

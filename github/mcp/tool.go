@@ -1,14 +1,14 @@
 package mcp
 
 import (
-    "context"
-    _ "embed"
-    "encoding/json"
-    "fmt"
-    neturl "net/url"
-    "regexp"
-    "strings"
-    "os"
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	neturl "net/url"
+	"os"
+	"regexp"
+	"strings"
 
 	"github.com/viant/jsonrpc"
 	"github.com/viant/mcp-protocol/schema"
@@ -56,26 +56,29 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	ops := h.ops
 
 	// Helper to surface device login prompt via elicitation.
-    msgPrompt := func(ctx context.Context) func(string) {
-        if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
-            return nil
-        }
-        return func(msg string) {
-            u := extractURL(msg)
-            code := extractCode(msg)
-            text := buildPromptMessage(u, code)
-            elicitID := newUUID()
-            if serviceDebug := func() bool { v := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG"))); return v != "" && v != "0" && v != "false" }(); serviceDebug {
-                fmt.Printf("[github/mcp] Elicit sent url=%s msg=%q\n", u, text)
-            }
-            _, _ = ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-                Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
-            }})
-        }
-    }
+	msgPrompt := func(ctx context.Context) func(string) {
+		if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
+			return nil
+		}
+		return func(msg string) {
+			u := extractURL(msg)
+			code := extractCode(msg)
+			text := buildPromptMessage(u, code)
+			elicitID := newUUID()
+			if serviceDebug := func() bool {
+				v := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG")))
+				return v != "" && v != "0" && v != "false"
+			}(); serviceDebug {
+				fmt.Printf("[github/mcp] Elicit sent url=%s msg=%q\n", u, text)
+			}
+			_, _ = ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
+				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
+			}})
+		}
+	}
 
 	// List repositories
-    if err := protoserver.RegisterTool[*ghservice.ListReposInput, *ghservice.ListReposOutput](base.Registry, "githubListRepos", descListRepos, func(ctx context.Context, in *ghservice.ListReposInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.ListReposInput, *ghservice.ListReposOutput](base.Registry, "githubListRepos", descListRepos, func(ctx context.Context, in *ghservice.ListReposInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		out, err := svc.ListRepos(ctx, in, msgPrompt(ctx))
 		if err != nil {
 			return buildErrorResult(err.Error())
@@ -86,7 +89,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// List repo issues
-    if err := protoserver.RegisterTool[*ghservice.ListRepoIssuesInput, *ghservice.ListRepoIssuesOutput](base.Registry, "githubListRepoIssues", descListIssues, func(ctx context.Context, in *ghservice.ListRepoIssuesInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.ListRepoIssuesInput, *ghservice.ListRepoIssuesOutput](base.Registry, "githubListRepoIssues", descListIssues, func(ctx context.Context, in *ghservice.ListRepoIssuesInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -100,7 +103,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// List repo pull requests
-    if err := protoserver.RegisterTool[*ghservice.ListRepoPRsInput, *ghservice.ListRepoPRsOutput](base.Registry, "githubListRepoPRs", descListPRs, func(ctx context.Context, in *ghservice.ListRepoPRsInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.ListRepoPRsInput, *ghservice.ListRepoPRsOutput](base.Registry, "githubListRepoPRs", descListPRs, func(ctx context.Context, in *ghservice.ListRepoPRsInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -114,7 +117,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Create issue
-    if err := protoserver.RegisterTool[*ghservice.CreateIssueInput, *ghservice.CreateIssueOutput](base.Registry, "githubCreateIssue", descCreateIssue, func(ctx context.Context, in *ghservice.CreateIssueInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.CreateIssueInput, *ghservice.CreateIssueOutput](base.Registry, "githubCreateIssue", descCreateIssue, func(ctx context.Context, in *ghservice.CreateIssueInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -131,7 +134,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Create PR
-    if err := protoserver.RegisterTool[*ghservice.CreatePRInput, *ghservice.CreatePROutput](base.Registry, "githubCreatePR", descCreatePR, func(ctx context.Context, in *ghservice.CreatePRInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.CreatePRInput, *ghservice.CreatePROutput](base.Registry, "githubCreatePR", descCreatePR, func(ctx context.Context, in *ghservice.CreatePRInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -148,7 +151,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Add comment
-    if err := protoserver.RegisterTool[*ghservice.AddCommentInput, *ghservice.AddCommentOutput](base.Registry, "githubAddComment", descAddComment, func(ctx context.Context, in *ghservice.AddCommentInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.AddCommentInput, *ghservice.AddCommentOutput](base.Registry, "githubAddComment", descAddComment, func(ctx context.Context, in *ghservice.AddCommentInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -168,7 +171,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// List comments
-    if err := protoserver.RegisterTool[*ghservice.ListCommentsInput, *ghservice.ListCommentsOutput](base.Registry, "githubListComments", descListComments, func(ctx context.Context, in *ghservice.ListCommentsInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.ListCommentsInput, *ghservice.ListCommentsOutput](base.Registry, "githubListComments", descListComments, func(ctx context.Context, in *ghservice.ListCommentsInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -186,9 +189,6 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Search issues/PRs
 	if err := protoserver.RegisterTool[*ghservice.SearchIssuesInput, *ghservice.SearchIssuesOutput](base.Registry, "githubSearchIssues", descSearchIssues, func(ctx context.Context, in *ghservice.SearchIssuesInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		if in.Account.Alias == "" {
-			return buildErrorResult("account.alias is required")
-		}
 		if strings.TrimSpace(in.Query) == "" {
 			return buildErrorResult("query is required")
 		}
@@ -202,7 +202,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Checkout repository (clone + optional branch/commit)
-    if err := protoserver.RegisterTool[*ghservice.CheckoutRepoInput, *ghservice.CheckoutRepoOutput](base.Registry, "githubCheckoutRepo", descCheckoutRepo, func(ctx context.Context, in *ghservice.CheckoutRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.CheckoutRepoInput, *ghservice.CheckoutRepoOutput](base.Registry, "githubCheckoutRepo", descCheckoutRepo, func(ctx context.Context, in *ghservice.CheckoutRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -216,7 +216,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// List repo path (without clone)
-    if err := protoserver.RegisterTool[*ghservice.ListRepoInput, *ghservice.ListRepoOutput](base.Registry, "listRepo", descListRepoPath, func(ctx context.Context, in *ghservice.ListRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.ListRepoInput, *ghservice.ListRepoOutput](base.Registry, "listRepo", descListRepoPath, func(ctx context.Context, in *ghservice.ListRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -230,7 +230,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Download repo file (without clone)
-    if err := protoserver.RegisterTool[*ghservice.DownloadInput, *ghservice.DownloadOutput](base.Registry, "download", descDownloadRepoFile, func(ctx context.Context, in *ghservice.DownloadInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.DownloadInput, *ghservice.DownloadOutput](base.Registry, "download", descDownloadRepoFile, func(ctx context.Context, in *ghservice.DownloadInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
@@ -268,37 +268,37 @@ func ghsvcUUID() string { return ghservice.NewUUID() }
 
 // Helpers to extract URL/code from device prompt text.
 func extractURL(msg string) string {
-    if m := regexp.MustCompile(`https?://[^\s]+`).FindString(msg); m != "" {
-        return m
-    }
-    return "https://github.com/login/device"
+	if m := regexp.MustCompile(`https?://[^\s]+`).FindString(msg); m != "" {
+		return m
+	}
+	return "https://github.com/login/device"
 }
 func extractCode(msg string) string {
-    if m := regexp.MustCompile(`(?i)code\s+([A-Z0-9-]+)`).FindStringSubmatch(msg); len(m) == 2 {
-        return m[1]
-    }
-    return ""
+	if m := regexp.MustCompile(`(?i)code\s+([A-Z0-9-]+)`).FindStringSubmatch(msg); len(m) == 2 {
+		return m[1]
+	}
+	return ""
 }
 
 // buildPromptMessage creates a concise, user-friendly message without exposing full URLs.
 func buildPromptMessage(u, code string) string {
-    if strings.TrimSpace(code) != "" {
-        return fmt.Sprintf("Open GitHub and enter code: %s", code)
-    }
-    // Try to derive a friendly target from OOB URL params
-    if p, err := neturl.Parse(u); err == nil {
-        q := p.Query()
-        if repo := q.Get("url"); repo != "" {
-            return fmt.Sprintf("Authorize access for %s", repo)
-        }
-        if domain := q.Get("domain"); domain != "" {
-            return fmt.Sprintf("Authorize GitHub access for %s", domain)
-        }
-        if host := p.Host; host != "" {
-            return fmt.Sprintf("Open authentication on %s", host)
-        }
-    }
-    return "Additional input required"
+	if strings.TrimSpace(code) != "" {
+		return fmt.Sprintf("Open GitHub and enter code: %s", code)
+	}
+	// Try to derive a friendly target from OOB URL params
+	if p, err := neturl.Parse(u); err == nil {
+		q := p.Query()
+		if repo := q.Get("url"); repo != "" {
+			return fmt.Sprintf("Authorize access for %s", repo)
+		}
+		if domain := q.Get("domain"); domain != "" {
+			return fmt.Sprintf("Authorize GitHub access for %s", domain)
+		}
+		if host := p.Host; host != "" {
+			return fmt.Sprintf("Open authentication on %s", host)
+		}
+	}
+	return "Additional input required"
 }
 
 // apiBase removed from this file; handled by adapter.

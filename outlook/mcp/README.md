@@ -6,7 +6,7 @@ This service supports loading Azure OAuth2 client configuration from a scy resou
 
 - `clientID`: Fallback Azure application (client) ID.
 - `tenantID`: Fallback tenant ID.
-- `storageDir`: Directory for auth records per account alias.
+- `secretsBase`: AFS/scy base URL for auth records per namespace+alias (e.g., `mem://localhost/mcp-outlook`, `file://~/.mcp/outlook`).
 - `callbackBaseURL`: Base URL for device login page rendering.
 - `useData` / `useText`: Output formatting flags.
 - `azureRef`: scy EncodedResource to load `cred.Azure`.
@@ -78,7 +78,7 @@ go run ./outlook/cmd/outlook-mcp -addr :7788 -storage "$HOME/.config/mcp-outlook
 
 - On startup, if `azureRef` is set, the service loads the secret via scy and applies `ClientID` from the secret. If absent, it uses `clientID` from config.
 - If `tenantID` flag/env is empty or set to `organizations`, the server will use `TenantID` from the `azureRef` secret when available.
-- Device Code flow is used for Microsoft Graph and auth records are saved under `storageDir`.
+- Device Code flow is used for Microsoft Graph and auth records are written under `secretsBase`.
 
 ## Notes
 
