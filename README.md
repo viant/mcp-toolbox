@@ -47,9 +47,9 @@ Run:
 
 ```
 go run ./github/cmd/github-mcp \
-  -addr :7789 \
-  -client-id YOUR_GITHUB_CLIENT_ID \
-  --secretsBase mem://localhost/mcp-github
+  -a :7789 \
+  -o "ipd_xxx.enc|blowfish://default" -i
+  
 ```
 
 Endpoints (selected):
@@ -69,15 +69,14 @@ Runs an MCP server integrated with Microsoft Graph using Device Code flow. You c
 Run with flags:
 
 ```
-
-
-	os.Args = []string{"", "-addr", ":7788", "-storage", "$HOME/.config/mcp-outlook", "-azure-ref", "~/.secret/azure.enc|blowfish://default"}
-
-
 go run ./outlook/cmd/outlook-mcp \
-  --addr :7788 \
-  --azure-ref "gcp://secretmanager/projects/myproj/secrets/azure-cred|blowfish://default"
+  --a :7788 \
+  --azure-ref "azure-cred|blowfish://default"
+   -o "ipd_xxx.enc|blowfish://default" -i
 ```
+
+
+
 
 Or environment variables:
 
