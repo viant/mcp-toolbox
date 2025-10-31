@@ -16,7 +16,7 @@ require (
 	github.com/viant/afs v1.26.2
 	github.com/viant/gosh v0.2.1
 	github.com/viant/jsonrpc v0.16.0
-	github.com/viant/mcp v0.8.0
+	github.com/viant/mcp v0.8.1
 	github.com/viant/mcp-protocol v0.6.0
 	github.com/viant/scy v0.25.4-0.20251010021037-5a0b62e88695
 )
@@ -89,4 +89,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/viant/mcp => ../mcp
