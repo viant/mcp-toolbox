@@ -47,7 +47,7 @@ type Service struct {
 	// elicit guards to avoid spamming multiple prompts for the same ns/alias/domain
 	elicitMu sync.Mutex
 	elicited map[string]time.Time
-	// global dedup across sessions per alias/domain
+	// global dedup across sessions per alias/domain/namespace
 	elicitedGlobal map[string]time.Time
 
 	// token waiters per alias/domain
@@ -576,6 +576,7 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		Repo        string `json:"repo"`
 		AccessToken string `json:"access_token"`
 		OAuthKey    bool   `json:"oauthKey"`
+		UUID        string `json:"uuid,omitempty"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -587,6 +588,7 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		owner := r.URL.Query().Get("owner")
 		repo := r.URL.Query().Get("repo")
 		oauthKey := r.URL.Query().Get("oauthKey") == "true"
+		uuid := r.URL.Query().Get("uuid")
 		var rb reqBody
 		if ct := r.Header.Get("Content-Type"); strings.HasPrefix(ct, "application/json") {
 			_ = json.NewDecoder(r.Body).Decode(&rb)
@@ -606,6 +608,9 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		}
 		if !oauthKey {
 			oauthKey = rb.OAuthKey
+		}
+		if uuid == "" {
+			uuid = rb.UUID
 		}
 		if alias == "" {
 			http.Error(w, "alias required", http.StatusBadRequest)
@@ -647,6 +652,12 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		if ns == "" {
 			ns = "default"
 		}
+		// If uuid corresponds to a pending auth, prefer its namespace to bind OOB to the original session
+		if u := strings.TrimSpace(uuid); u != "" {
+			if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
+				ns = pend.Namespace
+			}
+		}
 		if owner != "" && repo != "" {
 			s.saveTokenRepo(ns, alias, domain, owner, repo, token, oauthKey)
 			s.persistToken(r.Context(), ns, alias, domain, owner, repo, token)
@@ -656,6 +667,9 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		}
 		s.clearElicitedAll(alias, domain)
 		s.notifyToken(ns, alias, domain)
+		if uuid != "" {
+			s.pending.Remove(uuid)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 	}
@@ -802,7 +816,20 @@ func (s *Service) TokenCheckHandler() http.HandlerFunc {
 		if ns == "" {
 			ns = "default"
 		}
+		// Allow OOB to pin namespace via pending uuid; if missing (already consumed), fall back to any-ns visibility for UI only
+		if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
+			if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
+				ns = pend.Namespace
+			}
+		}
 		has := s.loadTokenPreferred(ns, alias, domain, owner, repo) != ""
+		if !has {
+			if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
+				if s.loadTokenPreferredAnyNS(alias, domain, owner, repo) != "" {
+					has = true
+				}
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"hasToken": has})
 	}
@@ -845,6 +872,12 @@ func (s *Service) VerifyHandler() http.HandlerFunc {
 		ns, _ := s.auth.Namespace(r.Context())
 		if ns == "" {
 			ns = "default"
+		}
+		// Allow OOB to pin namespace via pending uuid
+		if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
+			if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
+				ns = pend.Namespace
+			}
 		}
 		token := s.loadToken(ns, alias, domain)
 		if token == "" {
@@ -1004,7 +1037,7 @@ document.querySelectorAll('.tab').forEach(el => el.addEventListener('click', () 
   ['bearer','user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.remove('error')});
 }));
 async function pollCheck(alias, domain) {
-  const url = '{{BASE}}/github/auth/check?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'');
+  const url = '{{BASE}}/github/auth/check?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}';
   for (let i=0; i<60; i++) { // ~60 * 2s = 2 minutes
     const r = await fetch(url);
     const j = await r.json();
@@ -1034,12 +1067,12 @@ async function onOK() {
   const flagBasicError = (msg)=>{ status.textContent = msg; status.classList.add('error'); ['user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.add('error')}); };
   try {
     if (bearer) {
-      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||''), { method:'POST', headers: { 'Authorization': 'Bearer ' + bearer } });
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Bearer ' + bearer } });
       if (!r.ok) { const txt = await r.text(); flagTokenError(r.status===401 ? 'Invalid token' : ('Save failed: ' + txt)); return }
       if (await pollCheck(alias, domain)) {
         const repourl = document.getElementById('repourl').value.trim();
         if (repourl) {
-          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl));
+          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
           if (!vr.ok) { flagTokenError('Verify failed: ' + (await vr.text())); return; }
         }
         status.textContent = 'OK: token saved'; tryClose('OK');
@@ -1048,12 +1081,12 @@ async function onOK() {
     }
     if (user || pass) {
       const basic = btoa((user||'') + ':' + (pass||''));
-      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||''), { method:'POST', headers: { 'Authorization': 'Basic ' + basic } });
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Basic ' + basic } });
       if (!r.ok) { const txt = await r.text(); flagBasicError(r.status===401 ? 'Invalid username or token' : ('Save failed: ' + txt)); return }
       if (await pollCheck(alias, domain)) {
         const repourl = document.getElementById('repourl').value.trim();
         if (repourl) {
-          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl));
+          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
           if (!vr.ok) { flagBasicError('Verify failed: ' + (await vr.text())); return; }
         }
         status.textContent = 'OK: basic saved'; tryClose('OK');
@@ -1080,6 +1113,7 @@ function onReject(){ document.getElementById('status').textContent = 'Rejected b
 			"{{BASE}}", html.EscapeString(base),
 			"{{DEVICE}}", deviceInitial,
 			"{{REPOURL}}", html.EscapeString(repourl),
+			"{{UUID}}", html.EscapeString(uuid),
 		)
 		htmlPage := repl.Replace(htmlTmpl)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1115,6 +1149,15 @@ func (s *Service) BaseURL() string                            { return s.baseURL
 func (s *Service) StorageDir() string                         { return s.storageDir }
 func (s *Service) ClientID() string                           { return s.clientID }
 func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
+
+// Namespace returns the effective authorization namespace for this request context,
+// or "default" when not set.
+func (s *Service) Namespace(ctx context.Context) string {
+	if v, err := s.auth.Namespace(ctx); err == nil && v != "" {
+		return v
+	}
+	return "default"
+}
 
 func (s *Service) sessionOrNamespace(ctx context.Context) string {
 	// Prefer transport session id set by JSON-RPC transport
@@ -1177,6 +1220,9 @@ func (s *Service) notifyToken(ns, alias, domain string) {
 	}
 }
 
+// notifyTokenAll wakes any goroutines waiting for a token for (alias,domain) in any namespace.
+// notifyTokenAll removed to preserve strict namespace isolation; callers should use notifyToken with exact namespace.
+
 func serviceDebug() bool {
 	// Enable debug logs only when GITHUB_MCP_DEBUG is truthy
 	// (any non-empty value other than 0/false)
@@ -1191,7 +1237,11 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 	}
 	sess := s.sessionOrNamespace(ctx)
 	keySess := joinKey("elicit", sess, alias, domain)
-	keyGlob := joinKey("elicit", alias, domain)
+	nsVal := "default"
+	if v, err := s.auth.Namespace(ctx); err == nil && v != "" {
+		nsVal = v
+	}
+	keyGlob := joinKey("elicitNS", nsVal, alias, domain)
 	now := time.Now()
 	cooldown := s.ElicitCooldown()
 	s.elicitMu.Lock()
@@ -1219,6 +1269,11 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 	if owner != "" && name != "" {
 		q.Set("url", fmt.Sprintf("%s/%s/%s", domain, owner, name))
 	}
+	// Create a synthetic pending to carry namespace for OOB token ingestion
+	nsUse := nsVal
+	pid := uuid.New().String()
+	s.pending.Put(&PendingAuth{UUID: pid, Alias: alias, Namespace: nsUse})
+	q.Set("uuid", pid)
 	prompt(fmt.Sprintf("Open %s/github/auth/oob?%s to provide credentials", strings.TrimRight(base, "/"), q.Encode()))
 }
 
@@ -1234,10 +1289,17 @@ func (s *Service) clearElicitedAll(alias, domain string) {
 			}
 		}
 	}
-	// clear global key elicit|alias|domain
-	delete(s.elicitedGlobal, joinKey("elicit", alias, domain))
+	// clear any global key elicitNS|ns|alias|domain
+	for k := range s.elicitedGlobal {
+		parts := strings.Split(k, "|")
+		if len(parts) >= 4 {
+			// format: elicitNS|ns|alias|domain
+			if parts[2] == safePart(alias) && parts[3] == safePart(domain) {
+				delete(s.elicitedGlobal, k)
+			}
+		}
+	}
 	s.elicitMu.Unlock()
-	// removed log.Printf diagnostics
 }
 
 // waitForToken blocks until a token is saved for alias/domain (any repo), or context/timeout occurs.
@@ -1260,13 +1322,10 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		// removed log.Printf diagnostics
 		return false
 	case <-timer.C:
-		// removed log.Printf diagnostics
 		return false
 	case <-ch:
-		// removed log.Printf diagnostics
 		return true
 	}
 }

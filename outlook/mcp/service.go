@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"html"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/viant/jsonrpc"
 	protoclient "github.com/viant/mcp-protocol/client"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -36,6 +38,13 @@ type Service struct {
 	// service-level lazy cache of DeviceCodeCredential per namespace+alias
 	credMu sync.RWMutex
 	creds  map[string]*azidentity.DeviceCodeCredential
+
+	// Elicitation dedupe per session and globally (alias+tenant)
+	elicitMu       sync.Mutex
+	elicited       map[string]time.Time
+	elicitedGlobal map[string]time.Time
+	tunCoolOnce    sync.Once
+	tunCooldown    time.Duration
 }
 
 func NewService(cfg *Config) *Service {
@@ -63,16 +72,18 @@ func NewService(cfg *Config) *Service {
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
 	return &Service{
-		graphMgr:    graph.NewManager(clientID, cfg.SecretsBase),
-		baseURL:     cfg.CallbackBaseURL,
-		useText:     useText,
-		pending:     NewPendingAuths(),
-		auth:        oa.New(),
-		azure:       az,
-		tenantID:    tenantID,
-		clientID:    clientID,
-		secretsBase: cfg.SecretsBase,
-		creds:       map[string]*azidentity.DeviceCodeCredential{},
+		graphMgr:       graph.NewManager(clientID, cfg.SecretsBase),
+		baseURL:        cfg.CallbackBaseURL,
+		useText:        useText,
+		pending:        NewPendingAuths(),
+		auth:           oa.New(),
+		azure:          az,
+		tenantID:       tenantID,
+		clientID:       clientID,
+		secretsBase:    cfg.SecretsBase,
+		creds:          map[string]*azidentity.DeviceCodeCredential{},
+		elicited:       map[string]time.Time{},
+		elicitedGlobal: map[string]time.Time{},
 	}
 }
 
@@ -245,7 +256,12 @@ func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes
 		return c, nil
 	}
 	s.credMu.RUnlock()
-	cred, err := s.graphMgr.Credential(ctx, alias, tenantID, scopes, prompt)
+	// Wrap prompt with elicitation cooldown/dedupe
+	wp := prompt
+	if prompt != nil {
+		wp = func(msg string) { s.maybeElicitOnce(ctx, alias, tenantID, msg, prompt) }
+	}
+	cred, err := s.graphMgr.Credential(ctx, alias, tenantID, scopes, wp)
 	if err != nil {
 		return nil, err
 	}
@@ -256,5 +272,82 @@ func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes
 	}
 	s.creds[key] = cred
 	s.credMu.Unlock()
+	// Clear dedupe marks after successful acquisition
+	s.clearElicitedAll(alias, tenantID)
 	return cred, nil
+}
+
+// sessionOrNamespace prefers transport session id else auth namespace
+func (s *Service) sessionOrNamespace(ctx context.Context) string {
+	if v := ctx.Value(jsonrpc.SessionKey); v != nil {
+		if id, ok := v.(string); ok && id != "" {
+			return id
+		}
+	}
+	if v, err := s.auth.Namespace(ctx); err == nil && v != "" {
+		return v
+	}
+	return "default"
+}
+
+// ElicitCooldown returns cooldown between repeated elicitations; default 60s.
+func (s *Service) ElicitCooldown() time.Duration {
+	s.tunCoolOnce.Do(func() {
+		if v := strings.TrimSpace(os.Getenv("OUTLOOK_MCP_ELICIT_COOLDOWN_SECS")); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil {
+				s.tunCooldown = n
+			}
+		}
+		if s.tunCooldown == 0 {
+			s.tunCooldown = 60 * time.Second
+		}
+	})
+	return s.tunCooldown
+}
+
+// maybeElicitOnce emits at most once per cooldown window for session and global scopes.
+func (s *Service) maybeElicitOnce(ctx context.Context, alias, tenantID, msg string, prompt func(string)) {
+	if prompt == nil {
+		return
+	}
+	sess := s.sessionOrNamespace(ctx)
+	keySess := "elicit|" + safePart(sess) + "|" + safePart(alias) + "|" + safePart(tenantID)
+	keyGlob := "elicit|" + safePart(alias) + "|" + safePart(tenantID)
+	now := time.Now()
+	cooldown := s.ElicitCooldown()
+	s.elicitMu.Lock()
+	if t, ok := s.elicited[keySess]; ok && now.Sub(t) < cooldown {
+		s.elicitMu.Unlock()
+		return
+	}
+	if t, ok := s.elicitedGlobal[keyGlob]; ok && now.Sub(t) < cooldown {
+		s.elicitMu.Unlock()
+		return
+	}
+	s.elicited[keySess] = now
+	s.elicitedGlobal[keyGlob] = now
+	s.elicitMu.Unlock()
+	prompt(msg)
+}
+
+// clearElicitedAll clears dedupe entries for any session for alias/tenant.
+func (s *Service) clearElicitedAll(alias, tenantID string) {
+	s.elicitMu.Lock()
+	for k := range s.elicited {
+		parts := strings.Split(k, "|")
+		if len(parts) >= 4 {
+			if parts[2] == safePart(alias) && parts[3] == safePart(tenantID) {
+				delete(s.elicited, k)
+			}
+		}
+	}
+	delete(s.elicitedGlobal, "elicit|"+safePart(alias)+"|"+safePart(tenantID))
+	s.elicitMu.Unlock()
+}
+
+// local safePart for key building (avoid special characters)
+func safePart(s string) string {
+	s = strings.TrimSpace(s)
+	repl := strings.NewReplacer("|", "_", " ", "_")
+	return repl.Replace(s)
 }

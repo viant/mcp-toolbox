@@ -47,16 +47,24 @@ func (s *Service) CheckoutRepo(ctx context.Context, in *CheckoutRepoInput, promp
 
 		dest := in.DestDir
 		if dest == "" {
-			base := fmt.Sprintf("gh_%s_%s", sanitize(owner), sanitize(name))
+			// Derive a per-namespace, per-alias parent directory to isolate checkouts.
+			ns, _ := s.auth.Namespace(ctx)
+			if ns == "" {
+				ns = "default"
+			}
+			aliasSafe := sanitize(alias)
+			nsSafe := sanitize(ns)
 			parent := s.storageDir
 			if parent == "" {
 				parent = filepath.ToSlash(os.TempDir())
 			}
-			// ensure parent via AFS
-			if err := afs.New().Create(ctx, parent, afsfile.DefaultDirOsMode, true); err != nil {
+			// parent/<ns>__<alias>/gh_owner_repo
+			parentNS := filepath.Join(parent, nsSafe+"__"+aliasSafe)
+			if err := afs.New().Create(ctx, parentNS, afsfile.DefaultDirOsMode, true); err != nil {
 				return nil, err
 			}
-			dest = filepath.Join(parent, base)
+			base := fmt.Sprintf("gh_%s_%s", sanitize(owner), sanitize(name))
+			dest = filepath.Join(parentNS, base)
 		}
 
 		// Determine if we need to clone or open.

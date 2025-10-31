@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	neturl "net/url"
-	"os"
 	"regexp"
 	"strings"
 
@@ -65,12 +64,6 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			code := extractCode(msg)
 			text := buildPromptMessage(u, code)
 			elicitID := newUUID()
-			if serviceDebug := func() bool {
-				v := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG")))
-				return v != "" && v != "0" && v != "false"
-			}(); serviceDebug {
-				fmt.Printf("[github/mcp] Elicit sent url=%s msg=%q\n", u, text)
-			}
 			_, _ = ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
 				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
 			}})

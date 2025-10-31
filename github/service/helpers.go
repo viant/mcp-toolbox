@@ -50,7 +50,8 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 			}
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, "", "", wait) {
 				token = svc.loadToken(ns, aliasEff, domainEff)
-				if token == "" {
+				// Only allow cross-namespace fallback when operating in the shared default namespace.
+				if token == "" && ns == "default" {
 					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
 				}
 			}
@@ -59,9 +60,7 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or use /github/auth/start explicitly", aliasEff, domainEff)
 		}
 	}
-	if strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG"))) != "" {
-		fmt.Printf("[github] invoking call with domain token alias=%s domain=%s\n", aliasEff, domainEff)
-	}
+	// debug logging removed
 	out, err := call(token)
 	if err == nil {
 		return out, nil
@@ -111,7 +110,8 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			}
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, owner, name, wait) {
 				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
-				if token == "" {
+				// Only allow cross-namespace fallback when operating in the shared default namespace.
+				if token == "" && ns == "default" {
 					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
 				}
 			}
@@ -120,9 +120,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or /github/auth/token", aliasEff, domainEff)
 		}
 	}
-	if strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG"))) != "" {
-		fmt.Printf("[github] invoking call with repo token alias=%s domain=%s owner=%s repo=%s\n", aliasEff, domainEff, owner, name)
-	}
+	// debug logging removed
 	out, err := call(token)
 	if err == nil {
 		return out, nil

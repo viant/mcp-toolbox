@@ -34,6 +34,8 @@ type Manager struct {
 	clients map[string]*msgraphsdk.GraphServiceClient
 	// creds caches device code credentials per alias, kept in memory until process restarts.
 	creds map[string]*azidentity.DeviceCodeCredential
+	// inflight credential acquisitions per ns|alias to serialize device flows
+	waiters map[string][]chan struct{}
 }
 
 type pendingAuth struct{ message string }
@@ -46,6 +48,7 @@ func NewManager(clientID, storageDir string) *Manager {
 		pending:    map[string]*pendingAuth{},
 		clients:    map[string]*msgraphsdk.GraphServiceClient{},
 		creds:      map[string]*azidentity.DeviceCodeCredential{},
+		waiters:    map[string][]chan struct{}{},
 	}
 }
 
@@ -213,19 +216,28 @@ func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
 // StartDeviceLogin launches the device code authentication in background.
 // It stores the prompt message to be retrievable via DevicePrompt.
 func (m *Manager) StartDeviceLogin(ctx context.Context, alias, tenantID string, scopes []string, onComplete func()) {
+	m.mu.Lock()
 	if _, ok := m.pending[alias]; ok {
+		m.mu.Unlock()
 		return
 	}
 	holder := &pendingAuth{}
 	m.pending[alias] = holder
+	m.mu.Unlock()
 	go func() {
-		prompt := func(msg string) { holder.message = msg }
-		if _, _, err := m.acquireCredential(ctx, alias, tenantID, scopes, prompt); err == nil {
+		prompt := func(msg string) {
+			m.mu.Lock()
+			holder.message = msg
+			m.mu.Unlock()
+		}
+		if _, err := m.Credential(ctx, alias, tenantID, scopes, prompt); err == nil {
 			if onComplete != nil {
 				onComplete()
 			}
 		}
+		m.mu.Lock()
 		delete(m.pending, alias)
+		m.mu.Unlock()
 	}()
 }
 
@@ -310,10 +322,14 @@ func outlookDebug() bool {
 
 // DevicePrompt returns the last device-code prompt message for alias.
 func (m *Manager) DevicePrompt(alias string) string {
-	if p, ok := m.pending[alias]; ok {
-		return p.message
+	m.mu.RLock()
+	p, ok := m.pending[alias]
+	msg := ""
+	if ok && p != nil {
+		msg = p.message
 	}
-	return ""
+	m.mu.RUnlock()
+	return msg
 }
 
 // DefaultScopes returns the minimal set for email, calendar, tasks with offline access.
@@ -358,22 +374,55 @@ func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes
 		ns = "default"
 	}
 	key := ns + "|" + alias
+	// Fast path: cached
 	m.mu.RLock()
 	if c := m.creds[key]; c != nil {
 		m.mu.RUnlock()
 		return c, nil
 	}
 	m.mu.RUnlock()
+	// Inflight coordination
+	m.mu.Lock()
+	if c := m.creds[key]; c != nil {
+		m.mu.Unlock()
+		return c, nil
+	}
+	if lst, ok := m.waiters[key]; ok {
+		ch := make(chan struct{})
+		m.waiters[key] = append(lst, ch)
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ch:
+		}
+		m.mu.RLock()
+		c := m.creds[key]
+		m.mu.RUnlock()
+		if c == nil {
+			return nil, errors.New("credential acquisition failed")
+		}
+		return c, nil
+	}
+	// Mark inflight
+	m.waiters[key] = []chan struct{}{}
+	m.mu.Unlock()
 	cred, _, err := m.acquireCredential(ctx, alias, tenantID, scopes, prompt)
+	// Publish result and wake waiters
+	m.mu.Lock()
+	if existing := m.creds[key]; existing != nil {
+		cred = existing
+	} else if err == nil {
+		m.creds[key] = cred
+	}
+	lst := m.waiters[key]
+	delete(m.waiters, key)
+	m.mu.Unlock()
+	for _, ch := range lst {
+		close(ch)
+	}
 	if err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	if existing := m.creds[key]; existing != nil {
-		m.mu.Unlock()
-		return existing, nil
-	}
-	m.creds[key] = cred
-	m.mu.Unlock()
 	return cred, nil
 }
