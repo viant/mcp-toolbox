@@ -55,10 +55,13 @@ go run ./github/cmd/github-mcp \
 Endpoints (selected):
 - `GET /` – root redirect/info
 - `POST /mcp/call` – MCP RPC endpoint
-- `POST /github/auth/start` – start Device Code flow (returns verify URL and code)
-- `POST /github/auth/token` – ingest a personal access token or OAuth token
-- `GET  /github/auth/pending` – list pending codes for the current namespace
-- `POST /github/auth/pending/clear` – clear pending codes for the current namespace
+- `POST /github/auth/start` – start Device Code flow (returns verify URL + code)
+- `GET  /github/auth/oob` – out‑of‑band UI to paste a token, basic credentials, or start device flow; accepts `alias`, optional `domain`, optional `url=domain/owner/repo`, and `uuid` to bind to namespace
+- `POST /github/auth/token` – ingest a personal access token or basic credentials; accepts `alias`, `domain`, optional `owner`, `repo`, and `uuid` (recommended) to bind to namespace
+- `GET  /github/auth/check` – check whether a token exists; accepts `alias`, `domain`, optional `owner`, `repo`, and `uuid`
+- `GET  /github/auth/verify` – verify access to a repo default branch; accepts `alias`, `domain`, `url=domain/owner/repo`, and `uuid`
+- `GET  /github/auth/pending` – list pending device codes for the current namespace
+- `POST /github/auth/pending/clear` – clear pending device codes for the current namespace
 
 Common tools registered by the server include listing repositories, issues/PRs, creating issues/PRs, commenting, searching issues, checking out repos, listing repo paths, and downloading files.
 
@@ -97,7 +100,6 @@ Both servers derive a public callback base URL from `-addr` automatically (e.g.,
 - GitHub
   - Flags: `-addr`, `-client-id`, `-storage`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
   - Env (optional):
-    - `GITHUB_MCP_DEBUG`: set to enable verbose service logs
     - `GITHUB_MCP_WAIT_SECS`: max wait for credentials (default 300s)
     - `GITHUB_MCP_ELICIT_COOLDOWN_SECS`: cooldown between repeated credential prompts (default 60s)
 
@@ -114,16 +116,22 @@ MCP requests and stored credentials are isolated by a “namespace” derived fr
 - Without server auth, if the caller supplies `Authorization: Bearer <jwt>`, we still derive namespace from claims or fall back to `tkn-<md5>`; otherwise, the namespace defaults to `default`.
 
 Per-namespace separation in this repo:
-- GitHub: tokens, wait/wakeup keys, and repo tree caches are keyed by namespace. Debug logs show `ns=...` when saving.
-- Outlook: authentication records (disk/AFS), azidentity caches, in-memory clients/creds are keyed by namespace. Debug logs show `ns=...` and record URL when saving.
+- GitHub: tokens, wait/wakeup keys, and repo tree caches are keyed by namespace. Elicitation is deduped per session and per namespace (no cross‑namespace suppression). Out‑of‑band flows include a `uuid` that binds the UI to the original namespace so token saves land in the correct scope.
+- Outlook: authentication records (disk/AFS), azidentity caches, and in‑memory clients/creds are keyed by namespace. Concurrent acquisitions are serialized per ns+alias to avoid duplicate prompts.
 
 Important for remote deployments:
 - To guarantee isolation across concurrently connected users, run with both `-o` and `-i` (ID tokens) and ensure the client completes the BFF/auth flow. Otherwise, auth tokens or connections obtained under a weaker namespace (e.g., `default`) could be visible to other users via fallback behavior.
 - If you intentionally share credentials (e.g., a team-wide token), you may omit `-o/-i` and rely on the `default` namespace, but be aware this is shared across users.
 
 HTTP auth endpoints and BFF:
-- JSON-RPC (`/mcp`) calls are always mediated by the authorizer when `-o` is set.
-- Custom HTTP auth endpoints (e.g., `/github/auth/*`, `/outlook/auth/*`) can either be wrapped with the authorizer or accept `Authorization: Bearer <id_token>` so that secret writes land in the correct namespace.
+- JSON‑RPC (`/mcp`) calls are mediated by the authorizer when `-o` is set.
+- Custom HTTP auth endpoints (`/github/auth/*`, `/outlook/auth/*`) can be wrapped by the authorizer, or you can pass `Authorization: Bearer <id_token>` directly. GitHub’s OOB UI also uses a `uuid` to bind subsequent HTTP requests to the original namespace.
+
+GitHub checkout destination:
+- When `destDir` is not provided, checkouts are written under a namespaced path to avoid collisions:
+  - Parent: `storageDir` if set, else OS temp dir
+  - Final path: `<parent>/<namespace>__<alias>/gh_<owner>_<repo>`
+  - Example: `/tmp/alex@example.com__work/gh_viant_mdp`
 
 ## Secrets Storage Backends
 
