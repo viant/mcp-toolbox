@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/viant/mcp-toolbox/github/adapter"
-	"os"
-	"strings"
 	"time"
 )
 
