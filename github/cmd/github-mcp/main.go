@@ -24,12 +24,13 @@ import (
 
 // Options defines CLI flags for the GitHub MCP server.
 type Options struct {
-	HTTPAddr     string `short:"a" long:"addr"  description:"HTTP listen address (empty disables HTTP)"`
-	Storage      string `long:"storage" description:"Directory for auth tokens"`
-	SecretsBase  string `long:"secretsBase" description:"AFS/scy base URL for persisting tokens (e.g., mem://localhost/mcp-github)"`
-	ClientID     string `long:"client-id" description:"GitHub OAuth app client ID"`
-	Oauth2Config string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
-	UseIdToken   bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	HTTPAddr      string `short:"a" long:"addr"  description:"HTTP listen address (empty disables HTTP)"`
+	Storage       string `long:"storage" description:"Directory for auth tokens"`
+	SecretsBase   string `long:"secretsBase" description:"AFS/scy base URL for persisting tokens (e.g., mem://localhost/mcp-github)"`
+	ClientID      string `long:"client-id" description:"GitHub OAuth app client ID"`
+	Oauth2Config  string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
+	UseIdToken    bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	PublicBaseURL string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-github.agently.svc.cluster.local:7789)"`
 }
 
 func main() {
@@ -43,13 +44,16 @@ func main() {
 		opts.SecretsBase = "mem://localhost/mcp-github"
 	}
 	// Client ID is optional; when empty, device flow won't be available. Token ingestion remains supported via HTTP.
-	baseURL := "http://localhost"
-	if opts.HTTPAddr != "" {
-		hostport := opts.HTTPAddr
-		if hostport[0] == ':' {
-			hostport = "localhost" + hostport
+	baseURL := strings.TrimRight(strings.TrimSpace(opts.PublicBaseURL), "/")
+	if baseURL == "" {
+		baseURL = "http://localhost"
+		if opts.HTTPAddr != "" {
+			hostport := opts.HTTPAddr
+			if hostport[0] == ':' {
+				hostport = "localhost" + hostport
+			}
+			baseURL = "http://" + hostport
 		}
-		baseURL = "http://" + hostport
 	}
 	svc := ghservice.NewService(&ghservice.Config{ClientID: opts.ClientID, StorageDir: opts.Storage, SecretsBase: opts.SecretsBase, CallbackBaseURL: baseURL})
 

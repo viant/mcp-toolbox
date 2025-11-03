@@ -95,16 +95,17 @@ For more on Outlook configuration, see `outlook/mcp/README.md`.
 
 ## Configuration
 
-Both servers derive a public callback base URL from `-addr` automatically (e.g., `http://localhost:7789`). Storage directories default to a subfolder in the user config directory.
+Both servers derive a public callback base URL from `-addr` automatically (e.g., `http://localhost:7789`). You can override this with `--public-base-url` to use a non-localhost host (useful behind proxies or in-cluster services), for example `--public-base-url http://mcp-toolbox-github.agently.svc.cluster.local:7789`.
+Storage directories default to a subfolder in the user config directory.
 
 - GitHub
-  - Flags: `-addr`, `-client-id`, `-storage`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
+  - Flags: `-addr`, `--public-base-url`, `-client-id`, `-storage`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
   - Env (optional):
     - `GITHUB_MCP_WAIT_SECS`: max wait for credentials (default 300s)
     - `GITHUB_MCP_ELICIT_COOLDOWN_SECS`: cooldown between repeated credential prompts (default 60s)
 
 - Outlook
-  - Flags: `-addr`, `-client-id`, `-tenant-id`, `-azure-ref`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
+  - Flags: `-addr`, `--public-base-url`, `-client-id`, `-tenant-id`, `-azure-ref`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
   - Env: `OUTLOOK_CLIENT_ID`, `OUTLOOK_TENANT_ID`, `OUTLOOK_AZURE_REF`
   - `-azure-ref`/`OUTLOOK_AZURE_REF` uses `scy` EncodedResource to load `cred.Azure` secrets (supports file/GCP/AWS backends with KMS like `blowfish://default`).
 

@@ -31,6 +31,7 @@ type Options struct {
 	Oauth2Config   string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
 	BFFRedirectURI string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
 	UseIdToken     bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	PublicBaseURL  string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-outlook.agently.svc.cluster.local:7788)"`
 }
 
 func main() {
@@ -57,13 +58,16 @@ func main() {
 	}
 
 	// Derive callback base URL from listen address.
-	baseURL := "http://localhost"
-	if opts.HTTPAddr != "" {
-		hostport := opts.HTTPAddr
-		if hostport[0] == ':' {
-			hostport = "localhost" + hostport
+	baseURL := strings.TrimRight(strings.TrimSpace(opts.PublicBaseURL), "/")
+	if baseURL == "" {
+		baseURL = "http://localhost"
+		if opts.HTTPAddr != "" {
+			hostport := opts.HTTPAddr
+			if hostport[0] == ':' {
+				hostport = "localhost" + hostport
+			}
+			baseURL = "http://" + hostport
 		}
-		baseURL = "http://" + hostport
 	}
 	// If azure-ref provided, derive missing values from secret (clientID, tenantID).
 	if opts.AzureRef != "" {
