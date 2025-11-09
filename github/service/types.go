@@ -132,6 +132,22 @@ type ListRepoInput struct {
 	Concurrency int      `json:"concurrency,omitempty" description:"number of concurrent directory fetches (default 6)"`
 	Include     []string `json:"include,omitempty" description:"glob patterns to include (e.g., ['*.go','*.sql'])"`
 	Exclude     []string `json:"exclude,omitempty" description:"glob patterns to exclude (e.g., ['*_test.go','**/vendor/**'])"`
+
+	// Content search (optional): when either is set, include/exclude apply to file/folder names only,
+	// and files are additionally filtered by these content queries.
+	// Each pattern is a substring by default; wrap with /.../ to use RE2 regex.
+	FindInFilesInclude []string `json:"findInFilesInclude,omitempty" description:"include files whose content matches any pattern; substring or /regex/"`
+	FindInFilesExclude []string `json:"findInFilesExclude,omitempty" description:"exclude files whose content matches any pattern; substring or /regex/"`
+	// Case-insensitive matching for substring mode (regex can use (?i) flags)
+	// If nil, defaults to true. When true, substring matching is case-insensitive.
+	FindInFilesCaseInsensitive *bool `json:"findInFilesCaseInsensitive,omitempty" description:"case-insensitive substring matching for findInFiles patterns (default true)"`
+
+	// Content scanning safety knobs (apply when findInFiles is set)
+	SkipBinary  bool `json:"skipBinary,omitempty" description:"skip binary-like files during content scanning (default true)"`
+	MaxFileSize int  `json:"maxFileSize,omitempty" description:"max file size to scan in bytes (default service-level)"`
+	// Optional: reuse cached snapshot for local-FS feel
+	SessionID string `json:"sessionId,omitempty" description:"reuse cached repo snapshot across calls"`
+	// Debugging removed: previously logged examined files and sizes during content scan
 }
 type AssetItem struct {
 	Type string `json:"type"` // file|dir
@@ -142,6 +158,8 @@ type AssetItem struct {
 }
 type ListRepoOutput struct {
 	Items []AssetItem `json:"items"`
+	// Warning communicates non-fatal issues (e.g., content scan fallback to path-only).
+	Warning string `json:"warning,omitempty"`
 }
 
 type DownloadInput struct {
@@ -149,8 +167,8 @@ type DownloadInput struct {
 	Path string `json:"path"`
 }
 type DownloadOutput struct {
-    // Content carries binary data when the file is not recognized as UTF-8 text.
-    Content []byte `json:"content,omitempty"`
-    // Text carries UTF-8 textual content when auto-detected; in this case, Content is omitted.
-    Text    string `json:"text,omitempty"`
+	// Content carries binary data when the file is not recognized as UTF-8 text.
+	Content []byte `json:"content,omitempty"`
+	// Text carries UTF-8 textual content when auto-detected; in this case, Content is omitted.
+	Text string `json:"text,omitempty"`
 }

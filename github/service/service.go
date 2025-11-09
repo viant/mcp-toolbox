@@ -1,6 +1,7 @@
 package service
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -12,8 +13,12 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -62,6 +67,16 @@ type Service struct {
 
 	// secrets persistence
 	secretsBase string
+
+	// snapshot zip cache (repo archive zip), keyed by ns|alias|domain|owner|repo|ref
+	snapMu    sync.RWMutex
+	snapCache map[string]snapshotEntry
+
+	// in-memory snapshot cache for small zips
+	memSnapMu    sync.RWMutex
+	memSnapCache map[string]memSnapshotEntry
+	memSnapTTL   time.Duration
+	memSnapThres int64
 }
 
 // treeCacheEntry holds cached tree entries with expiration.
@@ -70,12 +85,25 @@ type treeCacheEntry struct {
 	expireAt time.Time
 }
 
+// snapshotEntry holds cached snapshot zip metadata.
+type snapshotEntry struct {
+	path     string
+	size     int64
+	expireAt time.Time
+}
+
+type memSnapshotEntry struct {
+	data     []byte
+	size     int64
+	expireAt time.Time
+}
+
 func NewService(cfg *Config) *Service {
 	if cfg == nil {
 		cfg = &Config{}
 	}
 	useText := !cfg.UseData
-	return &Service{
+	s := &Service{
 		baseURL:        cfg.CallbackBaseURL,
 		useText:        useText,
 		pending:        NewPendingAuths(),
@@ -90,7 +118,20 @@ func NewService(cfg *Config) *Service {
 		elicitedGlobal: map[string]time.Time{},
 		waiters:        map[string][]chan struct{}{},
 		secretsBase:    strings.TrimRight(os.ExpandEnv(cfg.SecretsBase), "/"),
+		snapCache:      map[string]snapshotEntry{},
+		memSnapCache:   map[string]memSnapshotEntry{},
 	}
+	// Configure in-memory snapshot caching defaults
+	s.memSnapThres = 100 * 1024 * 1024 // 100MB default
+	if cfg.SnapshotMemThresholdBytes > 0 {
+		s.memSnapThres = cfg.SnapshotMemThresholdBytes
+	}
+	ttlSecs := 900 // 15m
+	if cfg.SnapshotMemTTLSeconds > 0 {
+		ttlSecs = cfg.SnapshotMemTTLSeconds
+	}
+	s.memSnapTTL = time.Duration(ttlSecs) * time.Second
+	return s
 }
 
 type contentAPI interface {
@@ -107,6 +148,254 @@ func (s *Service) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/github/auth/check", s.TokenCheckHandler())
 	mux.HandleFunc("/github/auth/oob", s.OOBHandler())
 	mux.HandleFunc("/github/auth/verify", s.VerifyHandler())
+}
+
+// snapshotKey builds a cache key for a snapshot zip scoped to ns/alias/domain/owner/name/ref.
+func (s *Service) snapshotKey(ns, alias, domain, owner, name, ref string) string {
+	if domain == "" {
+		domain = "github.com"
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	return joinKey(ns, alias, domain, owner, name, ref)
+}
+
+// snapshotPath computes a deterministic storage path for a snapshot zip.
+func (s *Service) snapshotPath(ns, alias, domain, owner, name, ref string) string {
+	base := strings.TrimRight(os.ExpandEnv(s.storageDir), "/")
+	if base == "" {
+		base = os.TempDir()
+	}
+	parts := []string{base, "gh_snapshots", safePart(ns), safePart(alias), safePart(domain)}
+	// file name encodes owner/repo/ref
+	file := safePart(owner) + "_" + safePart(name) + "_" + safePart(ref) + ".zip"
+	return strings.Join(parts, "/") + "/" + file
+}
+
+// authBasic constructs an Authorization header like adapter.authBasic (duplicated to avoid export).
+func (s *Service) authBasic(token string) string {
+	if strings.Contains(token, ":") {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(token))
+	}
+	creds := "x-access-token:" + token
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+}
+
+const (
+	snapshotLargeThreshold = int64(100 * 1024 * 1024) // 100MB
+	snapshotTTL            = 30 * time.Minute
+)
+
+// GetOrFetchSnapshotZip returns a path to a repo snapshot zip for (owner/name@ref),
+// caching to disk for 30 minutes if the size is >= 100MB.
+// It uses the GitHub zipball API and follows redirects.
+func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, owner, name, ref, token string) (path string, size int64, fromCache bool, err error) {
+	key := s.snapshotKey(ns, alias, domain, owner, name, ref)
+	// In-memory cache check
+	s.memSnapMu.RLock()
+	if m, ok := s.memSnapCache[key]; ok && time.Now().Before(m.expireAt) && m.size > 0 {
+		s.memSnapMu.RUnlock()
+		// Write-through to a temp file is not required for scanning; callers may use memory path via helper.
+		// For backward compatibility, still return no path; let caller check memory via GetSnapshotBytes.
+		return "", m.size, true, nil
+	}
+	s.memSnapMu.RUnlock()
+	// Fast path: cache hit and file exists and not expired
+	s.snapMu.RLock()
+	if ent, ok := s.snapCache[key]; ok && time.Now().Before(ent.expireAt) {
+		if fi, e := os.Stat(ent.path); e == nil && fi.Mode().IsRegular() {
+			s.snapMu.RUnlock()
+			return ent.path, ent.size, true, nil
+		}
+	}
+	s.snapMu.RUnlock()
+
+	// Filesystem check even if not in in-memory cache (e.g., after restart)
+	dest := s.snapshotPath(ns, alias, domain, owner, name, ref)
+	if fi, e := os.Stat(dest); e == nil && fi.Mode().IsRegular() {
+		// Assume fresh if within TTL
+		if time.Since(fi.ModTime()) < snapshotTTL {
+			if fi.Size() >= snapshotLargeThreshold {
+				s.snapMu.Lock()
+				s.snapCache[key] = snapshotEntry{path: dest, size: fi.Size(), expireAt: time.Now().Add(snapshotTTL)}
+				s.snapMu.Unlock()
+			}
+			return dest, fi.Size(), true, nil
+		}
+	}
+
+	// Resolve ref if empty
+	if strings.TrimSpace(ref) == "" {
+		cli := adapter.New(domain)
+		def, derr := cli.GetRepoDefaultBranch(ctx, token, owner, name)
+		if derr == nil && def != "" {
+			ref = def
+		}
+	}
+
+	// Build zipball API URL
+	apiBase := "https://api.github.com"
+	if domain != "" && domain != "github.com" {
+		apiBase = "https://" + domain + "/api/v3"
+	}
+	url := fmt.Sprintf("%s/repos/%s/%s/zipball/%s", apiBase, owner, name, neturl.PathEscape(ref))
+
+	// Helper to perform one download attempt
+	doFetch := func() (int64, error) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if strings.TrimSpace(token) != "" {
+			req.Header.Set("Authorization", s.authBasic(token))
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			return 0, adapter.ErrUnauthorized
+		}
+		if resp.StatusCode >= 300 {
+			return 0, fmt.Errorf("zipball fetch failed: %s", resp.Status)
+		}
+		f, err := os.Create(dest)
+		if err != nil {
+			return 0, err
+		}
+		n, cpErr := io.Copy(f, resp.Body)
+		cerr := f.Close()
+		if cpErr != nil {
+			_ = os.Remove(dest)
+			return 0, cpErr
+		}
+		if cerr != nil {
+			_ = os.Remove(dest)
+			return 0, cerr
+		}
+		return n, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", 0, false, err
+	}
+	n, fetchErr := doFetch()
+	if fetchErr != nil {
+		// If out of space, try evicting namespace cache and retry once
+		if isNoSpace(fetchErr) {
+			_ = s.evictSnapshotNamespace(ns, 1)
+			n, fetchErr = doFetch()
+		}
+		if fetchErr != nil {
+			return "", 0, false, fetchErr
+		}
+	}
+
+	// Cache only if large enough; else leave file on disk (caller may remove) but do not index cache.
+	if n >= snapshotLargeThreshold {
+		s.snapMu.Lock()
+		s.snapCache[key] = snapshotEntry{path: dest, size: n, expireAt: time.Now().Add(snapshotTTL)}
+		s.snapMu.Unlock()
+	} else if n > 0 && n <= s.memSnapThres {
+		// Small zip: load into memory cache for faster reuse
+		if data, rerr := os.ReadFile(dest); rerr == nil {
+			s.memSnapMu.Lock()
+			s.memSnapCache[key] = memSnapshotEntry{data: data, size: int64(len(data)), expireAt: time.Now().Add(s.memSnapTTL)}
+			s.memSnapMu.Unlock()
+		}
+	}
+	return dest, n, false, nil
+}
+
+// GetSnapshotBytes returns a memory-cached snapshot if available.
+func (s *Service) GetSnapshotBytes(ns, alias, domain, owner, name, ref string) ([]byte, bool) {
+	key := s.snapshotKey(ns, alias, domain, owner, name, ref)
+	s.memSnapMu.RLock()
+	defer s.memSnapMu.RUnlock()
+	if m, ok := s.memSnapCache[key]; ok && time.Now().Before(m.expireAt) && len(m.data) > 0 {
+		return m.data, true
+	}
+	return nil, false
+}
+
+// isNoSpace returns true if err indicates no space left on device.
+func isNoSpace(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check wrapped syscall error
+	if errors.Is(err, syscall.ENOSPC) {
+		return true
+	}
+	// Fallback string match
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no space left") || strings.Contains(s, "enospc")
+}
+
+// evictSnapshotNamespace removes expired and then oldest snapshot files for a namespace.
+// It best-effort frees up space; `atLeast` is a hint for how many files to remove (>=1).
+func (s *Service) evictSnapshotNamespace(ns string, atLeast int) error {
+	base := strings.TrimRight(os.ExpandEnv(s.storageDir), "/")
+	if base == "" {
+		base = os.TempDir()
+	}
+	root := filepath.Join(base, "gh_snapshots", safePart(ns))
+	var files []os.FileInfo
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	// Recurse one level (alias) and domain to collect files
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		aliasDir := filepath.Join(root, e.Name())
+		doms, _ := os.ReadDir(aliasDir)
+		for _, d := range doms {
+			p := filepath.Join(aliasDir, d.Name())
+			items, _ := os.ReadDir(p)
+			for _, it := range items {
+				if it.IsDir() {
+					continue
+				}
+				fi, statErr := it.Info()
+				if statErr == nil {
+					files = append(files, &fileInfoWithPath{FileInfo: fi, path: filepath.Join(p, it.Name())})
+				}
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	// Remove expired first
+	now := time.Now()
+	kept := files[:0]
+	removed := 0
+	for _, fi := range files {
+		if now.Sub(fi.ModTime()) > snapshotTTL {
+			_ = os.Remove(fi.(*fileInfoWithPath).path)
+			removed++
+		} else {
+			kept = append(kept, fi)
+		}
+	}
+	files = kept
+	if removed >= atLeast || len(files) == 0 {
+		return nil
+	}
+	// Remove oldest until we satisfy atLeast
+	sort.Slice(files, func(i, j int) bool { return files[i].ModTime().Before(files[j].ModTime()) })
+	for i := 0; i < len(files) && removed < atLeast; i++ {
+		_ = os.Remove(files[i].(*fileInfoWithPath).path)
+		removed++
+	}
+	return nil
+}
+
+type fileInfoWithPath struct {
+	os.FileInfo
+	path string
 }
 
 func (s *Service) tokenURL(ns, alias, domain, owner, repo string) string {
@@ -1524,6 +1813,23 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 	}
 	// Execute with token using the retry helper to enable elicitation if no token exists.
 	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*ListRepoOutput, error) {
+		// Defaults: skip binary and a reasonable max size when scanning content
+		skipBinary := true
+		if in.SkipBinary {
+			skipBinary = true
+		}
+		maxSize := in.MaxFileSize
+		if maxSize <= 0 {
+			maxSize = 5 * 1024 * 1024
+		} // 5MB default
+		// Content queries (optional)
+		includeQs := in.FindInFilesInclude
+		excludeQs := in.FindInFilesExclude
+		// Default case-insensitive substring matching unless explicitly disabled
+		ci := true
+		if in.FindInFilesCaseInsensitive != nil {
+			ci = *in.FindInFilesCaseInsensitive
+		}
 		// If recursive requested, prefer Git Trees API for performance.
 		if in.Recursive {
 			// Resolve default branch first if ref empty; if provided ref is invalid, fallback to contents DFS.
@@ -1598,7 +1904,9 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			prefix := strings.Trim(startPath, "/")
 
 			var entries []adapter.TreeEntry
-			useCache := prefix == ""
+			// Always allow using/storing the full-root tree cache per repo, even when a subpath
+			// is requested. We fetch the full tree once and filter in-memory for subpaths.
+			useCache := true
 			cacheKey := ""
 			if useCache {
 				nsCache, _ := s.auth.Namespace(ctx)
@@ -1643,7 +1951,8 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			contains := strings.ToLower(strings.TrimSpace(in.Contains))
 			include := in.Include
 			exclude := in.Exclude
-			var out ListRepoOutput
+			var collected []AssetItem
+			var warn string
 			for _, e := range entries {
 				if prefix != "" && !strings.HasPrefix(e.Path, prefix+"/") && e.Path != prefix {
 					continue
@@ -1660,9 +1969,61 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 				} else if typ == "blob" {
 					typ = "file"
 				}
-				out.Items = append(out.Items, AssetItem{Type: typ, Name: pathBase(e.Path), Path: e.Path, Size: e.Size, Sha: e.Sha})
+				collected = append(collected, AssetItem{Type: typ, Name: pathBase(e.Path), Path: e.Path, Size: e.Size, Sha: e.Sha})
 			}
-			return &out, nil
+			// If content scanning is requested, refine by content using snapshot ZIP
+			if len(includeQs) > 0 || len(excludeQs) > 0 {
+				// Gather candidate file paths
+				cand := make(map[string]bool)
+				for _, it := range collected {
+					if it.Type == "file" {
+						cand[it.Path] = true
+					}
+				}
+				if len(cand) > 0 {
+					nsCache, _ := s.auth.Namespace(ctx)
+					zipPath, _, _, zerr := s.GetOrFetchSnapshotZip(ctx, nsCache, alias, domain, owner, name, ref, s.loadTokenPreferred(nsCache, alias, domain, owner, name))
+					if zerr == nil {
+						// Prefer memory snapshot if available
+						if data, ok := s.GetSnapshotBytes(nsCache, alias, domain, owner, name, ref); ok {
+							inc, exc := s.buildContentSetsFromBytes(data, cand, includeQs, excludeQs, skipBinary, int64(maxSize), ci)
+							filtered := make([]AssetItem, 0, len(collected))
+							for _, it := range collected {
+								if it.Type != "file" {
+									filtered = append(filtered, it)
+									continue
+								}
+								if exc != nil && exc[it.Path] {
+									continue
+								}
+								if inc == nil || inc[it.Path] {
+									filtered = append(filtered, it)
+								}
+							}
+							collected = filtered
+						} else {
+							inc, exc := s.buildContentSets(zipPath, cand, includeQs, excludeQs, skipBinary, int64(maxSize), ci)
+							filtered := make([]AssetItem, 0, len(collected))
+							for _, it := range collected {
+								if it.Type != "file" {
+									filtered = append(filtered, it)
+									continue
+								}
+								if exc != nil && exc[it.Path] {
+									continue
+								}
+								if inc == nil || inc[it.Path] {
+									filtered = append(filtered, it)
+								}
+							}
+							collected = filtered
+						}
+					} else {
+						warn = "content search skipped (snapshot unavailable): " + zerr.Error()
+					}
+				}
+			}
+			return &ListRepoOutput{Items: collected, Warning: warn}, nil
 		}
 
 		// Non-recursive: single directory via contents API
@@ -1689,7 +2050,8 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 		contains := strings.ToLower(strings.TrimSpace(in.Contains))
 		include := in.Include
 		exclude := in.Exclude
-		var out ListRepoOutput
+		var collected []AssetItem
+		var warn string
 		for _, v := range items {
 			if contains != "" && !strings.Contains(strings.ToLower(v.Path), contains) && !strings.Contains(strings.ToLower(v.Name), contains) {
 				continue
@@ -1697,9 +2059,58 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			if !passIncludeExclude(v.Path, include, exclude) {
 				continue
 			}
-			out.Items = append(out.Items, AssetItem{Type: v.Type, Name: v.Name, Path: v.Path, Size: v.Size, Sha: v.Sha})
+			collected = append(collected, AssetItem{Type: v.Type, Name: v.Name, Path: v.Path, Size: v.Size, Sha: v.Sha})
 		}
-		return &out, nil
+		if len(includeQs) > 0 || len(excludeQs) > 0 {
+			cand := make(map[string]bool)
+			for _, it := range collected {
+				if it.Type == "file" {
+					cand[it.Path] = true
+				}
+			}
+			if len(cand) > 0 {
+				nsCache, _ := s.auth.Namespace(ctx)
+				zipPath, _, _, zerr := s.GetOrFetchSnapshotZip(ctx, nsCache, alias, domain, owner, name, useRef, s.loadTokenPreferred(nsCache, alias, domain, owner, name))
+				if zerr == nil {
+					if data, ok := s.GetSnapshotBytes(nsCache, alias, domain, owner, name, useRef); ok {
+						inc, exc := s.buildContentSetsFromBytes(data, cand, includeQs, excludeQs, skipBinary, int64(maxSize), ci)
+						filtered := make([]AssetItem, 0, len(collected))
+						for _, it := range collected {
+							if it.Type != "file" {
+								filtered = append(filtered, it)
+								continue
+							}
+							if exc != nil && exc[it.Path] {
+								continue
+							}
+							if inc == nil || inc[it.Path] {
+								filtered = append(filtered, it)
+							}
+						}
+						collected = filtered
+					} else {
+						inc, exc := s.buildContentSets(zipPath, cand, includeQs, excludeQs, skipBinary, int64(maxSize), ci)
+						filtered := make([]AssetItem, 0, len(collected))
+						for _, it := range collected {
+							if it.Type != "file" {
+								filtered = append(filtered, it)
+								continue
+							}
+							if exc != nil && exc[it.Path] {
+								continue
+							}
+							if inc == nil || inc[it.Path] {
+								filtered = append(filtered, it)
+							}
+						}
+						collected = filtered
+					}
+				} else {
+					warn = "content search skipped (snapshot unavailable): " + zerr.Error()
+				}
+			}
+		}
+		return &ListRepoOutput{Items: collected, Warning: warn}, nil
 	})
 }
 
@@ -1762,6 +2173,317 @@ func simplePathMatch(pattern, name string) bool {
 		return strings.Contains(n, p)
 	}
 	return n == pattern || strings.HasSuffix(n, "/"+pattern) || strings.HasPrefix(n, pattern+"/")
+}
+
+// scanZipContent walks the given snapshot zip and returns sets of paths that matched include content patterns
+// and those that matched exclude content patterns. Paths are repo-relative (no top-level zip folder).
+func (s *Service) scanZipContent(zipPath string, candidates map[string]bool, include, exclude []string, caseInsensitive, skipBinary bool, maxSize int64) (map[string]bool, map[string]bool) {
+	matched := map[string]bool{}
+	excluded := map[string]bool{}
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return matched, excluded
+	}
+	defer zr.Close()
+	lower := func(b []byte) []byte {
+		if caseInsensitive {
+			return bytes.ToLower(b)
+		}
+		return b
+	}
+	toLower := func(s string) string {
+		if caseInsensitive {
+			return strings.ToLower(s)
+		}
+		return s
+	}
+	// Preprocess include/exclude patterns for content search
+	incl := make([]string, 0, len(include))
+	excl := make([]string, 0, len(exclude))
+	for _, p := range include {
+		if strings.TrimSpace(p) != "" {
+			incl = append(incl, toLower(p))
+		}
+	}
+	for _, p := range exclude {
+		if strings.TrimSpace(p) != "" {
+			excl = append(excl, toLower(p))
+		}
+	}
+
+	for _, f := range zr.File {
+		name := f.Name
+		// Strip top-level folder: owner-repo-sha/...
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			continue
+		}
+		if !candidates[name] {
+			continue
+		}
+		// Enforce size cap
+		if maxSize > 0 && f.UncompressedSize64 > uint64(maxSize) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		// Read up to maxSize bytes
+		var buf bytes.Buffer
+		if maxSize > 0 {
+			_, _ = io.CopyN(&buf, rc, maxSize)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		_ = rc.Close()
+		data := buf.Bytes()
+		// Binary skip check
+		if skipBinary && !isProbablyText(data) {
+			continue
+		}
+		content := lower(data)
+		// Exclude on content first
+		for _, p := range excl {
+			if p != "" && bytes.Contains(content, []byte(p)) {
+				excluded[name] = true
+				break
+			}
+		}
+		if excluded[name] {
+			continue
+		}
+		// Include on content
+		if len(incl) == 0 {
+			// No include constraints: nothing to mark
+			continue
+		}
+		for _, p := range incl {
+			if p != "" && bytes.Contains(content, []byte(p)) {
+				matched[name] = true
+				break
+			}
+		}
+	}
+	return matched, excluded
+}
+
+// scanZipFind filters candidates by checking whether file content matches the query.
+// Query supports two forms:
+// - substring (default): any non-empty string not delimited by '/'
+// - regex: /pattern/ (RE2). Inline flags like (?i) are supported by RE2.
+func (s *Service) scanZipFind(zipPath string, candidates map[string]bool, query string, skipBinary bool, maxSize int64, ci bool) map[string]bool {
+	out := map[string]bool{}
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return out
+	}
+	defer zr.Close()
+	isRegex := false
+	pat := strings.TrimSpace(query)
+	if len(pat) >= 2 && strings.HasPrefix(pat, "/") && strings.HasSuffix(pat, "/") {
+		pat = strings.TrimSuffix(strings.TrimPrefix(pat, "/"), "/")
+		isRegex = true
+	}
+	var re *regexp.Regexp
+	if isRegex {
+		re, err = regexp.Compile(pat)
+		if err != nil {
+			return out
+		}
+	} // else: substring search; optionally case-insensitive via ci
+	patBytes := []byte(pat)
+	var patLower []byte
+	if !isRegex && ci {
+		patLower = bytes.ToLower(patBytes)
+	}
+	for _, f := range zr.File {
+		name := f.Name
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			continue
+		}
+		if !candidates[name] {
+			continue
+		}
+		if maxSize > 0 && f.UncompressedSize64 > uint64(maxSize) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if maxSize > 0 {
+			_, _ = io.CopyN(&buf, rc, maxSize)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		_ = rc.Close()
+		data := buf.Bytes()
+		if skipBinary && !isProbablyText(data) {
+			continue
+		}
+		if isRegex {
+			if re.Match(data) {
+				out[name] = true
+			}
+		} else {
+			if ci {
+				if bytes.Contains(bytes.ToLower(data), patLower) {
+					out[name] = true
+				}
+			} else {
+				if bytes.Contains(data, patBytes) {
+					out[name] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// scanZipFindFromBytes is a variant that scans a snapshot zip already loaded in memory.
+func (s *Service) scanZipFindFromBytes(data []byte, candidates map[string]bool, query string, skipBinary bool, maxSize int64, ci bool) map[string]bool {
+	out := map[string]bool{}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return out
+	}
+	isRegex := false
+	pat := strings.TrimSpace(query)
+	if len(pat) >= 2 && strings.HasPrefix(pat, "/") && strings.HasSuffix(pat, "/") {
+		pat = strings.TrimSuffix(strings.TrimPrefix(pat, "/"), "/")
+		isRegex = true
+	}
+	var re *regexp.Regexp
+	if isRegex {
+		re, err = regexp.Compile(pat)
+		if err != nil {
+			return out
+		}
+	}
+	patBytes := []byte(pat)
+	var patLower []byte
+	if !isRegex && ci {
+		patLower = bytes.ToLower(patBytes)
+	}
+	for _, f := range zr.File {
+		name := f.Name
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			continue
+		}
+		if !candidates[name] {
+			continue
+		}
+		if maxSize > 0 && f.UncompressedSize64 > uint64(maxSize) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if maxSize > 0 {
+			_, _ = io.CopyN(&buf, rc, maxSize)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		_ = rc.Close()
+		b := buf.Bytes()
+		if skipBinary && !isProbablyText(b) {
+			continue
+		}
+		if isRegex {
+			if re.Match(b) {
+				out[name] = true
+			}
+		} else {
+			if ci {
+				if bytes.Contains(bytes.ToLower(b), patLower) {
+					out[name] = true
+				}
+			} else {
+				if bytes.Contains(b, patBytes) {
+					out[name] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// buildContentSets unions include and exclude matches across multiple patterns.
+func (s *Service) buildContentSets(zipPath string, candidates map[string]bool, includes, excludes []string, skipBinary bool, maxSize int64, ci bool) (map[string]bool, map[string]bool) {
+	var inc map[string]bool
+	var exc map[string]bool
+	for _, q := range includes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFind(zipPath, candidates, q, skipBinary, maxSize, ci)
+		if inc == nil {
+			inc = map[string]bool{}
+		}
+		for k := range m {
+			inc[k] = true
+		}
+	}
+	for _, q := range excludes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFind(zipPath, candidates, q, skipBinary, maxSize, ci)
+		if exc == nil {
+			exc = map[string]bool{}
+		}
+		for k := range m {
+			exc[k] = true
+		}
+	}
+	return inc, exc
+}
+
+// buildContentSetsFromBytes versions of content sets based on an in-memory snapshot.
+func (s *Service) buildContentSetsFromBytes(data []byte, candidates map[string]bool, includes, excludes []string, skipBinary bool, maxSize int64, ci bool) (map[string]bool, map[string]bool) {
+	var inc map[string]bool
+	var exc map[string]bool
+	for _, q := range includes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFindFromBytes(data, candidates, q, skipBinary, maxSize, ci)
+		if inc == nil {
+			inc = map[string]bool{}
+		}
+		for k := range m {
+			inc[k] = true
+		}
+	}
+	for _, q := range excludes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFindFromBytes(data, candidates, q, skipBinary, maxSize, ci)
+		if exc == nil {
+			exc = map[string]bool{}
+		}
+		for k := range m {
+			exc[k] = true
+		}
+	}
+	return inc, exc
 }
 
 // DownloadRepoFile fetches raw bytes of a file at path and ref.

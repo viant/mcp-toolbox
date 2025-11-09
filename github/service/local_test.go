@@ -1,6 +1,3 @@
-//go:build local
-// +build local
-
 package service
 
 import (
@@ -124,9 +121,7 @@ func Test_E2E_GHE_List_Download_And_Optional_Checkout(t *testing.T) {
 	}
 }
 
-// Test_E2E_GHE_SearchCampaign mirrors the provided call to help troubleshoot timeouts.
-// Run only with: go test -tags local ./github/service -run Test_E2E_GHE_SearchCampaign -v
-func Test_E2E_GHE_SearchCampaign(t *testing.T) {
+func Test_E2E_GHE_SearchPrice(t *testing.T) {
 	// Enable verbose service logs and cap token wait to ease troubleshooting
 	_ = os.Setenv("GITHUB_MCP_DEBUG", "1")
 	_ = os.Setenv("GITHUB_MCP_WAIT_SECS", "300")
@@ -163,13 +158,13 @@ func Test_E2E_GHE_SearchCampaign(t *testing.T) {
 
 	start := time.Now()
 	in := &ListRepoInput{
-		GitTarget:   GitTarget{URL: domain + "/viant/mdp"},
-		Path:        "/",
-		Recursive:   true,
-		Contains:    "campaign",
-		Concurrency: 8,
-		Include:     []string{"**/*.go", "**/*.md"},
-		Exclude:     []string{"**/*_test.go", "**/vendor/**"},
+		GitTarget:          GitTarget{URL: domain + "/viant/mdp"},
+		Path:               "/",
+		Recursive:          true,
+		FindInFilesInclude: []string{"price"},
+		Concurrency:        8,
+		Include:            []string{"**/*.go", "**/*.md"},
+		Exclude:            []string{"**/*_test.go", "**/vendor/**"},
 	}
 	t.Logf("Listing with params: %+v", in)
 	out, err := svc.ListRepoPath(ctx, in, func(msg string) { t.Logf("PROMPT: %s", msg) })
@@ -177,6 +172,73 @@ func Test_E2E_GHE_SearchCampaign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRepoPath error after %s: %v", elapsed, err)
 	}
+	t.Logf("ListRepoPath returned %d items in %s", len(out.Items), elapsed)
+	// Print first few results for inspection
+	max := 20
+	for i, it := range out.Items {
+		if i >= max {
+			break
+		}
+		t.Logf("%s\t%s\t%s\t%d", it.Type, it.Path, it.Name, it.Size)
+	}
+}
+
+// Run only with: go test -tags local ./github/service -run Test_E2E_GHE_ListRepoFiles_MDP -v
+// Mirrors the provided listRepoFiles request against GHE: github.vianttech.com/viant/mdp
+func Test_E2E_GHE_ListRepoFiles_MDP(t *testing.T) {
+	// Optional: turn on verbose logs and extend wait
+	_ = os.Setenv("GITHUB_MCP_DEBUG", "1")
+	_ = os.Setenv("GITHUB_MCP_WAIT_SECS", "300")
+
+	storage := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen error: %v", err)
+	}
+	baseURL := fmt.Sprintf("http://%s", ln.Addr().String())
+	svc := NewService(&Config{ClientID: "", StorageDir: storage, CallbackBaseURL: baseURL})
+	mux := http.NewServeMux()
+	svc.RegisterHTTP(mux)
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+
+	alias := "viant"
+	domain := "github.vianttech.com"
+
+	// Provide OOB page link so a user can paste a token for this domain/repo
+	oobURL := fmt.Sprintf("%s/github/auth/oob?alias=%s&domain=%s&url=%s/viant/mdp", baseURL, alias, domain, domain)
+	t.Logf("Open OOB URL to provide credentials: %s", oobURL)
+
+	// Wait for a token (or skip after timeout to avoid hanging CI)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	for svc.loadToken("default", alias, domain) == "" {
+		select {
+		case <-ctx.Done():
+			t.Skip("No token provided/ingested; skipping E2E")
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	// Use the exact request parameters supplied
+	start := time.Now()
+	in := &ListRepoInput{
+		GitTarget:   GitTarget{URL: domain + "/viant/mdp"},
+		Path:        "/",
+		Recursive:   true,
+		Concurrency: 8,
+		Include:     []string{"**/*.go", "**/*.sql", "**/*.yaml", "**/*.yml", "**/*.md"},
+		Exclude:     []string{"**/*_test.go", "**/vendor/**", ".git/**"},
+	}
+	t.Logf("Listing with params: %+v", in)
+	out, err := svc.ListRepoPath(ctx, in, func(msg string) { t.Logf("PROMPT: %s", msg) })
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ListRepoPath error after %s: %v", elapsed, err)
+	}
+	in.Path = "model"
+	out, err = svc.ListRepoPath(ctx, in, func(msg string) { t.Logf("PROMPT: %s", msg) })
+
 	t.Logf("ListRepoPath returned %d items in %s", len(out.Items), elapsed)
 	// Print first few results for inspection
 	max := 20
