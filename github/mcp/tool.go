@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	neturl "net/url"
+	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/viant/jsonrpc"
 	"github.com/viant/mcp-protocol/schema"
@@ -48,7 +50,82 @@ var descListRepoPath string
 //go:embed tools/githubDownloadRepoFile.md
 var descDownloadRepoFile string
 
+//go:embed tools/githubFindFilesPreview.md
+var descFindFilesPreview string
+
 // Types moved to types.go
+
+// Debug helpers
+func toolDebug() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_MCP_DEBUG")))
+	return v != "" && v != "0" && v != "false"
+}
+
+func logToolStart(name string) time.Time {
+	if toolDebug() {
+		fmt.Printf("[tool] start name=%s\n", name)
+	}
+	return time.Now()
+}
+
+func logToolEnd(name string, start time.Time, err error) {
+	if toolDebug() {
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		fmt.Printf("[tool] end name=%s dur=%s status=%s\n", name, time.Since(start), status)
+	}
+}
+
+// startToolPending starts a background logger that reports pending status every second
+// and emits a slow-call warning after 10s. Returns a stop func to end logging.
+func startToolPending(name string, args any, start time.Time) func() {
+	if !toolDebug() {
+		return func() {}
+	}
+	done := make(chan struct{})
+	summary := summarizeArgs(args)
+	go func() {
+		// Report every 10 seconds to reduce log noise
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		warned := false
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Since(start)
+				fmt.Printf("[tool] pending name=%s elapsed=%s args=%s\n", name, elapsed, summary)
+				if !warned && elapsed >= 10*time.Second {
+					fmt.Printf("[tool] slow name=%s elapsed=%s\n", name, elapsed)
+					warned = true
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+func summarizeArgs(args any) string {
+	if args == nil {
+		return "{}"
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	s := string(b)
+	// redact common large/sensitive fields
+	s = regexp.MustCompile(`"body"\s*:\s*".*?"`).ReplaceAllString(s, `"body":"[REDACTED]"`)
+	s = regexp.MustCompile(`"sedScripts"\s*:\s*\[[^\]]*\]`).ReplaceAllString(s, `"sedScripts":["[REDACTED]"]`)
+	const max = 512
+	if len(s) > max {
+		return s[:max] + fmt.Sprintf("...(+%d)", len(s)-max)
+	}
+	return s
+}
 
 func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	svc := h.service
@@ -72,10 +149,15 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List repositories
 	if err := protoserver.RegisterTool[*ghservice.ListReposInput, *ghservice.ListReposOutput](base.Registry, "githubListRepos", descListRepos, func(ctx context.Context, in *ghservice.ListReposInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubListRepos")
+		stop := startToolPending("githubListRepos", in, start)
+		defer stop()
 		out, err := svc.ListRepos(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubListRepos", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubListRepos", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -83,13 +165,19 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List repo issues
 	if err := protoserver.RegisterTool[*ghservice.ListRepoIssuesInput, *ghservice.ListRepoIssuesOutput](base.Registry, "githubListRepoIssues", descListIssues, func(ctx context.Context, in *ghservice.ListRepoIssuesInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubListRepoIssues")
+		stop := startToolPending("githubListRepoIssues", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubListRepoIssues", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		out, err := svc.ListRepoIssues(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubListRepoIssues", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubListRepoIssues", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -97,13 +185,19 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List repo pull requests
 	if err := protoserver.RegisterTool[*ghservice.ListRepoPRsInput, *ghservice.ListRepoPRsOutput](base.Registry, "githubListRepoPRs", descListPRs, func(ctx context.Context, in *ghservice.ListRepoPRsInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubListRepoPRs")
+		stop := startToolPending("githubListRepoPRs", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubListRepoPRs", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		out, err := svc.ListRepoPRs(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubListRepoPRs", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubListRepoPRs", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -111,16 +205,23 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Create issue
 	if err := protoserver.RegisterTool[*ghservice.CreateIssueInput, *ghservice.CreateIssueOutput](base.Registry, "githubCreateIssue", descCreateIssue, func(ctx context.Context, in *ghservice.CreateIssueInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubCreateIssue")
+		stop := startToolPending("githubCreateIssue", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubCreateIssue", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		if in.Title == "" {
+			logToolEnd("githubCreateIssue", start, fmt.Errorf("missing title"))
 			return buildErrorResult("title is required")
 		}
 		out, err := svc.CreateIssue(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubCreateIssue", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubCreateIssue", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -128,16 +229,23 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Create PR
 	if err := protoserver.RegisterTool[*ghservice.CreatePRInput, *ghservice.CreatePROutput](base.Registry, "githubCreatePR", descCreatePR, func(ctx context.Context, in *ghservice.CreatePRInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubCreatePR")
+		stop := startToolPending("githubCreatePR", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubCreatePR", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		if in.Title == "" || in.Head == "" || in.Base == "" {
+			logToolEnd("githubCreatePR", start, fmt.Errorf("missing title/head/base"))
 			return buildErrorResult("title, head, and base are required")
 		}
 		out, err := svc.CreatePR(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubCreatePR", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubCreatePR", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -145,19 +253,27 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Add comment
 	if err := protoserver.RegisterTool[*ghservice.AddCommentInput, *ghservice.AddCommentOutput](base.Registry, "githubAddComment", descAddComment, func(ctx context.Context, in *ghservice.AddCommentInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubAddComment")
+		stop := startToolPending("githubAddComment", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubAddComment", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		if in.IssueNumber <= 0 {
+			logToolEnd("githubAddComment", start, fmt.Errorf("invalid issueNumber"))
 			return buildErrorResult("issueNumber must be > 0")
 		}
 		if in.Body == "" {
+			logToolEnd("githubAddComment", start, fmt.Errorf("missing body"))
 			return buildErrorResult("body is required")
 		}
 		out, err := svc.AddComment(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubAddComment", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubAddComment", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -165,16 +281,23 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List comments
 	if err := protoserver.RegisterTool[*ghservice.ListCommentsInput, *ghservice.ListCommentsOutput](base.Registry, "githubListComments", descListComments, func(ctx context.Context, in *ghservice.ListCommentsInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubListComments")
+		stop := startToolPending("githubListComments", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubListComments", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		if in.IssueNumber <= 0 {
+			logToolEnd("githubListComments", start, fmt.Errorf("invalid issueNumber"))
 			return buildErrorResult("issueNumber must be > 0")
 		}
 		out, err := svc.ListComments(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubListComments", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubListComments", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -182,13 +305,19 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Search issues/PRs
 	if err := protoserver.RegisterTool[*ghservice.SearchIssuesInput, *ghservice.SearchIssuesOutput](base.Registry, "githubSearchIssues", descSearchIssues, func(ctx context.Context, in *ghservice.SearchIssuesInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubSearchIssues")
+		stop := startToolPending("githubSearchIssues", in, start)
+		defer stop()
 		if strings.TrimSpace(in.Query) == "" {
+			logToolEnd("githubSearchIssues", start, fmt.Errorf("missing query"))
 			return buildErrorResult("query is required")
 		}
 		out, err := svc.SearchIssues(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubSearchIssues", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubSearchIssues", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -196,13 +325,19 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Checkout repository (clone + optional branch/commit)
 	if err := protoserver.RegisterTool[*ghservice.CheckoutRepoInput, *ghservice.CheckoutRepoOutput](base.Registry, "githubCheckoutRepo", descCheckoutRepo, func(ctx context.Context, in *ghservice.CheckoutRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("githubCheckoutRepo")
+		stop := startToolPending("githubCheckoutRepo", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("githubCheckoutRepo", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		out, err := svc.CheckoutRepo(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("githubCheckoutRepo", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("githubCheckoutRepo", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -210,13 +345,19 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List repo path (without clone)
 	if err := protoserver.RegisterTool[*ghservice.ListRepoInput, *ghservice.ListRepoOutput](base.Registry, "listRepo", descListRepoPath, func(ctx context.Context, in *ghservice.ListRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("listRepo")
+		stop := startToolPending("listRepo", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("listRepo", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		out, err := svc.ListRepoPath(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("listRepo", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("listRepo", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
@@ -224,16 +365,39 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Download repo file (without clone)
 	if err := protoserver.RegisterTool[*ghservice.DownloadInput, *ghservice.DownloadOutput](base.Registry, "download", descDownloadRepoFile, func(ctx context.Context, in *ghservice.DownloadInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("download")
+		stop := startToolPending("download", in, start)
+		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("download", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		if in.Path == "" {
+			logToolEnd("download", start, fmt.Errorf("missing path"))
 			return buildErrorResult("path is required")
 		}
 		out, err := svc.DownloadRepoFile(ctx, in, msgPrompt(ctx))
 		if err != nil {
+			logToolEnd("download", start, err)
 			return buildErrorResult(err.Error())
 		}
+		logToolEnd("download", start, nil)
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	// Find files with preview (no apply), supports sed-like preview on snapshot
+	if err := protoserver.RegisterTool[*ghservice.FindFilesPreviewInput, *ghservice.FindFilesPreviewOutput](base.Registry, "findFilesPreview", descFindFilesPreview, func(ctx context.Context, in *ghservice.FindFilesPreviewInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("findFilesPreview")
+		stop := startToolPending("findFilesPreview", in, start)
+		defer stop()
+		out, err := svc.FindFilesPreview(ctx, in, msgPrompt(ctx))
+		if err != nil {
+			logToolEnd("findFilesPreview", start, err)
+			return buildErrorResult(err.Error())
+		}
+		logToolEnd("findFilesPreview", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err

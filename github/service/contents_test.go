@@ -74,7 +74,7 @@ var errUnauthorized = errors.New("unauthorized")
 
 func Test_ListRepoPath_and_Download_without_clone(t *testing.T) {
 	svc := newTestService(t)
-    svc.saveToken("default", "acc", "", "TKN")
+	svc.saveToken("default", "acc", "", "TKN")
 
 	fake := &fakeContentAPI{
 		items: []struct {
@@ -93,11 +93,11 @@ func Test_ListRepoPath_and_Download_without_clone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list error: %v", err)
 	}
-	if len(lst.Items) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(lst.Items))
+	if len(lst.Paths) != 2 {
+		t.Fatalf("expected 2 paths, got %d", len(lst.Paths))
 	}
-	if lst.Items[0].Name != "README.md" || lst.Items[1].Type != "dir" {
-		t.Fatalf("unexpected items: %+v", lst.Items)
+	if lst.Paths[0] != "README.md" || lst.Paths[1] != "cmd" {
+		t.Fatalf("unexpected paths: %+v", lst.Paths)
 	}
 
 	// Download file

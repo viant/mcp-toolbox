@@ -24,13 +24,16 @@ import (
 
 // Options defines CLI flags for the GitHub MCP server.
 type Options struct {
-	HTTPAddr      string `short:"a" long:"addr"  description:"HTTP listen address (empty disables HTTP)"`
-	Storage       string `long:"storage" description:"Directory for auth tokens"`
-	SecretsBase   string `long:"secretsBase" description:"AFS/scy base URL for persisting tokens (e.g., mem://localhost/mcp-github)"`
-	ClientID      string `long:"client-id" description:"GitHub OAuth app client ID"`
-	Oauth2Config  string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
-	UseIdToken    bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
-	PublicBaseURL string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-github.agently.svc.cluster.local:7789)"`
+	HTTPAddr           string `short:"a" long:"addr"  description:"HTTP listen address (empty disables HTTP)"`
+	Storage            string `long:"storage" description:"Directory for auth tokens"`
+	SecretsBase        string `long:"secretsBase" description:"AFS/scy base URL for persisting tokens (e.g., mem://localhost/mcp-github)"`
+	ClientID           string `long:"client-id" description:"GitHub OAuth app client ID"`
+	Oauth2Config       string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
+	UseIdToken         bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	PublicBaseURL      string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-github.agently.svc.cluster.local:7789)"`
+	SnapshotCleanHours int    `long:"snapshot-clean-hours" description:"Remove shared snapshot zips older than this many hours before each new download (default 12)"`
+	SedDiffBytes       int    `long:"sed-diff-bytes" description:"Max unified diff bytes for sed previews (default uses previewBytes for findFilesPreview; 8192 for download)"`
+	SedMaxEditsPerFile int    `long:"sed-max-edits" description:"Default max sed edits per file when input omits it (0 = unlimited)"`
 }
 
 func main() {
@@ -55,7 +58,7 @@ func main() {
 			baseURL = "http://" + hostport
 		}
 	}
-	svc := ghservice.NewService(&ghservice.Config{ClientID: opts.ClientID, StorageDir: opts.Storage, SecretsBase: opts.SecretsBase, CallbackBaseURL: baseURL})
+	svc := ghservice.NewService(&ghservice.Config{ClientID: opts.ClientID, StorageDir: opts.Storage, SecretsBase: opts.SecretsBase, CallbackBaseURL: baseURL, SnapshotSharedCleanupHours: opts.SnapshotCleanHours, SedDiffBytes: opts.SedDiffBytes, SedMaxEditsPerFile: opts.SedMaxEditsPerFile})
 
 	// Base server options
 	options := []mcpsrv.Option{

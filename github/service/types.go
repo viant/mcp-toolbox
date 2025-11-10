@@ -123,52 +123,100 @@ type CheckoutRepoOutput struct {
 	WasCloned  bool   `json:"wasCloned"`
 }
 
-// List path (assets) types
+// List path (assets) types — compact contract optimized for LLM usage.
 type ListRepoInput struct {
 	GitTarget
-	Path        string   `json:"path"`
-	Recursive   bool     `json:"recursive,omitempty" description:"traverse directories recursively"`
-	Contains    string   `json:"contains,omitempty" description:"return only entries whose name or path contains this substring (traversal unaffected)"`
-	Concurrency int      `json:"concurrency,omitempty" description:"number of concurrent directory fetches (default 6)"`
-	Include     []string `json:"include,omitempty" description:"glob patterns to include (e.g., ['*.go','*.sql'])"`
-	Exclude     []string `json:"exclude,omitempty" description:"glob patterns to exclude (e.g., ['*_test.go','**/vendor/**'])"`
-
-	// Content search (optional): when either is set, include/exclude apply to file/folder names only,
-	// and files are additionally filtered by these content queries.
-	// Each pattern is a substring by default; wrap with /.../ to use RE2 regex.
-	FindInFilesInclude []string `json:"findInFilesInclude,omitempty" description:"include files whose content matches any pattern; substring or /regex/"`
-	FindInFilesExclude []string `json:"findInFilesExclude,omitempty" description:"exclude files whose content matches any pattern; substring or /regex/"`
-	// Case-insensitive matching for substring mode (regex can use (?i) flags)
-	// If nil, defaults to true. When true, substring matching is case-insensitive.
-	FindInFilesCaseInsensitive *bool `json:"findInFilesCaseInsensitive,omitempty" description:"case-insensitive substring matching for findInFiles patterns (default true)"`
-
-	// Content scanning safety knobs (apply when findInFiles is set)
-	SkipBinary  bool `json:"skipBinary,omitempty" description:"skip binary-like files during content scanning (default true)"`
-	MaxFileSize int  `json:"maxFileSize,omitempty" description:"max file size to scan in bytes (default service-level)"`
-	// Optional: reuse cached snapshot for local-FS feel
-	SessionID string `json:"sessionId,omitempty" description:"reuse cached repo snapshot across calls"`
-	// Debugging removed: previously logged examined files and sizes during content scan
+	Path      string   `json:"path"`
+	Recursive bool     `json:"recursive,omitempty"`
+	Include   []string `json:"include,omitempty"`
+	Exclude   []string `json:"exclude,omitempty"`
 }
-type AssetItem struct {
-	Type string `json:"type"` // file|dir
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Size int    `json:"size"`
-	Sha  string `json:"sha"`
-}
+
 type ListRepoOutput struct {
-	Items []AssetItem `json:"items"`
-	// Warning communicates non-fatal issues (e.g., content scan fallback to path-only).
-	Warning string `json:"warning,omitempty"`
+	Ref     string   `json:"ref,omitempty"` // effective ref used (default branch when omitted)
+	Paths   []string `json:"paths"`         // repo-relative paths under the requested scope
+	Warning string   `json:"warning,omitempty"`
 }
 
 type DownloadInput struct {
 	GitTarget
 	Path string `json:"path"`
+	// Optional sed-like preview/transform (no repo changes)
+	SedScripts       []string `json:"sedScripts,omitempty" description:"sed scripts e.g. s/old/new/g; preview only"`
+	MaxEditsPerFile  int      `json:"maxEditsPerFile,omitempty"`
+	ApplySedToOutput bool     `json:"applySedToOutput,omitempty" description:"when true and file is text, return transformed text instead of original"`
 }
 type DownloadOutput struct {
 	// Content carries binary data when the file is not recognized as UTF-8 text.
 	Content []byte `json:"content,omitempty"`
 	// Text carries UTF-8 textual content when auto-detected; in this case, Content is omitted.
 	Text string `json:"text,omitempty"`
+	// TransformedText carries sed-transformed text when sedScripts are provided; original Text is preserved unless ApplySedToOutput=true.
+	TransformedText string     `json:"transformedText,omitempty"`
+	SedPreview      *SedResult `json:"sedPreview,omitempty"`
 }
+
+// FindFilesPreviewInput defines a search + preview (no-apply) request on a repo snapshot.
+type FindFilesPreviewInput struct {
+	GitTarget
+	// Scope
+	Path      string   `json:"path"`
+	Recursive bool     `json:"recursive,omitempty"`
+	Include   []string `json:"include,omitempty"`
+	Exclude   []string `json:"exclude,omitempty"`
+	// Content filters
+	Queries         []string `json:"queries,omitempty"`
+	ExcludeQueries  []string `json:"excludeQueries,omitempty"`
+	CaseInsensitive bool     `json:"caseInsensitive,omitempty"`
+	// Preview shaping
+	Mode      string `json:"mode,omitempty"`
+	Bytes     int    `json:"bytes,omitempty"`
+	Lines     int    `json:"lines,omitempty"`
+	MaxFiles  int    `json:"maxFiles,omitempty"`
+	MaxBlocks int    `json:"maxBlocks,omitempty"`
+	// Safety/perf
+	SkipBinary  bool `json:"skipBinary,omitempty"`
+	MaxSize     int  `json:"maxSize,omitempty"`
+	Concurrency int  `json:"concurrency,omitempty"`
+}
+
+type FindFilesPreviewOutput struct {
+	Ref   string        `json:"ref,omitempty"`
+	Sha   string        `json:"sha"`
+	Stats PreviewStats  `json:"stats"`
+	Files []PreviewFile `json:"files,omitempty"`
+}
+
+type PreviewStats struct {
+	Scanned   int  `json:"scanned"`
+	Matched   int  `json:"matched"`
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+type PreviewFile struct {
+	Path     string           `json:"path"`
+	Matches  int              `json:"matches,omitempty"`
+	Score    float32          `json:"score,omitempty"`
+	Snippets []PreviewSnippet `json:"snippets,omitempty"`
+	Omitted  int              `json:"omitted,omitempty"`
+}
+
+type PreviewSnippet struct {
+	Start   int      `json:"start"`
+	End     int      `json:"end"`
+	Text    string   `json:"text,omitempty"`
+	Hits    [][2]int `json:"hits,omitempty"`
+	Covered int      `json:"covered,omitempty"`
+	Total   int      `json:"total,omitempty"`
+	Cut     bool     `json:"cut,omitempty"`
+}
+
+type SedResult struct {
+	Edits int    `json:"edits"`
+	Diff  string `json:"diff,omitempty"`
+}
+
+// FindFilesPreviewInput requests finding files with optional sed-like preview (no apply).
+// (duplicate type removed)
+
+// (deprecated duplicate preview types removed)

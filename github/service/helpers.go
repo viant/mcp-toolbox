@@ -36,6 +36,7 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 	if token == "" {
 		if prompt != nil {
 			// Elicit once and wait briefly for token to arrive
+			// debug logs removed
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, "", "", prompt)
 			// Bound wait by context deadline when present
 			wait := svc.WaitTimeout()
@@ -53,6 +54,7 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
 				}
 			}
+			// debug logs removed
 		}
 		if token == "" {
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or use /github/auth/start explicitly", aliasEff, domainEff)
@@ -96,6 +98,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	}
 	if token == "" {
 		if prompt != nil {
+			// debug logs removed
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, owner, name, prompt)
 			// Bound wait by context deadline when present
 			wait := svc.WaitTimeout()
@@ -113,6 +116,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
 				}
 			}
+			// debug logs removed
 		}
 		if token == "" {
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or /github/auth/token", aliasEff, domainEff)

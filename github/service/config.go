@@ -14,4 +14,10 @@ type Config struct {
 	SnapshotMemThresholdBytes int64 `json:"snapshotMemThresholdBytes,omitempty"`
 	// SnapshotMemTTLSeconds controls in-memory snapshot TTL (default 900 = 15 minutes).
 	SnapshotMemTTLSeconds int `json:"snapshotMemTtlSeconds,omitempty"`
+	// SnapshotSharedCleanupHours controls how old shared snapshot files must be to be removed on pre-clean (default 12 hours).
+	SnapshotSharedCleanupHours int `json:"snapshotSharedCleanupHours,omitempty"`
+	// SedDiffBytes caps unified diff size for sed previews (default uses previewBytes for findFilesPreview; 8192 for download).
+	SedDiffBytes int `json:"sedDiffBytes,omitempty"`
+	// SedMaxEditsPerFile provides a default edits cap when input doesn't specify it.
+	SedMaxEditsPerFile int `json:"sedMaxEditsPerFile,omitempty"`
 }

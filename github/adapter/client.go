@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
-	"encoding/base64"
 )
 
 var ErrUnauthorized = errors.New("unauthorized")
@@ -56,125 +56,195 @@ type ContentItem struct {
 // by probing the repository root contents with the supplied ref.
 // It returns nil on any 2xx response, ErrUnauthorized on 401, and an error otherwise.
 func (c *Client) ValidateRef(ctx context.Context, token, owner, name, ref string) error {
-    if strings.TrimSpace(ref) == "" {
-        return fmt.Errorf("empty ref")
-    }
-    url := fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
-    if ref != "" {
-        url += "?ref=" + neturl.QueryEscape(ref)
-    }
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return err }
-    defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized { return ErrUnauthorized }
-    if resp.StatusCode >= 300 { return fmt.Errorf("validate ref failed: %s", resp.Status) }
-    return nil
+	if strings.TrimSpace(ref) == "" {
+		return fmt.Errorf("empty ref")
+	}
+	url := fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
+	if ref != "" {
+		url += "?ref=" + neturl.QueryEscape(ref)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("validate ref failed: %s", resp.Status)
+	}
+	return nil
 }
 
 // Trees API types
 type TreeEntry struct {
-    Path string `json:"path"`
-    Mode string `json:"mode"`
-    Type string `json:"type"` // "blob" | "tree" | "commit" (submodule)
-    Size int    `json:"size,omitempty"`
-    Sha  string `json:"sha"`
-    Url  string `json:"url"`
+	Path string `json:"path"`
+	Mode string `json:"mode"`
+	Type string `json:"type"` // "blob" | "tree" | "commit" (submodule)
+	Size int    `json:"size,omitempty"`
+	Sha  string `json:"sha"`
+	Url  string `json:"url"`
 }
 
 // GetBlob fetches blob content by SHA via the Git Data API.
 func (c *Client) GetBlob(ctx context.Context, token, owner, name, sha string) ([]byte, error) {
-    url := fmt.Sprintf("%s/repos/%s/%s/git/blobs/%s", c.apiBase, owner, name, sha)
-    // Try raw first
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github.raw")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return nil, err }
-    if resp.StatusCode == http.StatusUnauthorized { resp.Body.Close(); return nil, ErrUnauthorized }
-    if resp.StatusCode < 300 { defer resp.Body.Close(); return io.ReadAll(resp.Body) }
-    resp.Body.Close()
-    // Fallback JSON base64
-    req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req2.Header.Set("Authorization", authBasic(token))
-    req2.Header.Set("Accept", "application/vnd.github+json")
-    resp2, err := http.DefaultClient.Do(req2)
-    if err != nil { return nil, err }
-    defer resp2.Body.Close()
-    if resp2.StatusCode == http.StatusUnauthorized { return nil, ErrUnauthorized }
-    if resp2.StatusCode >= 300 { return nil, fmt.Errorf("get blob failed: %s", resp2.Status) }
-    var obj struct { Content string `json:"content"`; Encoding string `json:"encoding"` }
-    if err := json.NewDecoder(resp2.Body).Decode(&obj); err != nil { return nil, err }
-    b64 := strings.ReplaceAll(obj.Content, "\n", "")
-    data, err := base64.StdEncoding.DecodeString(b64)
-    if err != nil { return nil, err }
-    return data, nil
+	url := fmt.Sprintf("%s/repos/%s/%s/git/blobs/%s", c.apiBase, owner, name, sha)
+	// Try raw first
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github.raw")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode < 300 {
+		defer resp.Body.Close()
+		return io.ReadAll(resp.Body)
+	}
+	resp.Body.Close()
+	// Fallback JSON base64
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req2.Header.Set("Authorization", authBasic(token))
+	req2.Header.Set("Accept", "application/vnd.github+json")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		return nil, err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp2.StatusCode >= 300 {
+		return nil, fmt.Errorf("get blob failed: %s", resp2.Status)
+	}
+	var obj struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&obj); err != nil {
+		return nil, err
+	}
+	b64 := strings.ReplaceAll(obj.Content, "\n", "")
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // GetCommitTreeSHA resolves a ref (branch/tag/commit) to its tree SHA via commits API.
 func (c *Client) GetCommitTreeSHA(ctx context.Context, token, owner, name, ref string) (string, error) {
-    // try plain ref first
-    try := func(r string) (string, int, error) {
-        url := fmt.Sprintf("%s/repos/%s/%s/commits/%s", c.apiBase, owner, name, r)
-        req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-        req.Header.Set("Authorization", authBasic(token))
-        req.Header.Set("Accept", "application/vnd.github+json")
-        resp, err := http.DefaultClient.Do(req)
-        if err != nil { return "", 0, err }
-        defer resp.Body.Close()
-        if resp.StatusCode == http.StatusUnauthorized { return "", resp.StatusCode, ErrUnauthorized }
-        if resp.StatusCode >= 300 { return "", resp.StatusCode, fmt.Errorf("get commit failed: %s", resp.Status) }
-        var payload struct{ Commit struct{ Tree struct{ Sha string `json:"sha"` } `json:"tree"` } `json:"commit"` }
-        if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil { return "", resp.StatusCode, err }
-        if payload.Commit.Tree.Sha == "" { return "", resp.StatusCode, fmt.Errorf("commit tree SHA not found for ref %s", r) }
-        return payload.Commit.Tree.Sha, resp.StatusCode, nil
-    }
-    // plain branch/tag/sha
-    if sha, sc, err := try(ref); err == nil {
-        return sha, nil
-    } else {
-        // On 422, some GHEs require explicit heads/ prefix
-        if sc == http.StatusUnprocessableEntity && !strings.Contains(ref, "/") {
-            if sha, _, err2 := try("heads/" + ref); err2 == nil { return sha, nil }
-            if sha, _, err3 := try("refs/heads/" + ref); err3 == nil { return sha, nil }
-        }
-        return "", err
-    }
+	// try plain ref first
+	try := func(r string) (string, int, error) {
+		url := fmt.Sprintf("%s/repos/%s/%s/commits/%s", c.apiBase, owner, name, r)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req.Header.Set("Authorization", authBasic(token))
+		req.Header.Set("Accept", "application/vnd.github+json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			return "", resp.StatusCode, ErrUnauthorized
+		}
+		if resp.StatusCode >= 300 {
+			return "", resp.StatusCode, fmt.Errorf("get commit failed: %s", resp.Status)
+		}
+		var payload struct {
+			Commit struct {
+				Tree struct {
+					Sha string `json:"sha"`
+				} `json:"tree"`
+			} `json:"commit"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return "", resp.StatusCode, err
+		}
+		if payload.Commit.Tree.Sha == "" {
+			return "", resp.StatusCode, fmt.Errorf("commit tree SHA not found for ref %s", r)
+		}
+		return payload.Commit.Tree.Sha, resp.StatusCode, nil
+	}
+	// plain branch/tag/sha
+	if sha, sc, err := try(ref); err == nil {
+		return sha, nil
+	} else {
+		// On 422, some GHEs require explicit heads/ prefix
+		if sc == http.StatusUnprocessableEntity && !strings.Contains(ref, "/") {
+			if sha, _, err2 := try("heads/" + ref); err2 == nil {
+				return sha, nil
+			}
+			if sha, _, err3 := try("refs/heads/" + ref); err3 == nil {
+				return sha, nil
+			}
+		}
+		return "", err
+	}
 }
 
 // GetRepoDefaultBranch returns the default branch name (e.g., "main" or "master").
 func (c *Client) GetRepoDefaultBranch(ctx context.Context, token, owner, name string) (string, error) {
-    url := fmt.Sprintf("%s/repos/%s/%s", c.apiBase, owner, name)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return "", err }
-    defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized { return "", ErrUnauthorized }
-    if resp.StatusCode >= 300 { return "", fmt.Errorf("get repo failed: %s", resp.Status) }
-    var payload struct{ DefaultBranch string `json:"default_branch"` }
-    if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil { return "", err }
-    if payload.DefaultBranch == "" { return "", fmt.Errorf("default_branch not found") }
-    return payload.DefaultBranch, nil
+	url := fmt.Sprintf("%s/repos/%s/%s", c.apiBase, owner, name)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("get repo failed: %s", resp.Status)
+	}
+	var payload struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if payload.DefaultBranch == "" {
+		return "", fmt.Errorf("default_branch not found")
+	}
+	return payload.DefaultBranch, nil
 }
 
 // GetTreeRecursive fetches a full tree listing with recursive=1. Returns entries and whether it was truncated.
 func (c *Client) GetTreeRecursive(ctx context.Context, token, owner, name, treeSha string) ([]TreeEntry, bool, error) {
-    url := fmt.Sprintf("%s/repos/%s/%s/git/trees/%s?recursive=1", c.apiBase, owner, name, treeSha)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return nil, false, err }
-    defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized { return nil, false, ErrUnauthorized }
-    if resp.StatusCode >= 300 { return nil, false, fmt.Errorf("get tree failed: %s", resp.Status) }
-    var payload struct{ Tree []TreeEntry `json:"tree"`; Truncated bool `json:"truncated"` }
-    if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil { return nil, false, err }
-    return payload.Tree, payload.Truncated, nil
+	url := fmt.Sprintf("%s/repos/%s/%s/git/trees/%s?recursive=1", c.apiBase, owner, name, treeSha)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, false, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, false, fmt.Errorf("get tree failed: %s", resp.Status)
+	}
+	var payload struct {
+		Tree      []TreeEntry `json:"tree"`
+		Truncated bool        `json:"truncated"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, false, err
+	}
+	return payload.Tree, payload.Truncated, nil
 }
 
 func (c *Client) ListRepos(ctx context.Context, token, visibility, affiliation string, perPage int) ([]Repo, error) {
@@ -192,20 +262,20 @@ func (c *Client) ListRepos(ctx context.Context, token, visibility, affiliation s
 	if enc := q.Encode(); enc != "" {
 		url += "?" + enc
 	}
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("list repos failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list repos failed: %s", resp.Status)
+	}
 	var items []struct {
 		ID       int64  `json:"id"`
 		Name     string `json:"name"`
@@ -224,16 +294,22 @@ func (c *Client) ListRepos(ctx context.Context, token, visibility, affiliation s
 // ValidateToken performs a lightweight call to verify that provided credentials are valid.
 // It calls the /user endpoint which requires an authenticated token.
 func (c *Client) ValidateToken(ctx context.Context, token string) error {
-    url := c.apiBase + "/user"
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return err }
-    defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized { return ErrUnauthorized }
-    if resp.StatusCode >= 300 { return fmt.Errorf("validate token failed: %s", resp.Status) }
-    return nil
+	url := c.apiBase + "/user"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("validate token failed: %s", resp.Status)
+	}
+	return nil
 }
 
 func (c *Client) ListRepoIssues(ctx context.Context, token, owner, name, state string) ([]Issue, error) {
@@ -245,20 +321,20 @@ func (c *Client) ListRepoIssues(ctx context.Context, token, owner, name, state s
 	if enc := q.Encode(); enc != "" {
 		url += "?" + enc
 	}
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("list issues failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list issues failed: %s", resp.Status)
+	}
 	var items []struct {
 		ID     int64  `json:"id"`
 		Number int    `json:"number"`
@@ -284,20 +360,20 @@ func (c *Client) ListRepoPRs(ctx context.Context, token, owner, name, state stri
 	if enc := q.Encode(); enc != "" {
 		url += "?" + enc
 	}
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("list pulls failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list pulls failed: %s", resp.Status)
+	}
 	var items []struct {
 		ID     int64  `json:"id"`
 		Number int    `json:"number"`
@@ -327,21 +403,21 @@ func (c *Client) CreateIssue(ctx context.Context, token, owner, name, title, bod
 		payload["assignees"] = assignees
 	}
 	b, _ := json.Marshal(payload)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return Issue{}, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return Issue{}, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return Issue{}, fmt.Errorf("create issue failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return Issue{}, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return Issue{}, fmt.Errorf("create issue failed: %s", resp.Status)
+	}
 	var it struct {
 		ID           int64  `json:"id"`
 		Number       int    `json:"number"`
@@ -363,21 +439,21 @@ func (c *Client) CreatePR(ctx context.Context, token, owner, name, title, body, 
 		payload["draft"] = true
 	}
 	b, _ := json.Marshal(payload)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return PullRequest{}, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return PullRequest{}, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return PullRequest{}, fmt.Errorf("create pull request failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return PullRequest{}, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return PullRequest{}, fmt.Errorf("create pull request failed: %s", resp.Status)
+	}
 	var it struct {
 		ID           int64  `json:"id"`
 		Number       int    `json:"number"`
@@ -392,21 +468,21 @@ func (c *Client) CreatePR(ctx context.Context, token, owner, name, title, body, 
 func (c *Client) AddComment(ctx context.Context, token, owner, name string, issueNumber int, body string) (Comment, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", c.apiBase, owner, name, issueNumber)
 	b, _ := json.Marshal(map[string]any{"body": body})
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
-    req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return Comment{}, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return Comment{}, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return Comment{}, fmt.Errorf("add comment failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return Comment{}, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return Comment{}, fmt.Errorf("add comment failed: %s", resp.Status)
+	}
 	var it struct {
 		ID   int64  `json:"id"`
 		Body string `json:"body"`
@@ -423,20 +499,20 @@ func (c *Client) AddComment(ctx context.Context, token, owner, name string, issu
 
 func (c *Client) ListComments(ctx context.Context, token, owner, name string, issueNumber int) ([]Comment, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", c.apiBase, owner, name, issueNumber)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("list comments failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list comments failed: %s", resp.Status)
+	}
 	var items []struct {
 		ID   int64  `json:"id"`
 		Body string `json:"body"`
@@ -462,20 +538,20 @@ func (c *Client) SearchIssues(ctx context.Context, token, query string, perPage 
 		q.Set("per_page", fmt.Sprintf("%d", perPage))
 	}
 	url := c.apiBase + "/search/issues?" + q.Encode()
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("search issues failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("search issues failed: %s", resp.Status)
+	}
 	var result struct {
 		Items []struct {
 			ID     int64  `json:"id"`
@@ -496,48 +572,48 @@ func (c *Client) SearchIssues(ctx context.Context, token, query string, perPage 
 
 // ListContents lists directory entries at path, or returns a single item if path points to a file.
 func (c *Client) ListContents(ctx context.Context, token, owner, name, path, ref string) ([]ContentItem, error) {
-    var url string
-    if strings.TrimSpace(path) == "" {
-        url = fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
-    } else {
-        url = fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.apiBase, owner, name, path)
-    }
+	var url string
+	if strings.TrimSpace(path) == "" {
+		url = fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
+	} else {
+		url = fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.apiBase, owner, name, path)
+	}
 	if ref != "" {
 		url += "?ref=" + neturl.QueryEscape(ref)
 	}
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github+json")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-    if resp.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("list contents failed: %s", resp.Status)
-    }
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("list contents failed: %s", resp.Status)
+	}
 	// Could be array (dir) or object (file)
 	var arr []ContentItem
 	if err := json.NewDecoder(resp.Body).Decode(&arr); err == nil {
 		return arr, nil
 	}
 	// Reset decode by re-issuing the request
-    req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req2.Header = req.Header.Clone()
-    resp2, err := http.DefaultClient.Do(req2)
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req2.Header = req.Header.Clone()
+	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		return nil, err
 	}
 	defer resp2.Body.Close()
-    if resp2.StatusCode == http.StatusUnauthorized {
-        return nil, ErrUnauthorized
-    }
-    if resp2.StatusCode >= 300 {
-        return nil, fmt.Errorf("list contents failed: %s", resp2.Status)
-    }
+	if resp2.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp2.StatusCode >= 300 {
+		return nil, fmt.Errorf("list contents failed: %s", resp2.Status)
+	}
 	var obj ContentItem
 	if err := json.NewDecoder(resp2.Body).Decode(&obj); err != nil {
 		return nil, err
@@ -547,55 +623,102 @@ func (c *Client) ListContents(ctx context.Context, token, owner, name, path, ref
 
 // GetFileContent fetches raw file bytes via the contents API.
 func (c *Client) GetFileContent(ctx context.Context, token, owner, name, path, ref string) ([]byte, error) {
-    var url string
-    if strings.TrimSpace(path) == "" {
-        url = fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
-    } else {
-        url = fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.apiBase, owner, name, path)
-    }
-    if ref != "" {
-        url += "?ref=" + neturl.QueryEscape(ref)
-    }
-    // First try raw media type
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req.Header.Set("Authorization", authBasic(token))
-    req.Header.Set("Accept", "application/vnd.github.raw")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    if resp.StatusCode == http.StatusUnauthorized {
-        resp.Body.Close()
-        return nil, ErrUnauthorized
-    }
-    if resp.StatusCode < 300 {
-        defer resp.Body.Close()
-        return io.ReadAll(resp.Body)
-    }
-    // Some GHE deployments respond 404/415 for raw; fall back to JSON and decode base64 content
-    resp.Body.Close()
-    req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    req2.Header.Set("Authorization", authBasic(token))
-    req2.Header.Set("Accept", "application/vnd.github+json")
-    resp2, err := http.DefaultClient.Do(req2)
-    if err != nil { return nil, err }
-    defer resp2.Body.Close()
-    if resp2.StatusCode == http.StatusUnauthorized { return nil, ErrUnauthorized }
-    if resp2.StatusCode >= 300 { return nil, fmt.Errorf("get content failed: %s", resp2.Status) }
-    var obj struct { Content string `json:"content"`; Encoding string `json:"encoding"` }
-    if err := json.NewDecoder(resp2.Body).Decode(&obj); err != nil { return nil, err }
-    if obj.Content == "" { return nil, fmt.Errorf("empty content payload") }
-    // GitHub may include newlines in base64 content
-    b64 := strings.ReplaceAll(obj.Content, "\n", "")
-    data, err := base64.StdEncoding.DecodeString(b64)
-    if err != nil { return nil, err }
-    return data, nil
+	var url string
+	if strings.TrimSpace(path) == "" {
+		url = fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
+	} else {
+		url = fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.apiBase, owner, name, path)
+	}
+	if ref != "" {
+		url += "?ref=" + neturl.QueryEscape(ref)
+	}
+	// First try raw media type
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github.raw")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode < 300 {
+		defer resp.Body.Close()
+		return io.ReadAll(resp.Body)
+	}
+	// Some GHE deployments respond 404/415 for raw; fall back to JSON and decode base64 content
+	resp.Body.Close()
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req2.Header.Set("Authorization", authBasic(token))
+	req2.Header.Set("Accept", "application/vnd.github+json")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		return nil, err
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if resp2.StatusCode >= 300 {
+		return nil, fmt.Errorf("get content failed: %s", resp2.Status)
+	}
+	var obj struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&obj); err != nil {
+		return nil, err
+	}
+	if obj.Content == "" {
+		return nil, fmt.Errorf("empty content payload")
+	}
+	// GitHub may include newlines in base64 content
+	b64 := strings.ReplaceAll(obj.Content, "\n", "")
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 func authBasic(token string) string {
-    // If token looks like "username:password", use it directly; else treat as PAT.
-    if strings.Contains(token, ":") {
-        return "Basic " + base64.StdEncoding.EncodeToString([]byte(token))
-    }
-    creds := "x-access-token:" + token
-    return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+	// If token looks like "username:password", use it directly; else treat as PAT.
+	if strings.Contains(token, ":") {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(token))
+	}
+	creds := "x-access-token:" + token
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+}
+
+// RepoInfo carries minimal repo metadata needed for permission/visibility checks.
+type RepoInfo struct {
+	Private    bool   `json:"private"`
+	Visibility string `json:"visibility,omitempty"`
+}
+
+// GetRepo fetches repository metadata; returns ErrUnauthorized on 401.
+func (c *Client) GetRepo(ctx context.Context, token, owner, name string) (RepoInfo, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s", c.apiBase, owner, name)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", authBasic(token))
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return RepoInfo{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return RepoInfo{}, ErrUnauthorized
+	}
+	if resp.StatusCode >= 300 {
+		return RepoInfo{}, fmt.Errorf("get repo failed: %s", resp.Status)
+	}
+	var out RepoInfo
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return RepoInfo{}, err
+	}
+	return out, nil
 }
