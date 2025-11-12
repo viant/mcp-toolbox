@@ -16,40 +16,40 @@ import (
 	ghservice "github.com/viant/mcp-toolbox/github/service"
 )
 
-//go:embed tools/githubListRepos.md
+//go:embed tools/listRepos.md
 var descListRepos string
 
-//go:embed tools/githubListRepoIssues.md
+//go:embed tools/listRepoIssues.md
 var descListIssues string
 
-//go:embed tools/githubListRepoPRs.md
+//go:embed tools/listRepoPRs.md
 var descListPRs string
 
-//go:embed tools/githubCreateIssue.md
+//go:embed tools/createIssue.md
 var descCreateIssue string
 
-//go:embed tools/githubCreatePR.md
+//go:embed tools/createPR.md
 var descCreatePR string
 
-//go:embed tools/githubAddComment.md
+//go:embed tools/addComment.md
 var descAddComment string
 
-//go:embed tools/githubListComments.md
+//go:embed tools/listComments.md
 var descListComments string
 
-//go:embed tools/githubSearchIssues.md
+//go:embed tools/searchIssues.md
 var descSearchIssues string
 
-//go:embed tools/githubCheckoutRepo.md
+//go:embed tools/checkoutRepo.md
 var descCheckoutRepo string
 
-//go:embed tools/githubListRepoPath.md
+//go:embed tools/listRepoPath.md
 var descListRepoPath string
 
-//go:embed tools/githubDownloadRepoFile.md
+//go:embed tools/downloadRepoFile.md
 var descDownloadRepoFile string
 
-//go:embed tools/githubFindFilesPreview.md
+//go:embed tools/findFilesPreview.md
 var descFindFilesPreview string
 
 // Types moved to types.go
