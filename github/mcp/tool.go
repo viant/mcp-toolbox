@@ -55,17 +55,33 @@ var descFindFilesPreview string
 // Types moved to types.go
 
 func logToolStart(name string) time.Time {
-	return time.Now()
+	ts := time.Now()
+	fmt.Printf("[MCP][%s] START tool=%s\n", ts.Format(time.RFC3339Nano), name)
+	return ts
 }
 
 func logToolEnd(name string, start time.Time, err error) {
-	// no-op (tool debug logs removed)
+	dur := time.Since(start)
+	if err != nil {
+		fmt.Printf("[MCP][%s] END tool=%s dur=%s err=%v\n", time.Now().Format(time.RFC3339Nano), name, dur, err)
+	} else {
+		fmt.Printf("[MCP][%s] END tool=%s dur=%s ok\n", time.Now().Format(time.RFC3339Nano), name, dur)
+	}
 }
 
-// startToolPending starts a background logger that reports pending status every second
-// and emits a slow-call warning after 10s. Returns a stop func to end logging.
+// startToolPending prints a start line with summarized args and returns a stopper that prints end.
 func startToolPending(name string, args any, start time.Time) func() {
+	fmt.Printf("[MCP] ARGS tool=%s args=%s\n", name, summarizeArgs(args))
 	return func() {}
+}
+
+func logToolNS(h *Handler, name string, ctx context.Context) {
+	if h == nil {
+		return
+	}
+	if d, err := h.nsProvider.Namespace(ctx); err == nil {
+		fmt.Printf("[MCP] NS tool=%s ns=%s\n", name, d.Name)
+	}
 }
 
 func summarizeArgs(args any) string {
@@ -88,7 +104,6 @@ func summarizeArgs(args any) string {
 }
 
 func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
-	svc := h.service
 	ops := h.ops
 
 	// Helper to surface device login prompt via elicitation.
@@ -101,9 +116,16 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			code := extractCode(msg)
 			text := buildPromptMessage(u, code)
 			elicitID := newUUID()
-			_, _ = ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
-			}})
+			// Fire-and-forget to avoid blocking the triggering tool call on transport/UI delays.
+			go func() {
+				// Short timeout to prevent long blocking if client/UI is slow.
+				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				fmt.Printf("[MCP] ELICIT SEND id=%s url=%s\n", elicitID, u)
+				_, _ = ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
+					Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
+				}})
+			}()
 		}
 	}
 
@@ -112,7 +134,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		start := logToolStart("listRepos")
 		stop := startToolPending("listRepos", in, start)
 		defer stop()
-		out, err := svc.ListRepos(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "listRepos", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.ListRepos(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("listRepos", start, err)
 			return buildErrorResult(err.Error())
@@ -132,7 +159,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("listRepoIssues", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
-		out, err := svc.ListRepoIssues(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "listRepoIssues", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.ListRepoIssues(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("listRepoIssues", start, err)
 			return buildErrorResult(err.Error())
@@ -152,7 +184,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("listRepoPRs", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
-		out, err := svc.ListRepoPRs(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "listRepoPRs", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.ListRepoPRs(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("listRepoPRs", start, err)
 			return buildErrorResult(err.Error())
@@ -176,7 +213,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("createIssue", start, fmt.Errorf("missing title"))
 			return buildErrorResult("title is required")
 		}
-		out, err := svc.CreateIssue(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "createIssue", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.CreateIssue(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("createIssue", start, err)
 			return buildErrorResult(err.Error())
@@ -200,7 +242,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("createPR", start, fmt.Errorf("missing title/head/base"))
 			return buildErrorResult("title, head, and base are required")
 		}
-		out, err := svc.CreatePR(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "createPR", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.CreatePR(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("createPR", start, err)
 			return buildErrorResult(err.Error())
@@ -228,7 +275,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("addComment", start, fmt.Errorf("missing body"))
 			return buildErrorResult("body is required")
 		}
-		out, err := svc.AddComment(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "addComment", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.AddComment(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("addComment", start, err)
 			return buildErrorResult(err.Error())
@@ -252,7 +304,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("listComments", start, fmt.Errorf("invalid issueNumber"))
 			return buildErrorResult("issueNumber must be > 0")
 		}
-		out, err := svc.ListComments(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "listComments", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.ListComments(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("listComments", start, err)
 			return buildErrorResult(err.Error())
@@ -272,7 +329,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("searchIssues", start, fmt.Errorf("missing query"))
 			return buildErrorResult("query is required")
 		}
-		out, err := svc.SearchIssues(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "searchIssues", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.SearchIssues(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("searchIssues", start, err)
 			return buildErrorResult(err.Error())
@@ -292,7 +354,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("checkoutRepo", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
-		out, err := svc.CheckoutRepo(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "checkoutRepo", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.CheckoutRepo(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("checkoutRepo", start, err)
 			return buildErrorResult(err.Error())
@@ -312,7 +379,12 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("listRepo", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
-		out, err := svc.ListRepoPath(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "listRepo", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.ListRepoPath(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("listRepo", start, err)
 			return buildErrorResult(err.Error())
@@ -336,7 +408,15 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			logToolEnd("download", start, fmt.Errorf("missing path"))
 			return buildErrorResult("path is required")
 		}
-		out, err := svc.DownloadRepoFile(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "download", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		cid := newUUID()
+		ctxNS = ghservice.WithCID(ctxNS, cid)
+		fmt.Printf("[MCP] CID tool=download cid=%s path=%s\n", cid, in.Path)
+		out, err := svc.DownloadRepoFile(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("download", start, err)
 			return buildErrorResult(err.Error())
@@ -348,16 +428,21 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Find files with preview (no apply), supports sed-like preview on snapshot
-	if err := protoserver.RegisterTool[*ghservice.FindFilesPreviewInput, *ghservice.FindFilesPreviewOutput](base.Registry, "findFilesPreview", descFindFilesPreview, func(ctx context.Context, in *ghservice.FindFilesPreviewInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		start := logToolStart("findFilesPreview")
-		stop := startToolPending("findFilesPreview", in, start)
+	if err := protoserver.RegisterTool[*ghservice.FindFilesPreviewInput, *ghservice.FindFilesPreviewOutput](base.Registry, "searchRepoContent", descFindFilesPreview, func(ctx context.Context, in *ghservice.FindFilesPreviewInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("searchRepoContent")
+		stop := startToolPending("searchRepoContent", in, start)
 		defer stop()
-		out, err := svc.FindFilesPreview(ctx, in, msgPrompt(ctx))
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "searchRepoContent", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.SearchRepoContent(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
-			logToolEnd("findFilesPreview", start, err)
+			logToolEnd("searchRepoContent", start, err)
 			return buildErrorResult(err.Error())
 		}
-		logToolEnd("findFilesPreview", start, nil)
+		logToolEnd("searchRepoContent", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err

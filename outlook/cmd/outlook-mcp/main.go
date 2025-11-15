@@ -119,6 +119,8 @@ func main() {
 		mcpsrv.WithRootRedirect(true),
 		mcpsrv.WithStreamableURI("/mcp"),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/device/", svc.DeviceHandler()),
+		mcpsrv.WithCustomHTTPHandler("/outlook/auth/start", svc.DeviceStartHandler()),
+		mcpsrv.WithCustomHTTPHandler("/outlook/auth/check", svc.DeviceCheckHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/pending", svc.PendingListHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/pending/clear", svc.PendingClearHandler()),
 	}

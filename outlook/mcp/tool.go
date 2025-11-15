@@ -6,8 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
+	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/google/uuid"
 	"github.com/viant/jsonrpc"
 	"github.com/viant/mcp-protocol/schema"
@@ -38,27 +39,20 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	svc := h.service
 	ops := h.ops
 
-	userPrompt := func(ctx context.Context, m azidentity.DeviceCodeMessage) error {
-		if ops != nil && ops.Implements(schema.MethodElicitationCreate) {
-			text := fmt.Sprintf("Open %s and enter code: %s", m.VerificationURL, m.UserCode)
-			elicitID := newUUID()
-			_, _ = ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: m.VerificationURL},
+	// Non-blocking OOB launch aligned with GitHub flow, using server-side /outlook/auth/start
+	startOOB := func(ctx context.Context, alias, tenant string) {
+		if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
+			return
+		}
+		base := strings.TrimRight(svc.BaseURL(), "/")
+		url := fmt.Sprintf("%s/outlook/auth/start?alias=%s&tenant=%s", base, alias, tenant)
+		go func() {
+			ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, _ = ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
+				Params: schema.ElicitRequestParams{ElicitationId: newUUID(), Message: "Sign in to Outlook", Mode: string(schema.ElicitRequestParamsModeUrl), Url: url},
 			}})
-		}
-		return nil
-	}
-
-	var msgPrompt func(ctx context.Context) func(msg string)
-	msgPrompt = func(ctx context.Context) func(msg string) {
-		return func(msg string) {
-			deviceCodeMessage := azidentity.DeviceCodeMessage{
-				UserCode:        extractCode(msg),
-				VerificationURL: extractURL(msg),
-				Message:         msg,
-			}
-			_ = userPrompt(ctx, deviceCodeMessage)
-		}
+		}()
 	}
 
 	mailSvc := graph.NewMailService(svc.GraphManager())
@@ -73,7 +67,11 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		out, err := mailSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		// Start server-side OOB if needed before invoking the call
+		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
+			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		}
+		out, err := mailSvc.List(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -90,7 +88,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), msgPrompt(ctx)); err != nil {
+		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
+			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		}
+		if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), nil); err != nil {
 			return buildErrorResult(err.Error())
 		}
 		return buildSuccessResult(svc, map[string]any{"status": "sent"})
@@ -106,7 +107,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		out, err := calSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
+			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		}
+		out, err := calSvc.List(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -123,7 +127,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		out, err := calSvc.Create(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
+			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		}
+		out, err := calSvc.Create(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -140,7 +147,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		out, err := taskSvc.List(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
+			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		}
+		out, err := taskSvc.List(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -157,7 +167,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		out, err := taskSvc.Create(ctx, in, graph.DefaultScopes(), msgPrompt(ctx))
+		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
+			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		}
+		out, err := taskSvc.Create(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}

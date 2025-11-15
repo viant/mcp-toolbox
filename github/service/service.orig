@@ -1,0 +1,3757 @@
+package service
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"net/http"
+	neturl "net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	difflib "github.com/pmezard/go-difflib/difflib"
+	"github.com/viant/afs"
+	afsurl "github.com/viant/afs/url"
+	"github.com/viant/jsonrpc"
+	protoclient "github.com/viant/mcp-protocol/client"
+	oa "github.com/viant/mcp-toolbox/auth"
+	"github.com/viant/mcp-toolbox/github/adapter"
+	nsprov "github.com/viant/mcp/server/namespace"
+)
+
+// parseDelimitedRegex parses patterns like /pattern/ or /pattern/flags and returns
+// (isRegex, normalizedPattern, flags). Supported flag: i (case-insensitive).
+func parseDelimitedRegex(q string) (bool, string, string) {
+	q = strings.TrimSpace(q)
+	if len(q) < 2 {
+		return false, "", ""
+	}
+	if !strings.HasPrefix(q, "/") {
+		return false, "", ""
+	}
+	// Find last '/'
+	idx := strings.LastIndex(q, "/")
+	if idx <= 0 {
+		return false, "", ""
+	}
+	pat := q[1:idx]
+	flags := q[idx+1:]
+	return true, pat, flags
+}
+
+type Service struct {
+	baseURL    string
+	useText    bool
+	pending    *PendingAuths
+	auth       *oa.Service
+	ns         *nsprov.DefaultProvider
+	clientID   string
+	storageDir string
+
+	mu             sync.RWMutex
+	tokens         map[string]string // key(ns|alias|domain[|owner|repo[|oauth:clientID]]) -> access token
+	runner         cmdRunner
+	makeContentAPI func(domain string) contentAPI
+	// no alias forcing/defaulting; rely on explicit alias or inference
+
+	// treeCache stores full repo tree entries fetched via the Trees API
+	// keyed by domain|owner|repo for recursive root listings.
+	treeMu    sync.RWMutex
+	treeCache map[string]treeCacheEntry
+
+	// elicit guards to avoid spamming multiple prompts for the same ns/alias/domain
+	elicitMu sync.Mutex
+	elicited map[string]time.Time
+	// global dedup across sessions per alias/domain/namespace
+	elicitedGlobal map[string]time.Time
+
+	// token waiters per alias/domain
+	waitMu  sync.Mutex
+	waiters map[string][]chan struct{}
+
+	// cached tunables
+	tunWaitOnce sync.Once
+	tunCoolOnce sync.Once
+	tunWait     time.Duration
+	tunCooldown time.Duration
+
+	// secrets persistence
+	secretsBase string
+
+	// snapshot zip cache (repo archive zip), keyed by ns|alias|domain|owner|repo|ref
+	snapMu    sync.RWMutex
+	snapCache map[string]snapshotEntry
+
+	// in-memory shared snapshot cache for small zips (keyed by domain|owner|repo|sha)
+	memSnapMu        sync.RWMutex
+	memSnapCache     map[string]memSnapshotEntry
+	memSnapTTL       time.Duration
+	sharedCleanOlder time.Duration
+	sedDiffBytes     int
+	sedMaxEdits      int
+	memSnapThres     int64
+
+	// shared snapshot store across namespaces: storageDir/gh_snapshots_shared/{domain}/{owner}/{repo}/{sha}.zip
+	sharedMu sync.RWMutex
+
+	// permission cache: token-hash + repo -> allowed until
+	permMu    sync.RWMutex
+	permCache map[string]time.Time
+	permTTL   time.Duration
+
+	// repo visibility cache: domain|owner|repo -> public flag with expiry
+	visMu    sync.RWMutex
+	visCache map[string]visEntry
+}
+
+// treeCacheEntry holds cached tree entries with expiration.
+type treeCacheEntry struct {
+	entries  []adapter.TreeEntry
+	expireAt time.Time
+}
+
+// snapshotEntry holds cached snapshot zip metadata.
+type snapshotEntry struct {
+	path     string
+	size     int64
+	expireAt time.Time
+}
+
+type memSnapshotEntry struct {
+	data     []byte
+	size     int64
+	expireAt time.Time
+}
+
+type visEntry struct {
+	public   bool
+	expireAt time.Time
+}
+
+func NewService(cfg *Config) *Service {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	useText := !cfg.UseData
+	s := &Service{
+		baseURL:        cfg.CallbackBaseURL,
+		useText:        useText,
+		pending:        NewPendingAuths(),
+		auth:           oa.New(),
+		clientID:       cfg.ClientID,
+		storageDir:     cfg.StorageDir,
+		tokens:         map[string]string{},
+		runner:         defaultCmdRunner{},
+		makeContentAPI: func(domain string) contentAPI { return adapter.New(domain) },
+		treeCache:      map[string]treeCacheEntry{},
+		elicited:       map[string]time.Time{},
+		elicitedGlobal: map[string]time.Time{},
+		waiters:        map[string][]chan struct{}{},
+		secretsBase:    strings.TrimRight(os.ExpandEnv(cfg.SecretsBase), "/"),
+		snapCache:      map[string]snapshotEntry{},
+		memSnapCache:   map[string]memSnapshotEntry{},
+		permCache:      map[string]time.Time{},
+		visCache:       map[string]visEntry{},
+	}
+	// Initialize shared namespace provider: prefer identity (email/sub), fallback to token-hash with tkn- prefix
+	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
+	// Configure in-memory snapshot caching defaults
+	s.memSnapThres = 100 * 1024 * 1024 // 100MB default
+	if cfg.SnapshotMemThresholdBytes > 0 {
+		s.memSnapThres = cfg.SnapshotMemThresholdBytes
+	}
+	ttlSecs := 900 // 15m
+	if cfg.SnapshotMemTTLSeconds > 0 {
+		ttlSecs = cfg.SnapshotMemTTLSeconds
+	}
+	s.memSnapTTL = time.Duration(ttlSecs) * time.Second
+	s.permTTL = 15 * time.Minute
+	// Shared repo cache cleanup horizon
+	cleanHours := 12
+	if cfg.SnapshotSharedCleanupHours > 0 {
+		cleanHours = cfg.SnapshotSharedCleanupHours
+	}
+	s.sharedCleanOlder = time.Duration(cleanHours) * time.Hour
+	// Sed defaults
+	if cfg.SedDiffBytes > 0 {
+		s.sedDiffBytes = cfg.SedDiffBytes
+	}
+	if cfg.SedMaxEditsPerFile > 0 {
+		s.sedMaxEdits = cfg.SedMaxEditsPerFile
+	}
+	return s
+}
+
+type contentAPI interface {
+	ListContents(ctx context.Context, token, owner, name, path, ref string) ([]adapter.ContentItem, error)
+	GetFileContent(ctx context.Context, token, owner, name, path, ref string) ([]byte, error)
+}
+
+func (s *Service) RegisterHTTP(mux *http.ServeMux) {
+	mux.HandleFunc("/github/auth/device/", s.DeviceHandler())
+	mux.HandleFunc("/github/auth/pending", s.PendingListHandler())
+	mux.HandleFunc("/github/auth/pending/clear", s.PendingClearHandler())
+	mux.HandleFunc("/github/auth/token", s.TokenIngestHandler())
+	mux.HandleFunc("/github/auth/start", s.DeviceStartHandler())
+	mux.HandleFunc("/github/auth/check", s.TokenCheckHandler())
+	mux.HandleFunc("/github/auth/oob", s.OOBHandler())
+	mux.HandleFunc("/github/auth/verify", s.VerifyHandler())
+}
+
+// snapshotKey builds a cache key for a snapshot zip scoped to ns/alias/domain/owner/name/ref.
+func (s *Service) snapshotKey(ns, alias, domain, owner, name, ref string) string {
+	if domain == "" {
+		domain = "github.com"
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	return joinKey(ns, alias, domain, owner, name, ref)
+}
+
+// snapshotPath computes a deterministic storage path for a snapshot zip.
+func (s *Service) snapshotPath(ns, alias, domain, owner, name, ref string) string {
+	base := os.ExpandEnv(s.storageDir)
+	if strings.TrimSpace(base) == "" {
+		base = os.TempDir()
+	}
+	segs := []string{base, "gh_snapshots", safePart(ns), safePart(alias), safePart(domain), safePart(owner) + "_" + safePart(name) + "_" + safePart(ref) + ".zip"}
+	cleaned := make([]string, 0, len(segs))
+	for _, s := range segs {
+		if strings.TrimSpace(s) != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return base
+	}
+	head, tail := cleaned[0], cleaned[1:]
+	return afsurl.Join(head, tail...)
+}
+
+// sharedSnapshotPath returns the shared snapshot zip path keyed by domain/owner/name@sha.
+func (s *Service) sharedSnapshotPath(domain, owner, name, sha string) string {
+	base := os.ExpandEnv(s.storageDir)
+	if strings.TrimSpace(base) == "" {
+		base = os.TempDir()
+	}
+	segs := []string{base, "gh_snapshots_shared", safePart(domain), safePart(owner), safePart(name), safePart(sha) + ".zip"}
+	cleaned := make([]string, 0, len(segs))
+	for _, s := range segs {
+		if strings.TrimSpace(s) != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return base
+	}
+	head, tail := cleaned[0], cleaned[1:]
+	return afsurl.Join(head, tail...)
+}
+
+// sharedMemKey builds a key for in-memory shared snapshots (no namespace/alias).
+func (s *Service) sharedMemKey(domain, owner, name, sha string) string {
+	return joinKey(domain, owner, name, sha)
+}
+
+// authBasic constructs an Authorization header like adapter.authBasic (duplicated to avoid export).
+func (s *Service) authBasic(token string) string {
+	if strings.Contains(token, ":") {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(token))
+	}
+	creds := "x-access-token:" + token
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+}
+
+// effectiveRef returns ref if non-empty; otherwise attempts to resolve the repo's default branch.
+func (s *Service) effectiveRef(ctx context.Context, domain, owner, name, ref, token string) string {
+	r := strings.TrimSpace(ref)
+	if r != "" {
+		return r
+	}
+	def, err := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name)
+	if err == nil && strings.TrimSpace(def) != "" {
+		return def
+	}
+	return ref
+}
+
+const (
+	snapshotLargeThreshold = int64(100 * 1024 * 1024) // 100MB
+	snapshotTTL            = 30 * time.Minute
+)
+
+// GetOrFetchSnapshotZip returns a path to a repo snapshot zip for (owner/name@ref),
+// caching to disk for 30 minutes if the size is >= 100MB.
+// It uses the GitHub zipball API and follows redirects.
+func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, owner, name, ref, token string) (path string, size int64, fromCache bool, resolvedSHA string, err error) {
+	// Resolve ref -> immutable SHA (commit/tree). When ref empty, resolve default branch explicitly.
+	effRef := strings.TrimSpace(ref)
+	var defErr error
+	if effRef == "" {
+		cli := adapter.New(domain)
+		if def, derr := cli.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
+			effRef = def
+		} else {
+			defErr = derr
+		}
+	}
+	if sha, serr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, effRef); serr == nil && sha != "" {
+		resolvedSHA = sha
+	} else {
+		// Resolve sha via HEAD to zipball; do not proceed without a concrete SHA
+		if hs := s.resolveZipballSHA(ctx, domain, owner, name, effRef, token); hs != "" {
+			resolvedSHA = hs
+		} else {
+			if strings.TrimSpace(ref) == "" {
+				// Caller did not specify a ref and we couldn't resolve default
+				if defErr != nil {
+					return "", 0, false, "", fmt.Errorf("ref not specified; failed to resolve default branch: %v", defErr)
+				}
+				return "", 0, false, "", fmt.Errorf("ref not specified; default branch unavailable or inaccessible")
+			}
+			return "", 0, false, "", fmt.Errorf("invalid or inaccessible ref: %s", effRef)
+		}
+	}
+	// Shared store fast path
+	shared := s.sharedSnapshotPath(domain, owner, name, resolvedSHA)
+	// snapshot debug logs removed
+	// In-memory shared cache check
+	s.memSnapMu.RLock()
+	memKey := s.sharedMemKey(domain, owner, name, resolvedSHA)
+	if m, ok := s.memSnapCache[memKey]; ok && time.Now().Before(m.expireAt) && m.size > 0 {
+		s.memSnapMu.RUnlock()
+		// snapshot debug logs removed
+		return "", m.size, true, resolvedSHA, nil
+	} else {
+		s.memSnapMu.RUnlock()
+		// snapshot debug logs removed
+	}
+	// snapshot debug logs removed
+	if fi, e := os.Stat(shared); e == nil {
+		// snapshot debug logs removed
+		if fi.Mode().IsRegular() {
+			// Check permission/visibility before serving shared snapshot
+			if s.canUseSharedSnapshot(ctx, domain, owner, name, token) {
+				// Touch modtime for LRU
+				_ = os.Chtimes(shared, time.Now(), time.Now())
+				// snapshot debug logs removed
+				return shared, fi.Size(), true, resolvedSHA, nil
+			} else {
+				// snapshot debug logs removed
+			}
+		} else {
+			// snapshot debug logs removed
+		}
+	} else {
+		// snapshot debug logs removed
+	}
+	// (per-namespace memory path removed; only shared in-memory cache is used)
+	// No per-namespace disk index; rely on shared path presence only
+
+	// Filesystem check: shared store again (in case of race) already above, nothing to do here
+
+	// Build zipball API URL
+	apiBase := "https://api.github.com"
+	if domain != "" && domain != "github.com" {
+		apiBase = "https://" + domain + "/api/v3"
+	}
+	url := fmt.Sprintf("%s/repos/%s/%s/zipball/%s", apiBase, owner, name, neturl.PathEscape(resolvedSHA))
+
+	// Helper to perform one download attempt
+	doFetch := func() (int64, error) {
+		var written int64
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if strings.TrimSpace(token) != "" {
+			req.Header.Set("Authorization", s.authBasic(token))
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		// snapshot debug logs removed
+		if resp.StatusCode == http.StatusUnauthorized {
+			return 0, adapter.ErrUnauthorized
+		}
+		if resp.StatusCode >= 300 {
+			return 0, fmt.Errorf("zipball fetch failed: %s", resp.Status)
+		}
+		// If ref wasn't a SHA, try to extract the final SHA from response redirect/headers and adjust target path
+		if !looksLikeSHA(resolvedSHA) {
+			if cand := s.extractSHAFromHTTP(resp); cand != "" {
+				// snapshot debug logs removed
+				resolvedSHA = cand
+				newShared := s.sharedSnapshotPath(domain, owner, name, resolvedSHA)
+				if newShared != shared {
+					// snapshot debug logs removed
+					// ensure dir exists
+					_ = os.MkdirAll(filepath.Dir(newShared), 0o755)
+					shared = newShared
+				}
+			} else {
+				// snapshot debug logs removed
+			}
+		}
+		// snapshot debug logs removed
+		f, err := os.Create(shared)
+		if err != nil {
+			return 0, err
+		}
+		n, cpErr := io.Copy(f, &countingReader{r: resp.Body, n: &written})
+		cerr := f.Close()
+		if cpErr != nil {
+			_ = os.Remove(shared)
+			return 0, cpErr
+		}
+		if cerr != nil {
+			_ = os.Remove(shared)
+			return 0, cerr
+		}
+		// If we still don't have a SHA, attempt to derive it from the downloaded zip and rename
+		if !looksLikeSHA(resolvedSHA) {
+			if shaZip := extractSHAFromZipFile(shared); looksLikeSHA(shaZip) {
+				newShared := s.sharedSnapshotPath(domain, owner, name, shaZip)
+				// snapshot debug logs removed
+				_ = os.MkdirAll(filepath.Dir(newShared), 0o755)
+				// Best-effort rename; if it fails, keep the original path
+				if rerr := os.Rename(shared, newShared); rerr == nil {
+					shared = newShared
+					resolvedSHA = shaZip
+				} else {
+					// snapshot debug logs removed
+				}
+			} else {
+				// snapshot debug logs removed
+			}
+		}
+		// Verify file on disk after any rename/adjust
+		_, _ = os.Stat(shared)
+		// snapshot debug logs removed
+		return n, nil
+	}
+
+	cacheDir := filepath.Dir(shared)
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", 0, false, resolvedSHA, err
+	}
+	// Pre-clean: remove files older than configured horizon in the repo cache folder
+	s.cleanupOldSharedRepoFiles(cacheDir, s.sharedCleanOlder)
+	n, fetchErr := doFetch()
+	if fetchErr != nil {
+		// If out of space, try evicting namespace cache and retry once
+		if isNoSpace(fetchErr) {
+			// snapshot debug logs removed
+			_ = s.evictSnapshotNamespace(ns, 1)
+			_ = s.evictSharedSnapshots(1)
+			n, fetchErr = doFetch()
+		}
+		if fetchErr != nil {
+			return "", 0, false, resolvedSHA, fetchErr
+		}
+	}
+
+	// Cache only if large enough; else leave file on disk (caller may remove) but do not index cache.
+	if n >= snapshotLargeThreshold {
+		// Large snapshots left on disk only (shared)
+	} else if n > 0 && n <= s.memSnapThres {
+		// Small zip: load into memory cache for faster reuse
+		if data, rerr := os.ReadFile(shared); rerr == nil {
+			s.memSnapMu.Lock()
+			s.memSnapCache[s.sharedMemKey(domain, owner, name, resolvedSHA)] = memSnapshotEntry{data: data, size: int64(len(data)), expireAt: time.Now().Add(s.memSnapTTL)}
+			s.memSnapMu.Unlock()
+			// snapshot debug logs removed
+		}
+	}
+	return shared, n, false, resolvedSHA, nil
+}
+
+// GetSnapshotBytes returns a memory-cached snapshot if available.
+func (s *Service) GetSnapshotBytesShared(domain, owner, name, sha string) ([]byte, bool) {
+	key := s.sharedMemKey(domain, owner, name, sha)
+	s.memSnapMu.RLock()
+	defer s.memSnapMu.RUnlock()
+	if m, ok := s.memSnapCache[key]; ok && time.Now().Before(m.expireAt) && len(m.data) > 0 {
+		return m.data, true
+	}
+	return nil, false
+}
+
+// isNoSpace returns true if err indicates no space left on device.
+func isNoSpace(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check wrapped syscall error
+	if errors.Is(err, syscall.ENOSPC) {
+		return true
+	}
+	// Fallback string match
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "no space left") || strings.Contains(s, "enospc")
+}
+
+// evictSnapshotNamespace removes expired and then oldest snapshot files for a namespace.
+// It best-effort frees up space; `atLeast` is a hint for how many files to remove (>=1).
+func (s *Service) evictSnapshotNamespace(ns string, atLeast int) error {
+	base := strings.TrimRight(os.ExpandEnv(s.storageDir), "/")
+	if base == "" {
+		base = os.TempDir()
+	}
+	root := filepath.Join(base, "gh_snapshots", safePart(ns))
+	var files []os.FileInfo
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	// Recurse one level (alias) and domain to collect files
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		aliasDir := filepath.Join(root, e.Name())
+		doms, _ := os.ReadDir(aliasDir)
+		for _, d := range doms {
+			p := filepath.Join(aliasDir, d.Name())
+			items, _ := os.ReadDir(p)
+			for _, it := range items {
+				if it.IsDir() {
+					continue
+				}
+				fi, statErr := it.Info()
+				if statErr == nil {
+					files = append(files, &fileInfoWithPath{FileInfo: fi, path: filepath.Join(p, it.Name())})
+				}
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	// Remove expired first
+	now := time.Now()
+	kept := files[:0]
+	removed := 0
+	for _, fi := range files {
+		if now.Sub(fi.ModTime()) > snapshotTTL {
+			_ = os.Remove(fi.(*fileInfoWithPath).path)
+			removed++
+		} else {
+			kept = append(kept, fi)
+		}
+	}
+	files = kept
+	if removed >= atLeast || len(files) == 0 {
+		return nil
+	}
+	// Remove oldest until we satisfy atLeast
+	sort.Slice(files, func(i, j int) bool { return files[i].ModTime().Before(files[j].ModTime()) })
+	for i := 0; i < len(files) && removed < atLeast; i++ {
+		_ = os.Remove(files[i].(*fileInfoWithPath).path)
+		removed++
+	}
+	return nil
+}
+
+type fileInfoWithPath struct {
+	os.FileInfo
+	path string
+}
+
+// evictSharedSnapshots removes expired and then oldest files from the shared snapshot store.
+func (s *Service) evictSharedSnapshots(atLeast int) error {
+	base := strings.TrimRight(os.ExpandEnv(s.storageDir), "/")
+	if base == "" {
+		base = os.TempDir()
+	}
+	root := filepath.Join(base, "gh_snapshots_shared")
+	var files []os.FileInfo
+	// Traverse up to domain/owner/repo subdirs
+	domains, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, d := range domains {
+		if !d.IsDir() {
+			continue
+		}
+		owners, _ := os.ReadDir(filepath.Join(root, d.Name()))
+		for _, o := range owners {
+			if !o.IsDir() {
+				continue
+			}
+			repos, _ := os.ReadDir(filepath.Join(root, d.Name(), o.Name()))
+			for _, r := range repos {
+				p := filepath.Join(root, d.Name(), o.Name(), r.Name())
+				items, _ := os.ReadDir(p)
+				for _, it := range items {
+					if it.IsDir() {
+						continue
+					}
+					fi, e := it.Info()
+					if e == nil {
+						files = append(files, &fileInfoWithPath{FileInfo: fi, path: filepath.Join(p, it.Name())})
+					}
+				}
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	// Remove expired first
+	now := time.Now()
+	kept := files[:0]
+	removed := 0
+	for _, fi := range files {
+		if now.Sub(fi.ModTime()) > snapshotTTL {
+			_ = os.Remove(fi.(*fileInfoWithPath).path)
+			removed++
+		} else {
+			kept = append(kept, fi)
+		}
+	}
+	files = kept
+	if removed >= atLeast || len(files) == 0 {
+		return nil
+	}
+	// Oldest first until atLeast
+	sort.Slice(files, func(i, j int) bool { return files[i].ModTime().Before(files[j].ModTime()) })
+	for i := 0; i < len(files) && removed < atLeast; i++ {
+		_ = os.Remove(files[i].(*fileInfoWithPath).path)
+		removed++
+	}
+	return nil
+}
+
+// canUseSharedSnapshot checks whether the caller can access the repo or the repo is public.
+func (s *Service) canUseSharedSnapshot(ctx context.Context, domain, owner, name, token string) bool {
+	// Check visibility cache
+	repoKey := joinKey(domain, owner, name)
+	s.visMu.RLock()
+	if ent, ok := s.visCache[repoKey]; ok && time.Now().Before(ent.expireAt) {
+		isPublic := ent.public
+		s.visMu.RUnlock()
+		if isPublic {
+			return true
+		}
+		// Private: require token-level permission
+	} else {
+		s.visMu.RUnlock()
+	}
+
+	// Check permission cache for this token+repo
+	tokHash := hashToken(token)
+	if tokHash != "" {
+		key := joinKey(domain, owner, name, tokHash)
+		s.permMu.RLock()
+		if exp, ok := s.permCache[key]; ok && time.Now().Before(exp) {
+			s.permMu.RUnlock()
+			return true
+		}
+		s.permMu.RUnlock()
+	}
+
+	// Probe repo metadata
+	info, err := adapter.New(domain).GetRepo(ctx, token, owner, name)
+	if err != nil {
+		// Unauthorized or other error: treat as no access
+		return false
+	}
+	// Update visibility cache
+	s.visMu.Lock()
+	s.visCache[repoKey] = visEntry{public: !info.Private, expireAt: time.Now().Add(30 * time.Minute)}
+	s.visMu.Unlock()
+	if !info.Private {
+		return true // public
+	}
+	// Private: reaching here implies token can see the repo; cache permission for this token
+	if tokHash != "" {
+		key := joinKey(domain, owner, name, tokHash)
+		s.permMu.Lock()
+		s.permCache[key] = time.Now().Add(s.permTTL)
+		s.permMu.Unlock()
+		return true
+	}
+	return false
+}
+
+func hashToken(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	// Minimal hashing to avoid holding raw tokens in cache keys
+	// Use a simple FNV-1a to avoid adding a crypto dep here
+	var h uint64 = 1469598103934665603
+	const prime64 = 1099511628211
+	for i := 0; i < len(token); i++ {
+		h ^= uint64(token[i])
+		h *= prime64
+	}
+	return fmt.Sprintf("%x", h)
+}
+
+// cleanupOldSharedRepoFiles removes files older than the given age in a specific repo's shared cache folder.
+func (s *Service) cleanupOldSharedRepoFiles(dir string, olderThan time.Duration) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(fi.ModTime()) >= olderThan {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+			removed++
+		}
+	}
+	// snapshot debug logs removed
+}
+
+func (s *Service) tokenURL(ns, alias, domain, owner, repo string) string {
+	base := s.secretsBase
+	if base == "" {
+		return ""
+	}
+	if domain == "" {
+		domain = "github.com"
+	}
+	parts := []string{base, "github", safePart(ns), safePart(alias), safePart(domain)}
+	if owner != "" && repo != "" {
+		parts = append(parts, safePart(owner), safePart(repo))
+	}
+	parts = append(parts, "token")
+	return strings.Join(parts, "/")
+}
+
+func (s *Service) persistToken(ctx context.Context, ns, alias, domain, owner, repo, token string) {
+	if s.secretsBase == "" || token == "" {
+		return
+	}
+	if url := s.tokenURL(ns, alias, domain, owner, repo); url != "" {
+		_ = afs.New().Upload(ctx, url, 0o600, bytes.NewReader([]byte(token)))
+	}
+}
+
+func (s *Service) loadTokenFromSecrets(ctx context.Context, ns, alias, domain, owner, repo string) string {
+	if s.secretsBase == "" {
+		return ""
+	}
+	// prefer repo-level
+	tryURLs := []string{}
+	if owner != "" && repo != "" {
+		tryURLs = append(tryURLs, s.tokenURL(ns, alias, domain, owner, repo))
+	}
+	tryURLs = append(tryURLs, s.tokenURL(ns, alias, domain, "", ""))
+	for _, u := range tryURLs {
+		if u == "" {
+			continue
+		}
+		rc, err := afs.New().OpenURL(ctx, u)
+		if err == nil && rc != nil {
+			data, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			if len(data) > 0 {
+				return string(data)
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Service) tokenKey(ns, alias, domain string) string {
+	if domain == "" {
+		domain = "github.com"
+	}
+	return joinKey(ns, alias, domain)
+}
+func (s *Service) tokenKeyOAuth(ns, alias, domain, clientID string) string {
+	if domain == "" {
+		domain = "github.com"
+	}
+	if clientID == "" {
+		return s.tokenKey(ns, alias, domain)
+	}
+	return joinKey(ns, alias, domain, "oauth:"+clientID)
+}
+func (s *Service) tokenKeyRepo(ns, alias, domain, owner, name string) string {
+	if domain == "" {
+		domain = "github.com"
+	}
+	return joinKey(ns, alias, domain, owner, name)
+}
+func (s *Service) tokenKeyRepoOAuth(ns, alias, domain, owner, name, clientID string) string {
+	if clientID == "" {
+		return s.tokenKeyRepo(ns, alias, domain, owner, name)
+	}
+	return joinKey(ns, alias, domain, owner, name, "oauth:"+clientID)
+}
+
+// repoKey builds a cache key for a repository scoped to domain/owner/name.
+func (s *Service) repoKey(ns, domain, owner, name string) string {
+	if domain == "" {
+		domain = "github.com"
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	return ns + "|" + domain + "|" + owner + "|" + name
+}
+func (s *Service) loadToken(ns, alias, domain string) string {
+	key := s.tokenKey(ns, alias, domain)
+	s.mu.RLock()
+	t := s.tokens[key]
+	s.mu.RUnlock()
+	return t
+}
+
+// loadTokenPreferred resolves token by preferring repo-level (oauth then plain), then domain-level (oauth then plain).
+func (s *Service) loadTokenPreferred(ns, alias, domain, owner, name string) string {
+	s.mu.RLock()
+	var out string
+	// repo-level with oauth key
+	if owner != "" && name != "" && s.clientID != "" {
+		if t := s.tokens[s.tokenKeyRepoOAuth(ns, alias, domain, owner, name, s.clientID)]; t != "" {
+			out = t
+		}
+	}
+	// repo-level plain
+	if out == "" && owner != "" && name != "" {
+		if t := s.tokens[s.tokenKeyRepo(ns, alias, domain, owner, name)]; t != "" {
+			out = t
+		}
+	}
+	// domain-level with oauth key
+	if out == "" && s.clientID != "" {
+		if t := s.tokens[s.tokenKeyOAuth(ns, alias, domain, s.clientID)]; t != "" {
+			out = t
+		}
+	}
+	// domain-level plain
+	if out == "" {
+		if t := s.tokens[s.tokenKey(ns, alias, domain)]; t != "" {
+			out = t
+		}
+	}
+	s.mu.RUnlock()
+	return out
+}
+func (s *Service) saveToken(ns, alias, domain, token string) {
+	key := s.tokenKey(ns, alias, domain)
+	s.mu.Lock()
+	s.tokens[key] = token
+	s.mu.Unlock()
+}
+func (s *Service) saveTokenRepo(ns, alias, domain, owner, name, token string, oauthKey bool) {
+	s.mu.Lock()
+	if oauthKey && s.clientID != "" {
+		s.tokens[s.tokenKeyRepoOAuth(ns, alias, domain, owner, name, s.clientID)] = token
+	} else {
+		s.tokens[s.tokenKeyRepo(ns, alias, domain, owner, name)] = token
+	}
+	s.mu.Unlock()
+}
+func (s *Service) saveTokenDomain(ns, alias, domain, token string, oauthKey bool) {
+	s.mu.Lock()
+	if oauthKey && s.clientID != "" {
+		s.tokens[s.tokenKeyOAuth(ns, alias, domain, s.clientID)] = token
+	} else {
+		s.tokens[s.tokenKey(ns, alias, domain)] = token
+	}
+	s.mu.Unlock()
+}
+func (s *Service) clearToken(ns, alias, domain string) {
+	key := s.tokenKey(ns, alias, domain)
+	s.mu.Lock()
+	delete(s.tokens, key)
+	s.mu.Unlock()
+}
+
+// loadTokenPreferredAnyNS scans tokens across all namespaces to find a usable token.
+// Preference mirrors loadTokenPreferred: repo-level (oauth then plain), then domain-level (oauth then plain).
+func (s *Service) loadTokenPreferredAnyNS(alias, domain, owner, name string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	safeAlias := safePart(alias)
+	safeDomain := safePart(domain)
+	// repo-level
+	for k, _ := range s.tokens {
+		parts := strings.Split(k, "|")
+		// expect ns|alias|domain|owner|repo[|oauth:client]
+		if len(parts) >= 5 && parts[1] == safeAlias && parts[2] == safeDomain {
+			if owner != "" && name != "" && parts[3] == safePart(owner) && parts[4] == safePart(name) {
+				// prefer oauth key if present by scanning twice; handled below
+			}
+		}
+	}
+	// first pass: repo-level oauth
+	if s.clientID != "" && owner != "" && name != "" {
+		for k, v := range s.tokens {
+			parts := strings.Split(k, "|")
+			if len(parts) == 6 && parts[1] == safeAlias && parts[2] == safeDomain && parts[3] == safePart(owner) && parts[4] == safePart(name) && strings.HasPrefix(parts[5], "oauth:") {
+				if v != "" {
+					return v
+				}
+			}
+		}
+	}
+	// repo-level plain
+	if owner != "" && name != "" {
+		for k, v := range s.tokens {
+			parts := strings.Split(k, "|")
+			if len(parts) == 5 && parts[1] == safeAlias && parts[2] == safeDomain && parts[3] == safePart(owner) && parts[4] == safePart(name) {
+				if v != "" {
+					return v
+				}
+			}
+		}
+	}
+	// domain-level oauth
+	if s.clientID != "" {
+		for k, v := range s.tokens {
+			parts := strings.Split(k, "|")
+			if len(parts) == 4 && parts[1] == safeAlias && parts[2] == safeDomain && strings.HasPrefix(parts[3], "oauth:") {
+				if v != "" {
+					return v
+				}
+			}
+		}
+	}
+	// domain-level plain
+	for k, v := range s.tokens {
+		parts := strings.Split(k, "|")
+		if len(parts) == 3 && parts[1] == safeAlias && parts[2] == safeDomain {
+			if v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func (s *Service) Credential(ctx context.Context, alias, domain string, prompt func(string)) (string, error) {
+	alias = s.normalizeAlias(alias)
+	desc, _ := s.ns.Namespace(ctx)
+	ns := desc.Name
+	if ns == "" {
+		ns = "default"
+	}
+	if token := s.loadToken(ns, alias, domain); token != "" {
+		return token, nil
+	}
+	return s.startDeviceFlow(ctx, alias, domain, prompt)
+}
+
+// inferAlias tries to pick an alias automatically when caller omitted it.
+// Preference order:
+// 1) If exactly one repo-scoped token exists for ns/domain/owner/name, use its alias.
+// 2) Else if exactly one domain-scoped token exists for ns/domain, use its alias.
+// Returns the inferred alias (or "") and the set of candidate aliases found.
+func (s *Service) inferAlias(ctx context.Context, domain, owner, name string) (string, []string) {
+	desc, _ := s.ns.Namespace(ctx)
+	ns := desc.Name
+	if ns == "" {
+		ns = "default"
+	}
+	if domain == "" {
+		domain = "github.com"
+	}
+	repoAliases := map[string]struct{}{}
+	domAliases := map[string]struct{}{}
+	s.mu.RLock()
+	for k := range s.tokens {
+		parts := strings.Split(k, "|")
+		// Expect at least ns|alias|domain
+		if len(parts) < 3 {
+			continue
+		}
+		if parts[0] != safePart(ns) {
+			continue
+		}
+		if parts[2] != safePart(domain) {
+			continue
+		}
+		alias := parts[1]
+		if len(parts) >= 5 && owner != "" && name != "" {
+			if parts[3] == safePart(owner) && parts[4] == safePart(name) {
+				repoAliases[alias] = struct{}{}
+				continue
+			}
+		}
+		// domain level token
+		domAliases[alias] = struct{}{}
+	}
+	s.mu.RUnlock()
+	uniq := func(m map[string]struct{}) []string {
+		out := make([]string, 0, len(m))
+		for a := range m {
+			out = append(out, a)
+		}
+		return out
+	}
+	repoList := uniq(repoAliases)
+	if len(repoList) == 1 {
+		return repoList[0], repoList
+	}
+	// merge unique
+	allSet := map[string]struct{}{}
+	for a := range repoAliases {
+		allSet[a] = struct{}{}
+	}
+	for a := range domAliases {
+		allSet[a] = struct{}{}
+	}
+	all := uniq(allSet)
+	if len(all) == 1 {
+		return all[0], all
+	}
+	return "", all
+}
+
+func (s *Service) startDeviceFlow(ctx context.Context, alias, domain string, prompt func(string)) (string, error) {
+	type dcResp struct {
+		DeviceCode, UserCode, VerificationURI string
+		ExpiresIn, Interval                   int
+	}
+	form := fmt.Sprintf("client_id=%s&scope=repo%%20read:user", s.clientID)
+	host := domain
+	if host == "" {
+		host = "github.com"
+	}
+	deviceURL := fmt.Sprintf("https://%s/login/device/code", host)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, deviceURL, strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("device code failed: %s", resp.Status)
+	}
+	var dcr dcResp
+	if err := json.NewDecoder(resp.Body).Decode(&dcr); err != nil {
+		return "", err
+	}
+	ns, _ := s.auth.Namespace(ctx)
+	id := uuid.New().String()
+	s.pending.Put(&PendingAuth{UUID: id, Alias: alias, Namespace: ns, UserCode: dcr.UserCode, VerifyURL: dcr.VerificationURI})
+	// Prefer unified OOB page which can accept token/basic or show device code.
+	q := neturl.Values{}
+	q.Set("alias", alias)
+	if domain != "" {
+		q.Set("domain", domain)
+	}
+	q.Set("uuid", id)
+	oob := strings.TrimRight(s.baseURL, "/") + "/github/auth/oob?" + q.Encode()
+	if prompt != nil {
+		prompt(fmt.Sprintf("Open %s and follow instructions (code: %s)", oob, dcr.UserCode))
+	}
+	type tokResp struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+	}
+	for {
+		form := fmt.Sprintf("client_id=%s&device_code=%s&grant_type=urn:ietf:params:oauth:grant-type:device_code", s.clientID, dcr.DeviceCode)
+		tokenURL := fmt.Sprintf("https://%s/login/oauth/access_token", host)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form))
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		var tr tokResp
+		_ = json.NewDecoder(resp.Body).Decode(&tr)
+		resp.Body.Close()
+		if tr.AccessToken != "" {
+			ns2, _ := s.auth.Namespace(ctx)
+			if ns2 == "" {
+				ns2 = ns
+			}
+			s.saveToken(ns2, alias, domain, tr.AccessToken)
+			s.persistToken(ctx, ns2, alias, domain, "", "", tr.AccessToken)
+			s.clearElicitedAll(alias, domain)
+			s.notifyToken(ns2, alias, domain)
+			return tr.AccessToken, nil
+		}
+		if tr.Error == "authorization_pending" || tr.Error == "slow_down" {
+			if dcr.Interval <= 0 {
+				dcr.Interval = 5
+			}
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-timeAfterSeconds(dcr.Interval):
+			}
+			continue
+		}
+		if tr.Error != "" {
+			return "", fmt.Errorf("device flow error: %s", tr.Error)
+		}
+	}
+}
+
+func timeAfterSeconds(n int) <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	go func() { time.Sleep(time.Duration(n) * time.Second); ch <- struct{}{} }()
+	return ch
+}
+
+// FindFilesPreview searches files and returns previews (with optional sed-like preview), no apply.
+func (s *Service) FindFilesPreview(ctx context.Context, in *FindFilesPreviewInput, prompt func(string)) (*FindFilesPreviewOutput, error) {
+	if in == nil {
+		return nil, fmt.Errorf("input is nil")
+	}
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo, Ref: in.Ref}
+	domain, owner, name, ref, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	ns, _ := s.auth.Namespace(ctx)
+	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*FindFilesPreviewOutput, error) {
+		includeQs := filterContentPatterns(in.Queries)
+		excludeQs := filterContentPatterns(in.ExcludeQueries)
+		ci := in.CaseInsensitive
+		if len(includeQs) > 0 && !ci {
+			ci = true
+		}
+		skipBinary := in.SkipBinary
+		maxSize := in.MaxSize
+		if maxSize <= 0 {
+			maxSize = 5 * 1024 * 1024
+		}
+		previewMode := strings.ToLower(strings.TrimSpace(in.Mode))
+		previewBytes := in.Bytes
+		if previewBytes <= 0 {
+			previewBytes = 1024
+		}
+		maxFiles := in.MaxFiles
+		if maxFiles <= 0 {
+			maxFiles = 200
+		}
+		snippetLines := in.Lines
+		if snippetLines <= 0 {
+			snippetLines = 1
+		}
+		maxSnippetsPerFile := in.MaxBlocks
+		if maxSnippetsPerFile <= 0 {
+			maxSnippetsPerFile = 5
+		}
+
+		out := &FindFilesPreviewOutput{Stats: PreviewStats{}}
+		// debug logs removed
+		// Resolve ref if empty to the default branch.
+		ref = s.effectiveRef(ctx, domain, owner, name, ref, token)
+		// Require a repo snapshot zip for any previews. No per-file downloads.
+		zPath, _, _, shaKey, zerr := s.GetOrFetchSnapshotZip(ctx, ns, alias, domain, owner, name, ref, token)
+		var zipPath string
+		usedRef := strings.TrimSpace(ref)
+		if zerr != nil {
+			// Fallback to default branch snapshot when a specific ref fails
+			def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name)
+			if derr == nil && def != "" && strings.TrimSpace(ref) != "" && strings.TrimSpace(ref) != def {
+				if z2, _, _, sha2, zerr2 := s.GetOrFetchSnapshotZip(ctx, ns, alias, domain, owner, name, def, token); zerr2 == nil {
+					zipPath = z2
+					shaKey = sha2
+					usedRef = def
+				} else {
+					return nil, zerr
+				}
+			} else {
+				return nil, zerr
+			}
+		} else {
+			zipPath = zPath
+		}
+		out.Sha = shaKey
+		out.Ref = usedRef
+
+		cli := adapter.New(domain)
+		resolvedRef := ref
+		if strings.TrimSpace(resolvedRef) == "" {
+			if def, derr := (&GitTarget{Ref: ""}).ResolveRef(ctx, cli, token, owner, name, ""); derr == nil && def != "" {
+				resolvedRef = def
+			}
+		}
+		var entries []adapter.TreeEntry
+		if shaTree, e1 := cli.GetCommitTreeSHA(ctx, token, owner, name, resolvedRef); e1 == nil {
+			if ents, _, e2 := cli.GetTreeRecursive(ctx, token, owner, name, shaTree); e2 == nil {
+				entries = ents
+			}
+		}
+		if len(entries) == 0 {
+			if def, derr := cli.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
+				if sha2, e3 := cli.GetCommitTreeSHA(ctx, token, owner, name, def); e3 == nil {
+					if ents2, _, e4 := cli.GetTreeRecursive(ctx, token, owner, name, sha2); e4 == nil {
+						entries = ents2
+						resolvedRef = def
+					}
+				}
+			}
+		}
+		prefix := strings.Trim(strings.TrimPrefix(in.Path, "/"), "/")
+		include := in.Include
+		exclude := in.Exclude
+		type collectedItem struct {
+			Path string
+			Size int
+			Sha  string
+		}
+		collected := make([]collectedItem, 0, 256)
+		if len(entries) == 0 {
+			walker := s.makeContentAPI(domain)
+			var stack = []string{prefix}
+			visited := map[string]bool{}
+			for len(stack) > 0 {
+				n := len(stack) - 1
+				dir := stack[n]
+				stack = stack[:n]
+				if visited[dir] {
+					continue
+				}
+				visited[dir] = true
+				items, werr := walker.ListContents(ctx, token, owner, name, dir, resolvedRef)
+				if werr != nil {
+					if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
+						items, werr = walker.ListContents(ctx, token, owner, name, dir, def)
+						if werr == nil {
+							resolvedRef = def
+						}
+					}
+				}
+				if werr != nil {
+					break
+				}
+				for _, it := range items {
+					if it.Type == "dir" {
+						stack = append(stack, strings.Trim(strings.TrimPrefix(it.Path, "/"), "/"))
+					}
+					if it.Type == "file" {
+						if !passIncludeExclude(it.Path, include, exclude) {
+							continue
+						}
+						collected = append(collected, collectedItem{Path: it.Path, Size: it.Size, Sha: it.Sha})
+					}
+				}
+			}
+			// debug logs removed
+		} else {
+			for _, e := range entries {
+				if prefix != "" && !strings.HasPrefix(e.Path, prefix+"/") && e.Path != prefix {
+					continue
+				}
+				if !passIncludeExclude(e.Path, include, exclude) {
+					continue
+				}
+				if e.Type != "blob" {
+					continue
+				}
+				collected = append(collected, collectedItem{Path: e.Path, Size: e.Size, Sha: e.Sha})
+			}
+		}
+		// debug logs removed
+
+		matchedPaths := map[string]bool{}
+		if len(includeQs) > 0 || len(excludeQs) > 0 {
+			cand := make(map[string]bool, len(collected))
+			for _, it := range collected {
+				cand[it.Path] = true
+			}
+			inc, exc := s.buildContentSets(zipPath, cand, includeQs, excludeQs, skipBinary, int64(maxSize), ci)
+			for p := range cand {
+				if exc != nil && exc[p] {
+					continue
+				}
+				if inc == nil || inc[p] {
+					matchedPaths[p] = true
+				}
+			}
+			// debug logs removed
+		} else {
+			for _, it := range collected {
+				matchedPaths[it.Path] = true
+			}
+		}
+
+		files := make([]PreviewFile, 0, minInt(maxFiles, len(matchedPaths)))
+		filesScanned := len(collected)
+		filesMatched := 0
+		var stopPend func()
+		var processed int
+		stopPend = func() {}
+		for _, it := range collected {
+			if !matchedPaths[it.Path] {
+				continue
+			}
+			filesMatched++
+			if len(files) >= maxFiles {
+				break
+			}
+			var content []byte
+			if b, rerr := readZipEntry(zipPath, it.Path, int64(maxSize)); rerr == nil {
+				content = b
+			}
+			if skipBinary && !isProbablyText(content) {
+				continue
+			}
+			pv := PreviewFile{Path: it.Path}
+			pv.Matches = countMatches(content, includeQs, ci)
+			// Decide preview mode
+			mode := previewMode
+			if mode != "matches" && mode != "head" {
+				if len(includeQs) > 0 || len(excludeQs) > 0 {
+					mode = "matches"
+				} else {
+					mode = "head"
+				}
+			}
+			// If matches mode but no content filters, fall back to head
+			effMode := mode
+			if mode == "matches" && len(includeQs) == 0 && len(excludeQs) == 0 {
+				effMode = "head"
+			}
+			if effMode == "matches" {
+				snips, truncated, coveredMatches, totalMatches := buildMatchSnippetsCompact(content, includeQs, ci, snippetLines, previewBytes, maxSnippetsPerFile)
+				_ = truncated
+				pv.Snippets = snips
+				if totalMatches > coveredMatches {
+					pv.Omitted = totalMatches - coveredMatches
+				}
+			} else {
+				if previewBytes > 0 {
+					head := content
+					cut := false
+					if len(head) > previewBytes {
+						head = head[:previewBytes]
+						cut = true
+					}
+					pv.Snippets = []PreviewSnippet{{Start: 1, End: 1, Text: string(head), Cut: cut}}
+				}
+			}
+			files = append(files, pv)
+			processed++
+		}
+		stopPend()
+		// debug logs removed
+		out.Files = files
+		out.Stats = PreviewStats{Scanned: filesScanned, Matched: filesMatched, Truncated: filesMatched > maxFiles}
+		return out, nil
+	})
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// readZipEntry reads a file from zip by repo-relative path.
+func readZipEntry(zipPath, repoPath string, maxBytes int64) ([]byte, error) {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	// Entries have a top-level folder; strip it
+	for _, f := range zr.File {
+		name := f.Name
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if strings.TrimSuffix(name, "/") != repoPath {
+			continue
+		}
+		if f.FileInfo().IsDir() {
+			return nil, fmt.Errorf("dir")
+		}
+		rc, e := f.Open()
+		if e != nil {
+			return nil, e
+		}
+		defer rc.Close()
+		var buf bytes.Buffer
+		if maxBytes > 0 {
+			_, _ = io.CopyN(&buf, rc, maxBytes)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		return buf.Bytes(), nil
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func countMatches(b []byte, patterns []string, ci bool) int {
+	if len(patterns) == 0 || len(b) == 0 {
+		return 0
+	}
+	total := 0
+	lower := b
+	for _, q := range patterns {
+		if q == "" {
+			continue
+		}
+		// regex if /.../ or /.../flags
+		if ok, pat, flags := parseDelimitedRegex(q); ok {
+			if strings.Contains(flags, "i") {
+				pat = "(?i)" + pat
+			}
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				continue
+			}
+			total += len(re.FindAllIndex(b, -1))
+			continue
+		}
+		qb := []byte(q)
+		if ci {
+			if &lower == &b {
+				lower = bytes.ToLower(b)
+			}
+			qb = bytes.ToLower(qb)
+		}
+		// naive count
+		idx := 0
+		for {
+			loc := bytes.Index(lower[idx:], qb)
+			if loc < 0 {
+				break
+			}
+			total++
+			idx += loc + len(qb)
+			if idx >= len(lower) {
+				break
+			}
+		}
+	}
+	return total
+}
+
+// buildMatchSnippetsCompact assembles merged windows around matches within a preview budget.
+func buildMatchSnippetsCompact(b []byte, patterns []string, ci bool, contextLines, previewBytes, maxBlocks int) ([]PreviewSnippet, bool, int, int) {
+	total := countMatches(b, patterns, ci)
+	if total == 0 {
+		return nil, false, 0, 0
+	}
+	ranges := findMatchRanges(b, patterns, ci)
+	if len(ranges) == 0 {
+		return nil, false, 0, total
+	}
+	lineStarts, lines := indexLines(b)
+	windows := expandMatchWindows(ranges, lineStarts, contextLines, len(lines))
+	windows = mergeWindows(windows)
+	if maxBlocks > 0 && len(windows) > maxBlocks {
+		windows = windows[:maxBlocks]
+	}
+	covered := 0
+	for _, r := range ranges {
+		if matchCoveredByWindows(r, lineStarts, windows) {
+			covered++
+		}
+	}
+	perLine := make(map[int][][2]int)
+	for _, r := range ranges {
+		start, end := r[0], r[1]
+		sLine := findLineForOffset(lineStarts, start)
+		eLine := findLineForOffset(lineStarts, end-1)
+		if sLine < 0 || eLine < 0 {
+			continue
+		}
+		for li := sLine; li <= eLine; li++ {
+			ls := lineStarts[li]
+			le := lineEndOffset(lineStarts, li, len(b))
+			a := maxInt(start, ls)
+			z := minInt(end, le)
+			perLine[li] = append(perLine[li], [2]int{a - ls, z - ls})
+		}
+	}
+	var out []PreviewSnippet
+	used := 0
+	truncated := false
+	for _, w := range windows {
+		var sb strings.Builder
+		hits := make([][2]int, 0, 8)
+		base := 0
+		for li := w[0]; li <= w[1]; li++ {
+			line := lines[li]
+			if rs := perLine[li]; len(rs) > 0 {
+				for _, r := range rs {
+					hits = append(hits, [2]int{base + r[0], base + r[1]})
+				}
+			}
+			sb.Write(line)
+			if li < w[1] {
+				sb.WriteByte('\n')
+			}
+			base = sb.Len()
+			if previewBytes > 0 && used+base > previewBytes {
+				break
+			}
+		}
+		text := sb.String()
+		if previewBytes > 0 && used+len(text) > previewBytes {
+			remain := previewBytes - used
+			if remain < 0 {
+				remain = 0
+			}
+			if remain < len(text) {
+				text = text[:remain]
+				truncated = true
+			}
+		}
+		out = append(out, PreviewSnippet{Start: w[0] + 1, End: w[1] + 1, Text: text, Hits: hits})
+		used += len(text)
+		if previewBytes > 0 && used >= previewBytes {
+			truncated = true
+			break
+		}
+	}
+	if truncated && len(out) > 0 {
+		out[len(out)-1].Cut = true
+	}
+	return out, truncated, covered, total
+}
+
+func findMatchRanges(b []byte, patterns []string, ci bool) [][2]int {
+	if len(patterns) == 0 || len(b) == 0 {
+		return nil
+	}
+	var out [][2]int
+	var lower []byte
+	for _, q := range patterns {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		// regex if /.../ or /.../flags
+		if ok, pat, flags := parseDelimitedRegex(q); ok {
+			if strings.Contains(flags, "i") {
+				pat = "(?i)" + pat
+			}
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				continue
+			}
+			locs := re.FindAllIndex(b, -1)
+			for _, loc := range locs {
+				if len(loc) == 2 {
+					out = append(out, [2]int{loc[0], loc[1]})
+				}
+			}
+			continue
+		}
+		qb := []byte(q)
+		hay := b
+		if ci {
+			if lower == nil {
+				lower = bytes.ToLower(b)
+			}
+			hay = lower
+			qb = bytes.ToLower(qb)
+		}
+		idx := 0
+		for {
+			loc := bytes.Index(hay[idx:], qb)
+			if loc < 0 {
+				break
+			}
+			s := idx + loc
+			e := s + len(qb)
+			out = append(out, [2]int{s, e})
+			idx = e
+			if idx >= len(hay) {
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return out
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i][0] == out[j][0] {
+			return out[i][1] < out[j][1]
+		}
+		return out[i][0] < out[j][0]
+	})
+	// dedupe overlapping/identical ranges (simple merge)
+	merged := make([][2]int, 0, len(out))
+	cur := out[0]
+	for i := 1; i < len(out); i++ {
+		r := out[i]
+		if r[0] <= cur[1] { // overlap/adjacent
+			if r[1] > cur[1] {
+				cur[1] = r[1]
+			}
+		} else {
+			merged = append(merged, cur)
+			cur = r
+		}
+	}
+	merged = append(merged, cur)
+	return merged
+}
+
+// indexLines returns line start offsets and line byte slices without trailing newlines.
+func indexLines(b []byte) ([]int, [][]byte) {
+	if len(b) == 0 {
+		return []int{0}, [][]byte{{}}
+	}
+	starts := []int{0}
+	var lines [][]byte
+	start := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\n' {
+			// trim CR if present
+			end := i
+			if end > start && b[end-1] == '\r' {
+				end--
+			}
+			lines = append(lines, b[start:end])
+			starts = append(starts, i+1)
+			start = i + 1
+		}
+	}
+	// last line
+	if start <= len(b) {
+		end := len(b)
+		if end > start && end-1 >= 0 && b[end-1] == '\n' { // already handled
+			// no-op
+		} else {
+			lines = append(lines, b[start:end])
+		}
+	}
+	// ensure starts length matches lines+1 or more; not strictly required for our usage
+	return starts, lines
+}
+
+func lineEndOffset(starts []int, lineIdx int, total int) int {
+	if lineIdx+1 < len(starts) {
+		// end offset before newline (which is at starts[next]-1)
+		end := starts[lineIdx+1]
+		// exclude newline char
+		// line slice is [starts[lineIdx], end-1] possibly ending with CR
+		return end - 1
+	}
+	return total
+}
+
+func findLineForOffset(starts []int, off int) int {
+	// binary search in starts to find greatest i such that starts[i] <= off
+	i := sort.Search(len(starts), func(i int) bool { return starts[i] > off })
+	return i - 1
+}
+
+// expandMatchWindows converts byte match ranges into line windows expanded by context.
+func expandMatchWindows(ranges [][2]int, starts []int, context, totalLines int) [][2]int {
+	if len(ranges) == 0 {
+		return nil
+	}
+	out := make([][2]int, 0, len(ranges))
+	for _, r := range ranges {
+		sLine := findLineForOffset(starts, r[0])
+		eLine := findLineForOffset(starts, r[1]-1)
+		if sLine < 0 {
+			sLine = 0
+		}
+		if eLine < 0 {
+			eLine = 0
+		}
+		sLine = maxInt(0, sLine-context)
+		eLine = minInt(totalLines-1, eLine+context)
+		out = append(out, [2]int{sLine, eLine})
+	}
+	return out
+}
+
+func mergeWindows(wins [][2]int) [][2]int {
+	if len(wins) == 0 {
+		return wins
+	}
+	sort.Slice(wins, func(i, j int) bool {
+		if wins[i][0] == wins[j][0] {
+			return wins[i][1] < wins[j][1]
+		}
+		return wins[i][0] < wins[j][0]
+	})
+	merged := make([][2]int, 0, len(wins))
+	cur := wins[0]
+	for i := 1; i < len(wins); i++ {
+		w := wins[i]
+		if w[0] <= cur[1]+1 {
+			if w[1] > cur[1] {
+				cur[1] = w[1]
+			}
+		} else {
+			merged = append(merged, cur)
+			cur = w
+		}
+	}
+	merged = append(merged, cur)
+	return merged
+}
+
+func matchCoveredByWindows(r [2]int, starts []int, wins [][2]int) bool {
+	sLine := findLineForOffset(starts, r[0])
+	eLine := findLineForOffset(starts, r[1]-1)
+	for _, w := range wins {
+		if sLine >= w[0] && sLine <= w[1] {
+			return true
+		}
+		if eLine >= w[0] && eLine <= w[1] {
+			return true
+		}
+		if sLine < w[0] && eLine > w[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// applySedPreview applies sed-like scripts and returns edits count and a truncated unified diff.
+func applySedPreview(orig string, scripts []string, maxEdits, diffBytes int) (int, string) {
+	updated := orig
+	edits := 0
+	for _, s := range scripts {
+		s = strings.TrimSpace(s)
+		if !strings.HasPrefix(s, "s") {
+			continue
+		}
+		// Parse s<delim>pat<delim>repl<delim>flags
+		if len(s) < 2 {
+			continue
+		}
+		delim := s[1]
+		parts := strings.Split(s[2:], string(delim))
+		if len(parts) < 3 {
+			continue
+		}
+		pat, repl, flags := parts[0], parts[1], parts[2]
+		// Build regex with flags
+		opts := ""
+		if strings.Contains(flags, "i") {
+			opts += "(?i)"
+		}
+		if strings.Contains(flags, "m") {
+			opts += "(?m)"
+		}
+		re, err := regexp.Compile(opts + pat)
+		if err != nil {
+			continue
+		}
+		// Replace
+		limit := -1
+		if !strings.Contains(flags, "g") {
+			limit = 1
+		}
+		count := 0
+		updated = re.ReplaceAllStringFunc(updated, func(match string) string {
+			if limit >= 0 && count >= limit {
+				return match
+			}
+			count++
+			if maxEdits > 0 && edits+count > maxEdits {
+				return match
+			}
+			return re.ReplaceAllString(match, repl)
+		})
+		edits += count
+		if maxEdits > 0 && edits >= maxEdits {
+			break
+		}
+	}
+	if edits == 0 {
+		return 0, ""
+	}
+	ud := difflib.UnifiedDiff{A: difflib.SplitLines(orig), B: difflib.SplitLines(updated), FromFile: "a", ToFile: "b", Context: 2}
+	text, _ := difflib.GetUnifiedDiffString(ud)
+	if diffBytes > 0 && len(text) > diffBytes {
+		text = text[:diffBytes]
+	}
+	return edits, text
+}
+
+// applySedTransform returns transformed text using the same sed-like parser as preview.
+func applySedTransform(orig string, scripts []string) string {
+	updated := orig
+	for _, s := range scripts {
+		s = strings.TrimSpace(s)
+		if !strings.HasPrefix(s, "s") || len(s) < 2 {
+			continue
+		}
+		delim := s[1]
+		parts := strings.Split(s[2:], string(delim))
+		if len(parts) < 3 {
+			continue
+		}
+		pat, repl, flags := parts[0], parts[1], parts[2]
+		opts := ""
+		if strings.Contains(flags, "i") {
+			opts += "(?i)"
+		}
+		if strings.Contains(flags, "m") {
+			opts += "(?m)"
+		}
+		re, err := regexp.Compile(opts + pat)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(flags, "g") {
+			updated = re.ReplaceAllString(updated, repl)
+		} else {
+			replaced := false
+			updated = re.ReplaceAllStringFunc(updated, func(match string) string {
+				if replaced {
+					return match
+				}
+				replaced = true
+				return re.ReplaceAllString(match, repl)
+			})
+		}
+	}
+	return updated
+}
+
+func (s *Service) DeviceHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) != 4 {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+		uuid := parts[3]
+		pend, ok := s.pending.Get(uuid)
+		if !ok {
+			http.Error(w, "no pending auth", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, buildDeviceLoginHTML(pend.VerifyURL, pend.UserCode))
+	}
+}
+func buildDeviceLoginHTML(url, code string) string {
+	escURL := html.EscapeString(url)
+	escCode := html.EscapeString(code)
+	return fmt.Sprintf(`<html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;"><h3>Sign in to GitHub</h3><p>Click to open: <a href="%[1]s" target="_blank" rel="noopener noreferrer">%[1]s</a></p><p>Then enter this code:</p><p style="font-size:1.4em;font-weight:600;"><code>%[2]s</code> <button onclick="navigator.clipboard.writeText('%[2]s')">Copy</button></p><p>Keep this tab open; return to your assistant after completing sign-in.</p></body></html>`, escURL, escCode)
+}
+func (s *Service) PendingListHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ns := r.URL.Query().Get("namespace")
+		if ns == "" {
+			if d, err := s.ns.Namespace(r.Context()); err == nil {
+				ns = d.Name
+			}
+		}
+		if ns == "" {
+			http.Error(w, "namespace required", http.StatusBadRequest)
+			return
+		}
+		list := s.pending.ListNamespace(ns)
+		type row struct{ UUID, Alias, Namespace, UserCode, VerifyURL string }
+		out := make([]row, 0, len(list))
+		for _, v := range list {
+			out = append(out, row{UUID: v.UUID, Alias: v.Alias, Namespace: v.Namespace, UserCode: v.UserCode, VerifyURL: v.VerifyURL})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	}
+}
+func (s *Service) PendingClearHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ns := r.URL.Query().Get("namespace")
+		if ns == "" {
+			if d, err := s.ns.Namespace(r.Context()); err == nil {
+				ns = d.Name
+			}
+		}
+		if ns == "" {
+			http.Error(w, "namespace required", http.StatusBadRequest)
+			return
+		}
+		cleared := s.pending.ClearNamespace(ns)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"cleared": len(cleared), "uuids": cleared})
+	}
+}
+
+// TokenIngestHandler accepts a token via Authorization header (Bearer or Basic) or JSON body and stores it for alias/domain.
+func (s *Service) TokenIngestHandler() http.HandlerFunc {
+	type reqBody struct {
+		Alias       string `json:"alias"`
+		Domain      string `json:"domain"`
+		Owner       string `json:"owner"`
+		Repo        string `json:"repo"`
+		AccessToken string `json:"access_token"`
+		OAuthKey    bool   `json:"oauthKey"`
+		UUID        string `json:"uuid,omitempty"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		alias := r.URL.Query().Get("alias")
+		domain := r.URL.Query().Get("domain")
+		owner := r.URL.Query().Get("owner")
+		repo := r.URL.Query().Get("repo")
+		oauthKey := r.URL.Query().Get("oauthKey") == "true"
+		uuid := r.URL.Query().Get("uuid")
+		var rb reqBody
+		if ct := r.Header.Get("Content-Type"); strings.HasPrefix(ct, "application/json") {
+			_ = json.NewDecoder(r.Body).Decode(&rb)
+		}
+		if alias == "" {
+			alias = rb.Alias
+		}
+		alias = s.normalizeAlias(alias)
+		if domain == "" {
+			domain = rb.Domain
+		}
+		if owner == "" {
+			owner = rb.Owner
+		}
+		if repo == "" {
+			repo = rb.Repo
+		}
+		if !oauthKey {
+			oauthKey = rb.OAuthKey
+		}
+		if uuid == "" {
+			uuid = rb.UUID
+		}
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		// Prefer JSON body token if provided; fall back to Authorization header
+		token := strings.TrimSpace(rb.AccessToken)
+		if token == "" {
+			if auth := r.Header.Get("Authorization"); auth != "" {
+				parts := strings.SplitN(auth, " ", 2)
+				if len(parts) == 2 && strings.EqualFold(parts[0], "Basic") {
+					if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[1])); err == nil {
+						token = string(dec) // username:password
+					}
+				} else if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+					token = strings.TrimSpace(parts[1])
+				}
+				// removed log.Printf diagnostics
+			}
+		}
+		if token == "" {
+			http.Error(w, "access token missing", http.StatusBadRequest)
+			return
+		}
+		// Validate credentials against GitHub before saving to avoid storing invalid tokens.
+		if domain == "" {
+			domain = "github.com"
+		}
+		cli := adapter.New(domain)
+		if err := cli.ValidateToken(r.Context(), token); err != nil {
+			if errors.Is(err, adapter.ErrUnauthorized) {
+				http.Error(w, "invalid credentials", http.StatusUnauthorized)
+				return
+			}
+			http.Error(w, "credential validation failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		dsc, _ := s.ns.Namespace(r.Context())
+		ns := dsc.Name
+		if ns == "" {
+			ns = "default"
+		}
+		// If uuid corresponds to a pending auth, prefer its namespace to bind OOB to the original session
+		if u := strings.TrimSpace(uuid); u != "" {
+			if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
+				ns = pend.Namespace
+			}
+		}
+		if owner != "" && repo != "" {
+			s.saveTokenRepo(ns, alias, domain, owner, repo, token, oauthKey)
+			s.persistToken(r.Context(), ns, alias, domain, owner, repo, token)
+		} else {
+			s.saveTokenDomain(ns, alias, domain, token, oauthKey)
+			s.persistToken(r.Context(), ns, alias, domain, "", "", token)
+		}
+		s.clearElicitedAll(alias, domain)
+		s.notifyToken(ns, alias, domain)
+		if uuid != "" {
+			s.pending.Remove(uuid)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}
+}
+
+// DeviceStartHandler initiates device authorization and returns URL+code without blocking for completion.
+func (s *Service) DeviceStartHandler() http.HandlerFunc {
+	type reqBody struct {
+		Alias  string `json:"alias"`
+		Domain string `json:"domain"`
+	}
+	type dcResp struct {
+		DeviceCode, UserCode, VerificationURI string
+		ExpiresIn, Interval                   int
+	}
+	type respBody struct {
+		UUID, OOBUrl, VerifyURL, UserCode string
+		ExpiresIn, Interval               int
+	}
+	type tokResp struct {
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if s.clientID == "" {
+			http.Error(w, "service missing clientID", http.StatusBadRequest)
+			return
+		}
+		alias := r.URL.Query().Get("alias")
+		domain := r.URL.Query().Get("domain")
+		var rb reqBody
+		if ct := r.Header.Get("Content-Type"); strings.HasPrefix(ct, "application/json") {
+			_ = json.NewDecoder(r.Body).Decode(&rb)
+		}
+		if alias == "" {
+			alias = rb.Alias
+		}
+		if domain == "" {
+			domain = rb.Domain
+		}
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		host := domain
+		if host == "" {
+			host = "github.com"
+		}
+		form := fmt.Sprintf("client_id=%s&scope=repo%%20read:user", s.clientID)
+		deviceURL := fmt.Sprintf("https://%s/login/device/code", host)
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, deviceURL, strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			http.Error(w, "device code failed: "+resp.Status, http.StatusBadGateway)
+			return
+		}
+		var dcr dcResp
+		if err := json.NewDecoder(resp.Body).Decode(&dcr); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		dsc, _ := s.ns.Namespace(r.Context())
+		ns := dsc.Name
+		id := uuid.New().String()
+		s.pending.Put(&PendingAuth{UUID: id, Alias: alias, Namespace: ns, UserCode: dcr.UserCode, VerifyURL: dcr.VerificationURI})
+		oob := strings.TrimRight(s.baseURL, "/") + "/github/auth/device/" + id
+		// respond immediately with OOB url and code
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(respBody{UUID: id, OOBUrl: oob, VerifyURL: dcr.VerificationURI, UserCode: dcr.UserCode, ExpiresIn: dcr.ExpiresIn, Interval: dcr.Interval})
+
+		// Start background polling to exchange device_code for access token
+		go func(ctx context.Context, alias, domain, deviceCode string, interval int) {
+			if interval <= 0 {
+				interval = 5
+			}
+			host := domain
+			if host == "" {
+				host = "github.com"
+			}
+			for {
+				form := fmt.Sprintf("client_id=%s&device_code=%s&grant_type=urn:ietf:params:oauth:grant-type:device_code", s.clientID, deviceCode)
+				tokenURL := fmt.Sprintf("https://%s/login/oauth/access_token", host)
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form))
+				req.Header.Set("Accept", "application/json")
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					return
+				}
+				var tr tokResp
+				_ = json.NewDecoder(resp.Body).Decode(&tr)
+				resp.Body.Close()
+				if tr.AccessToken != "" {
+					ns2, _ := s.auth.Namespace(ctx)
+					if ns2 == "" {
+						ns2 = ns
+					}
+					s.saveToken(ns2, alias, domain, tr.AccessToken)
+					s.clearElicitedAll(alias, domain)
+					s.notifyToken(ns2, alias, domain)
+					// removed log.Printf diagnostics
+					return
+				}
+				if tr.Error == "authorization_pending" || tr.Error == "slow_down" {
+					select {
+					case <-ctx.Done():
+						return
+					case <-timeAfterSeconds(interval):
+					}
+					continue
+				}
+				return
+			}
+		}(r.Context(), alias, domain, dcr.DeviceCode, dcr.Interval)
+	}
+}
+
+// TokenCheckHandler returns whether a token exists for alias/domain.
+func (s *Service) TokenCheckHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		alias := r.URL.Query().Get("alias")
+		domain := r.URL.Query().Get("domain")
+		owner := r.URL.Query().Get("owner")
+		repo := r.URL.Query().Get("repo")
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		alias = s.normalizeAlias(alias)
+		ns, _ := s.auth.Namespace(r.Context())
+		if ns == "" {
+			ns = "default"
+		}
+		// Allow OOB to pin namespace via pending uuid; if missing (already consumed), fall back to any-ns visibility for UI only
+		if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
+			if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
+				ns = pend.Namespace
+			}
+		}
+		has := s.loadTokenPreferred(ns, alias, domain, owner, repo) != ""
+		if !has {
+			if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
+				if s.loadTokenPreferredAnyNS(alias, domain, owner, repo) != "" {
+					has = true
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"hasToken": has})
+	}
+}
+
+// VerifyHandler checks whether the provided/stored credential can access the repo's default branch tree.
+// GET /github/auth/verify?alias=...&domain=...&url=domain/owner/repo
+func (s *Service) VerifyHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		alias := s.normalizeAlias(r.URL.Query().Get("alias"))
+		domain := r.URL.Query().Get("domain")
+		u := strings.TrimSpace(r.URL.Query().Get("url"))
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		if u == "" {
+			http.Error(w, "url required (domain/owner/repo)", http.StatusBadRequest)
+			return
+		}
+		// parse domain/owner/name
+		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			if p := strings.Index(u, "://"); p > 0 {
+				u = u[p+3:]
+			}
+		}
+		parts := strings.Split(strings.Trim(u, "/"), "/")
+		if len(parts) < 3 {
+			http.Error(w, "invalid url; expected domain/owner/repo", http.StatusBadRequest)
+			return
+		}
+		if domain == "" {
+			domain = parts[0]
+		} // prefer explicit query param if provided
+		owner, name := parts[1], parts[2]
+		ns, _ := s.auth.Namespace(r.Context())
+		if ns == "" {
+			ns = "default"
+		}
+		// Allow OOB to pin namespace via pending uuid
+		if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
+			if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
+				ns = pend.Namespace
+			}
+		}
+		token := s.loadToken(ns, alias, domain)
+		if token == "" {
+			http.Error(w, "no token for alias/domain", http.StatusUnauthorized)
+			return
+		}
+		cli := adapter.New(domain)
+		// Resolve default branch
+		def, err := cli.GetRepoDefaultBranch(r.Context(), token, owner, name)
+		if err != nil {
+			http.Error(w, "verify: default branch: "+err.Error(), http.StatusUnauthorized)
+			return
+		}
+		// Resolve commit tree; tolerate 422 by attempting heads/ prefix and finally skipping
+		if _, err := cli.GetCommitTreeSHA(r.Context(), token, owner, name, def); err != nil {
+			// try heads/def and refs/heads/def implicitly handled inside GetCommitTreeSHA; if still errors, proceed
+			// removed log.Printf diagnostics
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "defaultBranch": def})
+	}
+}
+
+// OOBHandler serves a page to collect credentials: bearer token, basic creds, or start device flow.
+func (s *Service) OOBHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		alias := r.URL.Query().Get("alias")
+		domain := r.URL.Query().Get("domain")
+		uuid := r.URL.Query().Get("uuid")
+		if alias == "" {
+			alias = "default"
+		}
+		host := domain
+		if host == "" {
+			host = "github.com"
+		}
+		base := strings.TrimRight(s.baseURL, "/")
+		// If uuid is provided and pending exists, show device code info initially.
+		deviceInitial := ""
+		if uuid != "" {
+			if pend, ok := s.pending.Get(uuid); ok && pend != nil {
+				deviceInitial = fmt.Sprintf("Open <a href=\"%s\" target=\"_blank\" rel=\"noopener\">%s</a> and enter code <code>%s</code>.", html.EscapeString(pend.VerifyURL), html.EscapeString(pend.VerifyURL), html.EscapeString(pend.UserCode))
+			}
+		}
+		// Simple HTML + inline JS for user interaction.
+		repourl := r.URL.Query().Get("url")
+		htmlTmpl := `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitHub Authorization</title>
+  <style>
+    :root { --bg:#f3f4f6; --card:#ffffff; --muted:#6b7280; --fg:#111827; --primary:#dc4b43; --primary-600:#c0392b; --ring:#e5e7eb; }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--fg); display:flex; align-items:center; justify-content:center; padding:24px}
+    .card{width:100%; max-width:640px; background:var(--card); border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,.08); overflow:hidden; border:1px solid var(--ring)}
+    .header{padding:28px 28px 0}
+    .brand{display:flex; align-items:center; gap:10px; color:var(--primary); font-weight:800; letter-spacing:.08em}
+    .brand svg{height:22px}
+    .title{margin:12px 0 6px; font-size:22px; font-weight:700}
+    .subtitle{margin:0; color:var(--muted); font-size:14px}
+    .body{padding:24px 28px 28px}
+    .stack{display:flex; flex-direction:column; gap:12px; margin-bottom:16px}
+    label{display:block; font-weight:600; margin-bottom:6px}
+    input{width:100%; padding:12px 14px; border:1px solid var(--ring); border-radius:10px; font-size:15px; outline:none}
+    input:focus{border-color:var(--primary); box-shadow:0 0 0 3px rgba(220,75,67,.15)}
+    .hint{font-size:12px; color:var(--muted); margin-top:4px}
+    #status.error{color:#b91c1c}
+    input.error{border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.15) !important}
+    .tabs{display:flex; gap:8px; margin:10px 0 18px}
+    .tab{flex:0 0 auto; padding:8px 12px; border:1px solid var(--ring); border-radius:999px; cursor:pointer; font-size:13px; color:#374151; background:#fafafa}
+    .tab.active{background:var(--primary); color:#fff; border-color:var(--primary)}
+    .section{display:none}
+    .section.active{display:block}
+    .actions{display:flex; gap:10px; margin-top:18px}
+    .btn{appearance:none; border:none; cursor:pointer; border-radius:10px; padding:10px 14px; font-size:15px}
+    .btn.primary{background:var(--primary); color:#fff}
+    .btn.primary:hover{background:var(--primary-600)}
+    .btn.ghost{background:#f9fafb; border:1px solid var(--ring)}
+    code{background:#f6f7f9; padding:2px 6px; border-radius:6px}
+    .footer{padding:14px 28px 24px; color:var(--muted); font-size:12px}
+    .device{margin-top:8px; padding:10px; background:#fff8f8; border:1px dashed var(--primary); border-radius:10px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="brand">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 .2a8 8 0 0 0-2.53 15.6c.4.07.55-.17.55-.38v-1.32c-2.26.49-2.73-1.09-2.73-1.09-.36-.92-.89-1.16-.89-1.16-.73-.5.06-.49.06-.49.81.06 1.24.83 1.24.83.72 1.23 1.88.88 2.34.67.07-.52.28-.88.5-1.08-1.8-.2-3.69-.9-3.69-4.02 0-.89.32-1.62.84-2.19-.08-.2-.36-1.01.08-2.1 0 0 .68-.22 2.22.84a7.6 7.6 0 0 1 4.05 0c1.54-1.06 2.22-.84 2.22-.84.44 1.09.16 1.9.08 2.1.52.57.84 1.3.84 2.19 0 3.13-1.89 3.82-3.7 4.02.29.25.54.74.54 1.5v2.23c0 .21.14.45.55.38A8 8 0 0 0 8 .2Z"/></svg>
+        <span>GitHub</span>
+      </div>
+      <h1 class="title">Authorize GitHub Access</h1>
+      <p class="subtitle">Alias and host are prefilled; choose a sign‑in method below.</p>
+    </div>
+    <div class="body">
+      <div class="stack">
+        <div>
+          <label for="alias">Alias</label>
+          <input id="alias" value="{{ALIAS}}" />
+        </div>
+        <div>
+          <label for="domain">Domain</label>
+          <input id="domain" value="{{DOMAIN}}" />
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button class="tab" data-tab="token">Token</button>
+        <button class="tab active" data-tab="basic">Username/Password</button>
+        <button class="tab" data-tab="device">Device Flow</button>
+      </div>
+
+      <div id="sec-token" class="section">
+        <label for="bearer">Personal Access Token</label>
+        <input id="bearer" placeholder="ghp_..." />
+        <div class="hint">Paste a GitHub token with the required scopes.</div>
+      </div>
+
+      <div id="sec-basic" class="section active">
+        <label for="user">Username</label>
+        <input id="user" placeholder="Username" />
+        <label for="pass" style="margin-top:10px">Password or Token</label>
+        <input id="pass" type="password" placeholder="••••••••" />
+        <div class="hint">For GitHub.com, basic auth requires a token as password.</div>
+      </div>
+
+      <div id="sec-device" class="section">
+        <div class="device" id="deviceInfo">{{DEVICE}}</div>
+        <div class="hint">Start device flow to sign in on github.com and return here.</div>
+      </div>
+
+      <label for="repourl" style="margin-top:16px">Repository (optional)</label>
+      <input id="repourl" value="{{REPOURL}}" placeholder="github.vianttech.com/owner/repo" />
+
+      <div class="actions">
+        <button class="btn primary" onclick="onOK()">Continue</button>
+        <button class="btn ghost" onclick="onCancel()">Cancel</button>
+        <button class="btn ghost" onclick="onReject()">Reject</button>
+      </div>
+
+      <div id="status" class="hint" style="margin-top:10px"></div>
+    </div>
+    <div class="footer">You can switch method tabs at any time. We never store your password; tokens are kept locally for this session.</div>
+  </div>
+
+<script>
+document.querySelectorAll('.tab').forEach(el => el.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  const tab = el.getAttribute('data-tab');
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById('sec-' + tab).classList.add('active');
+  // clear previous error highlights when switching methods
+  document.getElementById('status').classList.remove('error');
+  ['bearer','user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.remove('error')});
+}));
+async function pollCheck(alias, domain) {
+  const url = '{{BASE}}/github/auth/check?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}';
+  for (let i=0; i<60; i++) { // ~60 * 2s = 2 minutes
+    const r = await fetch(url);
+    const j = await r.json();
+    if (j.hasToken) return true;
+    await new Promise(rs => setTimeout(rs, 2000));
+  }
+  return false;
+}
+async function startDevice() {
+  const alias = document.getElementById('alias').value.trim();
+  const domain = document.getElementById('domain').value.trim();
+  const el = document.getElementById('deviceInfo'); el.textContent = 'Starting device flow...';
+  const r = await fetch('{{BASE}}/github/auth/start?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||''), { method:'POST' });
+  if (!r.ok) { el.textContent = 'Start error: ' + r.status; return }
+  const j = await r.json();
+  el.innerHTML = 'Open <a href="' + j.VerifyURL + '" target="_blank" rel="noopener">' + j.VerifyURL + '</a> and enter code <code>' + j.UserCode + '</code>.\nThen return here.';
+  if (await pollCheck(alias, domain)) { el.innerHTML += '<div>Token saved.</div>'; tryClose('Device flow completed.'); }
+}
+async function onOK() {
+  const alias = document.getElementById('alias').value.trim();
+  const domain = document.getElementById('domain').value.trim();
+  const bearer = document.getElementById('bearer').value.trim();
+  const user = document.getElementById('user').value.trim();
+  const pass = document.getElementById('pass').value.trim();
+  const status = document.getElementById('status'); status.textContent = 'Processing...'; status.classList.remove('error');
+  const flagTokenError = (msg)=>{ status.textContent = msg; status.classList.add('error'); const b=document.getElementById('bearer'); if(b) b.classList.add('error'); };
+  const flagBasicError = (msg)=>{ status.textContent = msg; status.classList.add('error'); ['user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.add('error')}); };
+  try {
+    if (bearer) {
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Bearer ' + bearer } });
+      if (!r.ok) { const txt = await r.text(); flagTokenError(r.status===401 ? 'Invalid token' : ('Save failed: ' + txt)); return }
+      if (await pollCheck(alias, domain)) {
+        const repourl = document.getElementById('repourl').value.trim();
+        if (repourl) {
+          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
+          if (!vr.ok) { flagTokenError('Verify failed: ' + (await vr.text())); return; }
+        }
+        status.textContent = 'OK: token saved'; tryClose('OK');
+      } else { status.textContent = 'Saved, but token not visible in check'; tryClose('Saved'); }
+      return;
+    }
+    if (user || pass) {
+      const basic = btoa((user||'') + ':' + (pass||''));
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Basic ' + basic } });
+      if (!r.ok) { const txt = await r.text(); flagBasicError(r.status===401 ? 'Invalid username or token' : ('Save failed: ' + txt)); return }
+      if (await pollCheck(alias, domain)) {
+        const repourl = document.getElementById('repourl').value.trim();
+        if (repourl) {
+          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
+          if (!vr.ok) { flagBasicError('Verify failed: ' + (await vr.text())); return; }
+        }
+        status.textContent = 'OK: basic saved'; tryClose('OK');
+      } else { status.textContent = 'Saved, but not visible in check'; tryClose('Saved'); }
+      return;
+    }
+    await startDevice(); status.textContent = 'Device flow started.';
+  } catch (e) { status.textContent = e.message; }
+}
+function tryClose(msg){
+  try { window.close(); } catch(e){}
+  // If window doesn't close (opened as a tab), show a message
+  const s = document.getElementById('status');
+  if (s) s.textContent = msg + ' — you can close this tab now.';
+}
+function onCancel(){ document.getElementById('status').textContent = 'Canceled by user.'; tryClose('Canceled'); }
+function onReject(){ document.getElementById('status').textContent = 'Rejected by user.'; tryClose('Rejected'); }
+ </script>
+</body></html>`
+		// Replace placeholders without % formatting issues.
+		repl := strings.NewReplacer(
+			"{{ALIAS}}", html.EscapeString(alias),
+			"{{DOMAIN}}", html.EscapeString(host),
+			"{{BASE}}", html.EscapeString(base),
+			"{{DEVICE}}", deviceInitial,
+			"{{REPOURL}}", html.EscapeString(repourl),
+			"{{UUID}}", html.EscapeString(uuid),
+		)
+		htmlPage := repl.Replace(htmlTmpl)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, htmlPage)
+	}
+}
+
+func parseAuthHeaderToken(header string) string {
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	scheme, val := strings.ToLower(strings.TrimSpace(parts[0])), strings.TrimSpace(parts[1])
+	switch scheme {
+	case "bearer":
+		return val
+	case "basic":
+		dec, err := base64.StdEncoding.DecodeString(val)
+		if err != nil {
+			return ""
+		}
+		creds := string(dec)
+		if i := strings.IndexByte(creds, ':'); i != -1 {
+			return creds[i+1:]
+		}
+		return creds
+	}
+	return ""
+}
+
+func (s *Service) UseTextField() bool                         { return s.useText }
+func (s *Service) BaseURL() string                            { return s.baseURL }
+func (s *Service) StorageDir() string                         { return s.storageDir }
+func (s *Service) ClientID() string                           { return s.clientID }
+func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
+
+// Namespace returns the effective authorization namespace for this request context,
+// or "default" when not set.
+func (s *Service) Namespace(ctx context.Context) string {
+	if d, err := s.ns.Namespace(ctx); err == nil && d.Name != "" {
+		return d.Name
+	}
+	return "default"
+}
+
+// WaitTimeout returns maximum time to wait for credentials; configurable via GITHUB_MCP_WAIT_SECS (default 300s).
+func (s *Service) WaitTimeout() time.Duration {
+	s.tunWaitOnce.Do(func() {
+		if v := strings.TrimSpace(os.Getenv("GITHUB_MCP_WAIT_SECS")); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil {
+				s.tunWait = n
+			}
+		}
+		if s.tunWait == 0 {
+			s.tunWait = 300 * time.Second
+		}
+	})
+	return s.tunWait
+}
+
+// ElicitCooldown returns cooldown between repeated elicitations; configurable via GITHUB_MCP_ELICIT_COOLDOWN_SECS (default 60s).
+func (s *Service) ElicitCooldown() time.Duration {
+	s.tunCoolOnce.Do(func() {
+		if v := strings.TrimSpace(os.Getenv("GITHUB_MCP_ELICIT_COOLDOWN_SECS")); v != "" {
+			if n, err := time.ParseDuration(v + "s"); err == nil {
+				s.tunCooldown = n
+			}
+		}
+		if s.tunCooldown == 0 {
+			s.tunCooldown = 60 * time.Second
+		}
+	})
+	return s.tunCooldown
+}
+
+func (s *Service) tokenWaitKey(ns, alias, domain string) string {
+	return joinKey("wait", ns, alias, domain)
+}
+
+// notifyToken wakes any goroutines waiting for a token for (alias,domain).
+func (s *Service) notifyToken(ns, alias, domain string) {
+	key := s.tokenWaitKey(ns, alias, domain)
+	s.waitMu.Lock()
+	lst := s.waiters[key]
+	delete(s.waiters, key)
+	s.waitMu.Unlock()
+	// removed log.Printf diagnostics
+	for _, ch := range lst {
+		close(ch)
+	}
+}
+
+// notifyTokenAll wakes any goroutines waiting for a token for (alias,domain) in any namespace.
+// notifyTokenAll removed to preserve strict namespace isolation; callers should use notifyToken with exact namespace.
+
+// serviceDebug removed; debug logs have been stripped.
+
+// looksLikeSHA reports whether s is a 40-hex SHA1 string.
+func looksLikeSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// resolveZipballSHA attempts to resolve a ref to a concrete commit SHA by issuing
+// a HEAD request to the zipball URL and inspecting the final URL or headers after redirects.
+func (s *Service) resolveZipballSHA(ctx context.Context, domain, owner, name, ref, token string) string {
+	apiBase := "https://api.github.com"
+	if domain != "" && domain != "github.com" {
+		apiBase = "https://" + domain + "/api/v3"
+	}
+	url := fmt.Sprintf("%s/repos/%s/%s/zipball/%s", apiBase, owner, name, neturl.PathEscape(ref))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", s.authBasic(token))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	// Try final URL first
+	if resp.Request != nil && resp.Request.URL != nil {
+		// codeload often returns /legacy.zip/{sha}
+		segs := strings.Split(strings.Trim(resp.Request.URL.Path, "/"), "/")
+		if len(segs) > 0 {
+			cand := segs[len(segs)-1]
+			if looksLikeSHA(cand) {
+				return strings.ToLower(cand)
+			}
+		}
+	}
+	// Fallback: parse Content-Disposition filename=owner-repo-<sha>.zip
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		// naive parse: take last -part before .zip
+		if i := strings.LastIndex(cd, "-"); i > 0 {
+			if j := strings.LastIndex(strings.ToLower(cd), ".zip"); j > i {
+				cand := cd[i+1 : j]
+				cand = strings.Trim(cand, `"'`)
+				if looksLikeSHA(cand) {
+					return strings.ToLower(cand)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// extractSHAFromHTTP tries to parse a commit SHA from the final HTTP response URL/path or Content-Disposition.
+func (s *Service) extractSHAFromHTTP(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		segs := strings.Split(strings.Trim(resp.Request.URL.Path, "/"), "/")
+		if len(segs) > 0 {
+			cand := segs[len(segs)-1]
+			if looksLikeSHA(cand) {
+				return strings.ToLower(cand)
+			}
+		}
+	}
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		if i := strings.LastIndex(cd, "-"); i > 0 {
+			if j := strings.LastIndex(strings.ToLower(cd), ".zip"); j > i {
+				cand := strings.Trim(cd[i+1:j], `"'`)
+				if looksLikeSHA(cand) {
+					return strings.ToLower(cand)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// findExistingSharedZip returns the newest zip's sha in the shared repo folder, if any.
+func (s *Service) findExistingSharedZip(domain, owner, name string) string {
+	base := os.ExpandEnv(s.storageDir)
+	if strings.TrimSpace(base) == "" {
+		base = os.TempDir()
+	}
+	repoDir := filepath.Join(base, "gh_snapshots_shared", safePart(domain), safePart(owner), safePart(name))
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		return ""
+	}
+	type pair struct {
+		name string
+		mod  time.Time
+	}
+	var found []pair
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		nm := e.Name()
+		if !strings.HasSuffix(strings.ToLower(nm), ".zip") {
+			continue
+		}
+		sha := strings.TrimSuffix(nm, ".zip")
+		if !looksLikeSHA(sha) {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		found = append(found, pair{name: sha, mod: fi.ModTime()})
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].mod.After(found[j].mod) })
+	return found[0].name
+}
+
+type countingReader struct {
+	r io.Reader
+	n *int64
+}
+
+func (cr *countingReader) Read(p []byte) (int, error) {
+	n, err := cr.r.Read(p)
+	if n > 0 && cr.n != nil {
+		atomic.AddInt64(cr.n, int64(n))
+	}
+	return n, err
+}
+
+// extractSHAFromZipFile opens the zip and attempts to infer the commit SHA from its top-level folder name.
+func extractSHAFromZipFile(p string) string {
+	zr, err := zip.OpenReader(p)
+	if err != nil {
+		return ""
+	}
+	defer zr.Close()
+	// Try directory entries first
+	for _, f := range zr.File {
+		if strings.HasSuffix(f.Name, "/") {
+			top := strings.TrimSuffix(f.Name, "/")
+			if idx := strings.IndexByte(top, '/'); idx >= 0 {
+				top = top[:idx]
+			}
+			base := filepath.Base(top)
+			parts := strings.Split(base, "-")
+			if len(parts) > 0 {
+				cand := parts[len(parts)-1]
+				if looksLikeSHA(cand) {
+					return strings.ToLower(cand)
+				}
+				if l := len(cand); l >= 7 && l <= 40 {
+					hex := true
+					for i := 0; i < l; i++ {
+						c := cand[i]
+						if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+							continue
+						}
+						hex = false
+						break
+					}
+					if hex {
+						return strings.ToLower(cand)
+					}
+				}
+			}
+			break
+		}
+	}
+	// Fallback: derive top folder from first file path
+	for _, f := range zr.File {
+		name := f.Name
+		if name == "" {
+			continue
+		}
+		top := name
+		if idx := strings.IndexByte(name, '/'); idx >= 0 {
+			top = name[:idx]
+		}
+		base := filepath.Base(top)
+		parts := strings.Split(base, "-")
+		if len(parts) == 0 {
+			continue
+		}
+		cand := parts[len(parts)-1]
+		if looksLikeSHA(cand) {
+			return strings.ToLower(cand)
+		}
+		if l := len(cand); l >= 7 && l <= 40 {
+			hex := true
+			for i := 0; i < l; i++ {
+				c := cand[i]
+				if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+					continue
+				}
+				hex = false
+				break
+			}
+			if hex {
+				return strings.ToLower(cand)
+			}
+		}
+		break
+	}
+	return ""
+}
+
+// maybeElicitOnce emits a single OOB prompt per (ns,alias,domain) within a cooldown window.
+func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, name string, prompt func(string)) {
+	if prompt == nil {
+		return
+	}
+	namespace := s.Namespace(ctx)
+	keySess := joinKey("elicit", namespace, alias, domain)
+	nsVal := "default"
+	if v, err := s.auth.Namespace(ctx); err == nil && v != "" {
+		nsVal = v
+	}
+	keyGlob := joinKey("elicitNS", nsVal, alias, domain)
+	now := time.Now()
+	cooldown := s.ElicitCooldown()
+	s.elicitMu.Lock()
+	if t, ok := s.elicited[keySess]; ok && now.Sub(t) < cooldown {
+		// removed log.Printf diagnostics
+		s.elicitMu.Unlock()
+		return
+	}
+	if t, ok := s.elicitedGlobal[keyGlob]; ok && now.Sub(t) < cooldown {
+		// removed log.Printf diagnostics
+		s.elicitMu.Unlock()
+		return
+	}
+	s.elicited[keySess] = now
+	s.elicitedGlobal[keyGlob] = now
+	s.elicitMu.Unlock()
+	// removed log.Printf diagnostics
+	base := s.BaseURL()
+	q := neturl.Values{}
+	q.Set("alias", alias)
+	if domain != "" {
+		q.Set("domain", domain)
+	}
+	// Include repo url hint when available
+	if owner != "" && name != "" {
+		q.Set("url", fmt.Sprintf("%s/%s/%s", domain, owner, name))
+	}
+	// Create a synthetic pending to carry namespace for OOB token ingestion
+	nsUse := nsVal
+	pid := uuid.New().String()
+	s.pending.Put(&PendingAuth{UUID: pid, Alias: alias, Namespace: nsUse})
+	q.Set("uuid", pid)
+	prompt(fmt.Sprintf("Open %s/github/auth/oob?%s to provide credentials", strings.TrimRight(base, "/"), q.Encode()))
+}
+
+// clearElicitedAll clears dedupe entries for any session for this alias/domain.
+func (s *Service) clearElicitedAll(alias, domain string) {
+	s.elicitMu.Lock()
+	for k := range s.elicited {
+		parts := strings.Split(k, "|")
+		// key format: elicit|session|alias|domain
+		if len(parts) >= 4 {
+			if parts[2] == safePart(alias) && parts[3] == safePart(domain) {
+				delete(s.elicited, k)
+			}
+		}
+	}
+	// clear any global key elicitNS|ns|alias|domain
+	for k := range s.elicitedGlobal {
+		parts := strings.Split(k, "|")
+		if len(parts) >= 4 {
+			// format: elicitNS|ns|alias|domain
+			if parts[2] == safePart(alias) && parts[3] == safePart(domain) {
+				delete(s.elicitedGlobal, k)
+			}
+		}
+	}
+	s.elicitMu.Unlock()
+}
+
+// waitForToken blocks until a token is saved for alias/domain (any repo), or context/timeout occurs.
+func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, name string, timeout time.Duration) bool {
+	if t := s.loadTokenPreferred(ns, alias, domain, owner, name); t != "" {
+		return true
+	}
+	key := s.tokenWaitKey(ns, alias, domain)
+	ch := make(chan struct{}, 1)
+	s.waitMu.Lock()
+	s.waiters[key] = append(s.waiters[key], ch)
+	s.waitMu.Unlock()
+	// removed log.Printf diagnostics
+	// Re-check in case token arrived before registration
+	if t := s.loadTokenPreferred(ns, alias, domain, owner, name); t != "" {
+		s.notifyToken(ns, alias, domain)
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	case <-ch:
+		return true
+	}
+}
+
+// Public methods: ListRepos, ListRepoIssues, ListRepoPRs
+func (s *Service) ListRepos(ctx context.Context, in *ListReposInput, prompt func(string)) (*ListReposOutput, error) {
+	alias := s.normalizeAlias(in.Account.Alias)
+	if alias == "" {
+		if inf, _ := s.inferAlias(ctx, in.Account.Domain, "", ""); inf != "" {
+			alias = inf
+		}
+	}
+	cli := adapter.New(in.Account.Domain)
+	repos, err := withCredentialRetry(ctx, s, alias, in.Account.Domain, prompt, func(token string) ([]adapter.Repo, error) {
+		return cli.ListRepos(ctx, token, in.Visibility, in.Affiliation, in.PerPage)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := &ListReposOutput{}
+	for _, v := range repos {
+		out.Repos = append(out.Repos, Repo{ID: v.ID, Name: v.Name, FullName: v.FullName})
+	}
+	return out, nil
+}
+func (s *Service) ListRepoIssues(ctx context.Context, in *ListRepoIssuesInput, prompt func(string)) (*ListRepoIssuesOutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	issues, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]adapter.Issue, error) {
+		return cli.ListRepoIssues(ctx, token, owner, name, in.State)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := &ListRepoIssuesOutput{}
+	for _, v := range issues {
+		out.Issues = append(out.Issues, Issue{ID: v.ID, Number: v.Number, Title: v.Title, State: v.State})
+	}
+	return out, nil
+}
+func (s *Service) ListRepoPRs(ctx context.Context, in *ListRepoPRsInput, prompt func(string)) (*ListRepoPRsOutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	pulls, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]adapter.PullRequest, error) {
+		return cli.ListRepoPRs(ctx, token, owner, name, in.State)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := &ListRepoPRsOutput{}
+	for _, v := range pulls {
+		out.Pulls = append(out.Pulls, PullRequest{ID: v.ID, Number: v.Number, Title: v.Title, State: v.State})
+	}
+	return out, nil
+}
+
+// CreateIssue creates a new issue in a repository.
+func (s *Service) CreateIssue(ctx context.Context, in *CreateIssueInput, prompt func(string)) (*CreateIssueOutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	issue, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (adapter.Issue, error) {
+		return cli.CreateIssue(ctx, token, owner, name, in.Title, in.Body, in.Labels, in.Assignees)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &CreateIssueOutput{Issue: Issue{ID: issue.ID, Number: issue.Number, Title: issue.Title, State: issue.State}}, nil
+}
+
+// CreatePR opens a pull request.
+func (s *Service) CreatePR(ctx context.Context, in *CreatePRInput, prompt func(string)) (*CreatePROutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	pr, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (adapter.PullRequest, error) {
+		return cli.CreatePR(ctx, token, owner, name, in.Title, in.Body, in.Head, in.Base, in.Draft)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &CreatePROutput{Pull: PullRequest{ID: pr.ID, Number: pr.Number, Title: pr.Title, State: pr.State}}, nil
+}
+
+// AddComment adds a comment to an issue or PR (PR comments use issue comments endpoint).
+func (s *Service) AddComment(ctx context.Context, in *AddCommentInput, prompt func(string)) (*AddCommentOutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	cm, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (adapter.Comment, error) {
+		return cli.AddComment(ctx, token, owner, name, in.IssueNumber, in.Body)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &AddCommentOutput{Comment: Comment{ID: cm.ID, Body: cm.Body, User: cm.User, CreatedAt: cm.CreatedAt}}, nil
+}
+
+// ListComments lists comments for an issue or PR.
+func (s *Service) ListComments(ctx context.Context, in *ListCommentsInput, prompt func(string)) (*ListCommentsOutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	items, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]adapter.Comment, error) {
+		return cli.ListComments(ctx, token, owner, name, in.IssueNumber)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := &ListCommentsOutput{}
+	for _, v := range items {
+		out.Comments = append(out.Comments, Comment{ID: v.ID, Body: v.Body, User: v.User, CreatedAt: v.CreatedAt})
+	}
+	return out, nil
+}
+
+// SearchIssues runs a GitHub issues/PRs search query.
+func (s *Service) SearchIssues(ctx context.Context, in *SearchIssuesInput, prompt func(string)) (*SearchIssuesOutput, error) {
+	alias := s.normalizeAlias(in.Account.Alias)
+	if alias == "" {
+		if inf, _ := s.inferAlias(ctx, in.Account.Domain, "", ""); inf != "" {
+			alias = inf
+		}
+	}
+	cli := adapter.New(in.Account.Domain)
+	issues, err := withCredentialRetry(ctx, s, alias, in.Account.Domain, prompt, func(token string) ([]adapter.Issue, error) {
+		return cli.SearchIssues(ctx, token, in.Query, in.PerPage)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := &SearchIssuesOutput{}
+	for _, it := range issues {
+		out.Issues = append(out.Issues, Issue{ID: it.ID, Number: it.Number, Title: it.Title, State: it.State})
+	}
+	return out, nil
+}
+
+// ListRepoPath lists paths under the given repo path/ref. Returns repo-relative paths only
+// (compact output for LLMs). For content-based searching and previews, use FindFilesPreview.
+func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt func(string)) (*ListRepoOutput, error) {
+	if in == nil {
+		return nil, fmt.Errorf("input is nil")
+	}
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo, Ref: in.Ref}
+	domain, owner, name, ref, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	// Execute with token using the retry helper to enable elicitation if no token exists.
+	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*ListRepoOutput, error) {
+		// Normalize empty ref to default branch up front
+		ref = s.effectiveRef(ctx, domain, owner, name, ref, token)
+		// Path-only listing; for content-based searching use githubFindFilesPreview
+		// If recursive requested, prefer Git Trees API for performance.
+		if in.Recursive {
+			// Validate a user-supplied ref; if invalid, switch to default branch to avoid slow DFS.
+			cli := adapter.New(domain)
+			// removed log.Printf diagnostics
+			if strings.TrimSpace(t.Ref) != "" {
+				if err := cli.ValidateRef(ctx, token, owner, name, ref); err != nil {
+					if def, derr := cli.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
+						ref = def
+					}
+				}
+			}
+			treeSha, err := cli.GetCommitTreeSHA(ctx, token, owner, name, ref)
+			if err != nil {
+				// If commit resolution fails on GHE (e.g., 422), fallback to a contents-based recursive walk.
+				// removed log.Printf diagnostics
+				walker := s.makeContentAPI(domain)
+				startPath := strings.Trim(strings.TrimPrefix(in.Path, "/"), "/")
+				// removed log.Printf diagnostics
+				// Simple DFS over directories using Contents API
+				var out ListRepoOutput
+				var stack = []string{startPath}
+				visited := map[string]bool{}
+				for len(stack) > 0 {
+					n := len(stack) - 1
+					dir := stack[n]
+					stack = stack[:n]
+					if visited[dir] {
+						continue
+					}
+					visited[dir] = true
+					items, werr := walker.ListContents(ctx, token, owner, name, dir, ref)
+					if werr != nil {
+						// Retry with default branch if available
+						if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
+							items, werr = walker.ListContents(ctx, token, owner, name, dir, def)
+							if werr == nil {
+								ref = def
+							}
+						}
+						if werr != nil {
+							return nil, werr
+						}
+					}
+					for _, it := range items {
+						// We need full paths; filter by include/exclude only
+						if it.Type == "dir" {
+							stack = append(stack, strings.Trim(strings.TrimPrefix(it.Path, "/"), "/"))
+						}
+						if !passIncludeExclude(it.Path, in.Include, in.Exclude) {
+							continue
+						}
+						out.Paths = append(out.Paths, it.Path)
+					}
+				}
+				out.Ref = ref
+				return &out, nil
+			}
+			// Determine if this is a root request (full-tree). If so, try cache by domain/owner/repo.
+			startPath := strings.TrimPrefix(in.Path, "/")
+			prefix := strings.Trim(startPath, "/")
+
+			var entries []adapter.TreeEntry
+			// Always allow using/storing the full-root tree cache per repo, even when a subpath
+			// is requested. We fetch the full tree once and filter in-memory for subpaths.
+			useCache := true
+			cacheKey := ""
+			if useCache {
+				nsCache, _ := s.auth.Namespace(ctx)
+				if nsCache == "" {
+					nsCache = "default"
+				}
+				cacheKey = s.repoKey(nsCache, domain, owner, name)
+				s.treeMu.RLock()
+				cached, ok := s.treeCache[cacheKey]
+				s.treeMu.RUnlock()
+				if ok {
+					if time.Now().Before(cached.expireAt) && len(cached.entries) > 0 {
+						entries = cached.entries
+					} else {
+						// Expired entry: purge eagerly (best-effort)
+						s.treeMu.Lock()
+						delete(s.treeCache, cacheKey)
+						s.treeMu.Unlock()
+					}
+				}
+			}
+			// Miss or not using cache: fetch
+			if entries == nil {
+				fetched, truncated, err := cli.GetTreeRecursive(ctx, token, owner, name, treeSha)
+				if err != nil {
+					return nil, err
+				}
+				if truncated {
+					return nil, fmt.Errorf("tree listing truncated by API; narrow path or use non-recursive mode")
+				}
+				entries = fetched
+				if useCache {
+					s.treeMu.Lock()
+					s.treeCache[cacheKey] = treeCacheEntry{
+						entries:  append([]adapter.TreeEntry(nil), entries...),
+						expireAt: time.Now().Add(30 * time.Minute),
+					}
+					s.treeMu.Unlock()
+				}
+			}
+			// Filter by path prefix
+			include := in.Include
+			exclude := in.Exclude
+			var collected []string
+			for _, e := range entries {
+				if prefix != "" && !strings.HasPrefix(e.Path, prefix+"/") && e.Path != prefix {
+					continue
+				}
+				if !passIncludeExclude(e.Path, include, exclude) {
+					continue
+				}
+				typ := e.Type
+				if typ == "tree" {
+					typ = "dir"
+				} else if typ == "blob" {
+					typ = "file"
+				}
+				// Include files only for tree listing
+				if typ == "file" {
+					collected = append(collected, e.Path)
+				}
+			}
+			return &ListRepoOutput{Ref: ref, Paths: collected}, nil
+		}
+
+		// Non-recursive: single directory via contents API
+		cli := s.makeContentAPI(domain)
+		startPath := strings.TrimPrefix(in.Path, "/")
+		useRef := s.effectiveRef(ctx, domain, owner, name, in.Ref, token)
+		// removed log.Printf diagnostics
+		items, err := cli.ListContents(ctx, token, owner, name, startPath, useRef)
+		if err != nil {
+			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil {
+				items, err = cli.ListContents(ctx, token, owner, name, startPath, def)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		include := in.Include
+		exclude := in.Exclude
+		var collected []string
+		for _, v := range items {
+			if !passIncludeExclude(v.Path, include, exclude) {
+				continue
+			}
+			collected = append(collected, v.Path)
+		}
+		return &ListRepoOutput{Ref: useRef, Paths: collected}, nil
+	})
+}
+
+func pathBase(p string) string {
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+func passIncludeExclude(path string, include, exclude []string) bool {
+	// Exclude wins
+	for _, pat := range exclude {
+		if globMatch(pat, path) || globMatch(pat, pathBase(path)) {
+			return false
+		}
+	}
+	if len(include) == 0 {
+		return true
+	}
+	for _, pat := range include {
+		if globMatch(pat, path) || globMatch(pat, pathBase(path)) {
+			return true
+		}
+	}
+	return false
+}
+
+func globMatch(pattern, name string) bool {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return false
+	}
+	// Convert ** to a simple contains check when present (coarse but effective for our use)
+	if strings.Contains(pattern, "**/") {
+		// Remove **/ and fallback to path suffix match
+		p := strings.ReplaceAll(pattern, "**/", "")
+		return simplePathMatch(p, name)
+	}
+	return simplePathMatch(pattern, name)
+}
+
+func simplePathMatch(pattern, name string) bool {
+	// Very basic glob: *.ext and prefix/* patterns
+	pattern = strings.ToLower(pattern)
+	n := strings.ToLower(name)
+	if strings.HasPrefix(pattern, "*") && strings.Count(pattern, "*") == 1 && strings.HasPrefix(pattern, "*.") {
+		// *.ext
+		suf := strings.TrimPrefix(pattern, "*")
+		return strings.HasSuffix(n, suf)
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		pre := strings.TrimSuffix(pattern, "/*")
+		return strings.HasPrefix(n, pre+"/")
+	}
+	// Fallback contains or exact
+	if strings.Contains(pattern, "*") {
+		// crude * handling: replace * with empty and check contains of the remainder
+		p := strings.ReplaceAll(pattern, "*", "")
+		return strings.Contains(n, p)
+	}
+	return n == pattern || strings.HasSuffix(n, "/"+pattern) || strings.HasPrefix(n, pattern+"/")
+}
+
+// scanZipContent walks the given snapshot zip and returns sets of paths that matched include content patterns
+// and those that matched exclude content patterns. Paths are repo-relative (no top-level zip folder).
+func (s *Service) scanZipContent(zipPath string, candidates map[string]bool, include, exclude []string, caseInsensitive, skipBinary bool, maxSize int64) (map[string]bool, map[string]bool) {
+	matched := map[string]bool{}
+	excluded := map[string]bool{}
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return matched, excluded
+	}
+	defer zr.Close()
+	lower := func(b []byte) []byte {
+		if caseInsensitive {
+			return bytes.ToLower(b)
+		}
+		return b
+	}
+	toLower := func(s string) string {
+		if caseInsensitive {
+			return strings.ToLower(s)
+		}
+		return s
+	}
+	// Preprocess include/exclude patterns for content search
+	incl := make([]string, 0, len(include))
+	excl := make([]string, 0, len(exclude))
+	for _, p := range include {
+		if strings.TrimSpace(p) != "" {
+			incl = append(incl, toLower(p))
+		}
+	}
+	for _, p := range exclude {
+		if strings.TrimSpace(p) != "" {
+			excl = append(excl, toLower(p))
+		}
+	}
+
+	for _, f := range zr.File {
+		name := f.Name
+		// Strip top-level folder: owner-repo-sha/...
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			continue
+		}
+		if !candidates[name] {
+			continue
+		}
+		// Enforce size cap
+		if maxSize > 0 && f.UncompressedSize64 > uint64(maxSize) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		// Read up to maxSize bytes
+		var buf bytes.Buffer
+		if maxSize > 0 {
+			_, _ = io.CopyN(&buf, rc, maxSize)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		_ = rc.Close()
+		data := buf.Bytes()
+		// Binary skip check
+		if skipBinary && !isProbablyText(data) {
+			continue
+		}
+		content := lower(data)
+		// Exclude on content first
+		for _, p := range excl {
+			if p != "" && bytes.Contains(content, []byte(p)) {
+				excluded[name] = true
+				break
+			}
+		}
+		if excluded[name] {
+			continue
+		}
+		// Include on content
+		if len(incl) == 0 {
+			// No include constraints: nothing to mark
+			continue
+		}
+		for _, p := range incl {
+			if p != "" && bytes.Contains(content, []byte(p)) {
+				matched[name] = true
+				break
+			}
+		}
+	}
+	return matched, excluded
+}
+
+// scanZipFind filters candidates by checking whether file content matches the query.
+// Query supports two forms:
+// - substring (default): any non-empty string not delimited by '/'
+// - regex: /pattern/ (RE2). Inline flags like (?i) are supported by RE2.
+func (s *Service) scanZipFind(zipPath string, candidates map[string]bool, query string, skipBinary bool, maxSize int64, ci bool) map[string]bool {
+	out := map[string]bool{}
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return out
+	}
+	defer zr.Close()
+	// Support /pattern/ or /pattern/flags where flags may include 'i'
+	isRegex, pat, flags := parseDelimitedRegex(query)
+	var re *regexp.Regexp
+	if isRegex {
+		if strings.Contains(flags, "i") {
+			pat = "(?i)" + pat
+		}
+		var err error
+		re, err = regexp.Compile(pat)
+		if err != nil {
+			return out
+		}
+	} else {
+		pat = strings.TrimSpace(query)
+	}
+	patBytes := []byte(pat)
+	var patLower []byte
+	if !isRegex && ci {
+		patLower = bytes.ToLower(patBytes)
+	}
+	for _, f := range zr.File {
+		name := f.Name
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			continue
+		}
+		if !candidates[name] {
+			continue
+		}
+		if maxSize > 0 && f.UncompressedSize64 > uint64(maxSize) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if maxSize > 0 {
+			_, _ = io.CopyN(&buf, rc, maxSize)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		_ = rc.Close()
+		data := buf.Bytes()
+		if skipBinary && !isProbablyText(data) {
+			continue
+		}
+		if isRegex {
+			if re.Match(data) {
+				out[name] = true
+			}
+		} else {
+			if ci {
+				if bytes.Contains(bytes.ToLower(data), patLower) {
+					out[name] = true
+				}
+			} else {
+				if bytes.Contains(data, patBytes) {
+					out[name] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// scanZipFindFromBytes is a variant that scans a snapshot zip already loaded in memory.
+func (s *Service) scanZipFindFromBytes(data []byte, candidates map[string]bool, query string, skipBinary bool, maxSize int64, ci bool) map[string]bool {
+	out := map[string]bool{}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return out
+	}
+	// Support /pattern/ or /pattern/flags where flags may include 'i'
+	isRegex, pat, flags := parseDelimitedRegex(query)
+	var re *regexp.Regexp
+	if isRegex {
+		if strings.Contains(flags, "i") {
+			pat = "(?i)" + pat
+		}
+		var err error
+		re, err = regexp.Compile(pat)
+		if err != nil {
+			return out
+		}
+	} else {
+		pat = strings.TrimSpace(query)
+	}
+	patBytes := []byte(pat)
+	var patLower []byte
+	if !isRegex && ci {
+		patLower = bytes.ToLower(patBytes)
+	}
+	for _, f := range zr.File {
+		name := f.Name
+		if i := strings.IndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		if name == "" || strings.HasSuffix(name, "/") {
+			continue
+		}
+		if !candidates[name] {
+			continue
+		}
+		if maxSize > 0 && f.UncompressedSize64 > uint64(maxSize) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		var buf bytes.Buffer
+		if maxSize > 0 {
+			_, _ = io.CopyN(&buf, rc, maxSize)
+		} else {
+			_, _ = io.Copy(&buf, rc)
+		}
+		_ = rc.Close()
+		b := buf.Bytes()
+		if skipBinary && !isProbablyText(b) {
+			continue
+		}
+		if isRegex {
+			if re.Match(b) {
+				out[name] = true
+			}
+		} else {
+			if ci {
+				if bytes.Contains(bytes.ToLower(b), patLower) {
+					out[name] = true
+				}
+			} else {
+				if bytes.Contains(b, patBytes) {
+					out[name] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// buildContentSets unions include and exclude matches across multiple patterns.
+func (s *Service) buildContentSets(zipPath string, candidates map[string]bool, includes, excludes []string, skipBinary bool, maxSize int64, ci bool) (map[string]bool, map[string]bool) {
+	var inc map[string]bool
+	var exc map[string]bool
+	for _, q := range includes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFind(zipPath, candidates, q, skipBinary, maxSize, ci)
+		if inc == nil {
+			inc = map[string]bool{}
+		}
+		for k := range m {
+			inc[k] = true
+		}
+	}
+	for _, q := range excludes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFind(zipPath, candidates, q, skipBinary, maxSize, ci)
+		if exc == nil {
+			exc = map[string]bool{}
+		}
+		for k := range m {
+			exc[k] = true
+		}
+	}
+	return inc, exc
+}
+
+// buildContentSetsFromBytes versions of content sets based on an in-memory snapshot.
+func (s *Service) buildContentSetsFromBytes(data []byte, candidates map[string]bool, includes, excludes []string, skipBinary bool, maxSize int64, ci bool) (map[string]bool, map[string]bool) {
+	var inc map[string]bool
+	var exc map[string]bool
+	for _, q := range includes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFindFromBytes(data, candidates, q, skipBinary, maxSize, ci)
+		if inc == nil {
+			inc = map[string]bool{}
+		}
+		for k := range m {
+			inc[k] = true
+		}
+	}
+	for _, q := range excludes {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		m := s.scanZipFindFromBytes(data, candidates, q, skipBinary, maxSize, ci)
+		if exc == nil {
+			exc = map[string]bool{}
+		}
+		for k := range m {
+			exc[k] = true
+		}
+	}
+	return inc, exc
+}
+
+// filterContentPatterns trims patterns and drops empty entries so accidental blanks don't trigger snapshot work.
+func filterContentPatterns(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, 0, len(in))
+	for _, q := range in {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		out = append(out, q)
+	}
+	return out
+}
+
+// DownloadRepoFile fetches raw bytes of a file at path and ref.
+func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, prompt func(string)) (*DownloadOutput, error) {
+	if in == nil {
+		return nil, fmt.Errorf("input is nil")
+	}
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo, Ref: in.Ref}
+	domain, owner, name, ref, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := s.makeContentAPI(domain)
+	data, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]byte, error) {
+		// Resolve ref to default if empty using authenticated call
+		useRef := s.effectiveRef(ctx, domain, owner, name, ref, token)
+		// If a specific ref was provided and appears invalid/inaccessible, fall back to the default branch.
+		if strings.TrimSpace(ref) != "" {
+			cliRef := adapter.New(domain)
+			if vErr := cliRef.ValidateRef(ctx, token, owner, name, useRef); vErr != nil {
+				if def, derr := cliRef.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
+					// debug logs removed
+					useRef = def
+				}
+			}
+		}
+		// removed log.Printf diagnostics
+		p := strings.TrimPrefix(in.Path, "/")
+		// First try contents API
+		if data, err := cli.GetFileContent(ctx, token, owner, name, p, useRef); err == nil {
+			return data, nil
+		}
+		// removed log.Printf diagnostics
+		// Fallback: list parent directory via contents on default branch to obtain file SHA, then fetch blob by SHA
+		parent := p
+		if idx := strings.LastIndex(parent, "/"); idx >= 0 {
+			parent = parent[:idx]
+		} else {
+			parent = ""
+		}
+		def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name)
+		if derr != nil {
+			return nil, derr
+		}
+		items, err := cli.ListContents(ctx, token, owner, name, parent, def)
+		if err != nil {
+			return nil, err
+		}
+		var sha string
+		for _, it := range items {
+			if it.Path == p && it.Sha != "" {
+				sha = it.Sha
+				break
+			}
+		}
+		if sha == "" {
+			return nil, fmt.Errorf("get content failed: %s", "sha not found in parent listing on default branch")
+		}
+		return adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Auto-detect text vs binary. Populate only one of Text or Content.
+	if isProbablyText(data) {
+		out := &DownloadOutput{Text: string(data)}
+		// Optional sed preview/transform using Go.Sed
+		if len(in.SedScripts) > 0 {
+			maxEdits := in.MaxEditsPerFile
+			if maxEdits <= 0 && s.sedMaxEdits > 0 {
+				maxEdits = s.sedMaxEdits
+			}
+			diffCap := s.sedDiffBytes
+			if diffCap <= 0 {
+				diffCap = 8192
+			}
+			edits, diff := applySedPreview(out.Text, in.SedScripts, maxEdits, diffCap)
+			out.SedPreview = &SedResult{Edits: edits, Diff: diff}
+			if edits > 0 {
+				updated := applySedTransform(out.Text, in.SedScripts)
+				out.TransformedText = updated
+				if in.ApplySedToOutput {
+					out.Text = updated
+					out.TransformedText = ""
+				}
+			}
+		}
+		return out, nil
+	}
+	return &DownloadOutput{Content: data}, nil
+}
+
+// isProbablyText reports whether b looks like UTF-8 text with a low ratio of control characters.
+func isProbablyText(b []byte) bool {
+	if len(b) == 0 {
+		return true
+	}
+	// Treat as text if valid UTF-8 and contains no NUL bytes and few non-printable runes.
+	if !utf8.Valid(b) {
+		return false
+	}
+	// Sample up to first 4KB to keep it cheap.
+	sample := b
+	if len(sample) > 4096 {
+		sample = sample[:4096]
+	}
+	// Count control runes excluding common whitespace (tab, newline, carriage return).
+	var control, total int
+	for len(sample) > 0 {
+		r, size := utf8.DecodeRune(sample)
+		sample = sample[size:]
+		total++
+		if r == '\n' || r == '\r' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			control++
+			if control > 8 { // a few control chars allowed; above that assume binary
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Service) normalizeAlias(a string) string { return a }

@@ -11,15 +11,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/viant/jsonrpc"
 	protoclient "github.com/viant/mcp-protocol/client"
+
+	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	oa "github.com/viant/mcp-toolbox/auth"
 	"github.com/viant/mcp-toolbox/outlook/graph"
+	nsprov "github.com/viant/mcp/server/namespace"
 	"github.com/viant/scy"
 	"github.com/viant/scy/cred"
-	"sync"
 )
 
 // Service wires graph manager and optional UI/secret helpers.
@@ -30,6 +31,7 @@ type Service struct {
 	useText     bool
 	pending     *PendingAuths
 	auth        *oa.Service
+	ns          *nsprov.DefaultProvider
 	azure       *cred.Azure
 	tenantID    string
 	clientID    string
@@ -71,7 +73,7 @@ func NewService(cfg *Config) *Service {
 	tenantID := cfg.TenantID
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
-	return &Service{
+	s := &Service{
 		graphMgr:       graph.NewManager(clientID, cfg.SecretsBase),
 		baseURL:        cfg.CallbackBaseURL,
 		useText:        useText,
@@ -85,6 +87,8 @@ func NewService(cfg *Config) *Service {
 		elicited:       map[string]time.Time{},
 		elicitedGlobal: map[string]time.Time{},
 	}
+	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
+	return s
 }
 
 func (s *Service) RegisterHTTP(mux *http.ServeMux) {
@@ -93,6 +97,9 @@ func (s *Service) RegisterHTTP(mux *http.ServeMux) {
 	// List/clear pending endpoints
 	mux.HandleFunc("/outlook/auth/pending", s.PendingListHandler())
 	mux.HandleFunc("/outlook/auth/pending/clear", s.PendingClearHandler())
+	// Start/check endpoints to align with GitHub-style OOB
+	mux.HandleFunc("/outlook/auth/start", s.DeviceStartHandler())
+	mux.HandleFunc("/outlook/auth/check", s.DeviceCheckHandler())
 }
 
 // DeviceHandler serves the device login page for a pending auth UUID.
@@ -179,6 +186,56 @@ func buildWaitingForDeviceHTML() string {
 </body></html>`, url)
 }
 
+// DeviceStartHandler starts device login for alias and returns a uuid and OOB URL.
+func (s *Service) DeviceStartHandler() http.HandlerFunc {
+	type out struct{ UUID, OOBUrl string }
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		alias := r.URL.Query().Get("alias")
+		tenant := r.URL.Query().Get("tenant")
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		d, _ := s.ns.Namespace(r.Context())
+		ns := d.Name
+		if ns == "" {
+			ns = "default"
+		}
+		id := newUUID()
+		s.pending.Put(&PendingAuth{UUID: id, Alias: alias, TenantID: tenant, Namespace: ns, done: make(chan struct{}, 1)})
+		// Start device flow in background; when token acquired, PendingAuth will be removed by Manager.
+		s.graphMgr.StartDeviceLogin(r.Context(), alias, tenant, graph.DefaultScopes(), func() { s.pending.Complete(id) })
+		base := strings.TrimRight(s.baseURL, "/")
+		oob := fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, id, alias)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out{UUID: id, OOBUrl: oob})
+	}
+}
+
+// DeviceCheckHandler returns whether a credential is available for alias/tenant in current namespace.
+func (s *Service) DeviceCheckHandler() http.HandlerFunc {
+	type out struct{ HasToken bool }
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		alias := r.URL.Query().Get("alias")
+		tenant := r.URL.Query().Get("tenant")
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		has := !s.graphMgr.NeedsInteractive(r.Context(), alias, tenant, graph.DefaultScopes())
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out{HasToken: has})
+	}
+}
+
 // PendingListHandler returns JSON of pending auths for a namespace.
 func (s *Service) PendingListHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -188,8 +245,8 @@ func (s *Service) PendingListHandler() http.HandlerFunc {
 		}
 		ns := r.URL.Query().Get("namespace")
 		if ns == "" {
-			if v, err := s.auth.Namespace(r.Context()); err == nil {
-				ns = v
+			if d, err := s.ns.Namespace(r.Context()); err == nil {
+				ns = d.Name
 			}
 		}
 		if ns == "" {
@@ -216,8 +273,8 @@ func (s *Service) PendingClearHandler() http.HandlerFunc {
 		}
 		ns := r.URL.Query().Get("namespace")
 		if ns == "" {
-			if v, err := s.auth.Namespace(r.Context()); err == nil {
-				ns = v
+			if d, err := s.ns.Namespace(r.Context()); err == nil {
+				ns = d.Name
 			}
 		}
 		if ns == "" {
@@ -245,7 +302,8 @@ func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
 // Credential returns an azidentity.DeviceCodeCredential cached per account alias.
 // It delegates acquisition to the graph manager on cache miss and stores it until process restart.
 func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
-	ns, _ := s.auth.Namespace(ctx)
+	dsc, _ := s.ns.Namespace(ctx)
+	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
@@ -279,13 +337,8 @@ func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes
 
 // sessionOrNamespace prefers transport session id else auth namespace
 func (s *Service) sessionOrNamespace(ctx context.Context) string {
-	if v := ctx.Value(jsonrpc.SessionKey); v != nil {
-		if id, ok := v.(string); ok && id != "" {
-			return id
-		}
-	}
-	if v, err := s.auth.Namespace(ctx); err == nil && v != "" {
-		return v
+	if d, err := s.ns.Namespace(ctx); err == nil && d.Name != "" {
+		return d.Name
 	}
 	return "default"
 }

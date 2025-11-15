@@ -29,6 +29,10 @@ The goal of this project is to make it straightforward to expose common develope
   - Binary: `outlook/cmd/outlook-mcp`
   - Service + tools: `outlook/mcp`, `outlook/service`, `outlook/graph`
 
+- Slack MCP
+  - Binary: `slack/cmd/slack-mcp`
+  - Service + tools: `slack/mcp`, `slack/service`
+
 - Shared
   - Auth helper: `auth` (derives caller namespace from JWT in context)
 
@@ -93,16 +97,37 @@ go run ./outlook/cmd/outlook-mcp -addr :7788 --secretsBase mem://localhost/mcp-o
 
 For more on Outlook configuration, see `outlook/mcp/README.md`.
 
+### Slack MCP
+
+Runs an MCP server that calls Slack Web API with a bot token. No end‑user OAuth is required when acting as an agent client.
+
+Run:
+
+```
+go run ./slack/cmd/slack-mcp \
+  -a :7791 \
+  --secretsBase mem://localhost/mcp-slack \
+  --token-ref "file://~/.secret/slack-bot-token|blowfish://default"
+```
+
+Tools:
+- `slackListChannels` – lists channels with pagination.
+- `slackPostMessage` – posts text or Block Kit JSON to a channel or thread.
+
+Secrets:
+- `--token-ref` loads a bot token via scy EncodedResource (plain string or `{token:"xoxb-..."}`).
+- You can also store per‑alias secrets at `<secretsBase>/slack/<namespace>/<alias>/token` (any AFS/scy URL). Per‑alias secrets take precedence over `--token-ref`.
+
 ## Configuration
 
 Both servers derive a public callback base URL from `-addr` automatically (e.g., `http://localhost:7789`). You can override this with `--public-base-url` to use a non-localhost host (useful behind proxies or in-cluster services), for example `--public-base-url http://mcp-toolbox-github.agently.svc.cluster.local:7789`.
 Storage directories default to a subfolder in the user config directory.
 
 - GitHub
-  - Flags: `-addr`, `--public-base-url`, `-client-id`, `-storage`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
-  - Env (optional):
-    - `GITHUB_MCP_WAIT_SECS`: max wait for credentials (default 300s)
-    - `GITHUB_MCP_ELICIT_COOLDOWN_SECS`: cooldown between repeated credential prompts (default 60s)
+  - Flags: `-addr`, `--public-base-url`, `-client-id`, `-storage`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`, `--wait-secs`, `--elicit-cooldown-secs`
+  - Notes:
+    - `--wait-secs`: max wait for credentials during calls (default 300)
+    - `--elicit-cooldown-secs`: cooldown between repeated credential prompts per namespace+alias+domain (default 60)
 
 - Outlook
   - Flags: `-addr`, `--public-base-url`, `-client-id`, `-tenant-id`, `-azure-ref`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`

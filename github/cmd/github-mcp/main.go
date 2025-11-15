@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	ghservice "github.com/viant/mcp-toolbox/github/service"
 	mcpsrv "github.com/viant/mcp/server"
 	serverauth "github.com/viant/mcp/server/auth"
+	nsprov "github.com/viant/mcp/server/namespace"
+	oob "github.com/viant/mcp/server/oob"
 	"github.com/viant/scy"
 	"github.com/viant/scy/cred"
 	_ "github.com/viant/scy/kms/blowfish"
@@ -34,6 +37,8 @@ type Options struct {
 	SnapshotCleanHours int    `long:"snapshot-clean-hours" description:"Remove shared snapshot zips older than this many hours before each new download (default 12)"`
 	SedDiffBytes       int    `long:"sed-diff-bytes" description:"Max unified diff bytes for sed previews (default uses previewBytes for findFilesPreview; 8192 for download)"`
 	SedMaxEditsPerFile int    `long:"sed-max-edits" description:"Default max sed edits per file when input omits it (0 = unlimited)"`
+	WaitSecs           int    `long:"wait-secs" description:"Max seconds to wait for credentials during calls (default 300)" default:"300"`
+	ElicitCooldownSecs int    `long:"elicit-cooldown-secs" description:"Cooldown seconds between repeated OOB prompts per ns+alias+domain (default 60)" default:"60"`
 }
 
 func main() {
@@ -58,9 +63,41 @@ func main() {
 			baseURL = "http://" + hostport
 		}
 	}
-	svc := ghservice.NewService(&ghservice.Config{ClientID: opts.ClientID, StorageDir: opts.Storage, SecretsBase: opts.SecretsBase, CallbackBaseURL: baseURL, SnapshotSharedCleanupHours: opts.SnapshotCleanHours, SedDiffBytes: opts.SedDiffBytes, SedMaxEditsPerFile: opts.SedMaxEditsPerFile})
+	svc := ghservice.NewService(&ghservice.Config{
+		ClientID:                   opts.ClientID,
+		StorageDir:                 opts.Storage,
+		SecretsBase:                opts.SecretsBase,
+		CallbackBaseURL:            baseURL,
+		SnapshotSharedCleanupHours: opts.SnapshotCleanHours,
+		SedDiffBytes:               opts.SedDiffBytes,
+		SedMaxEditsPerFile:         opts.SedMaxEditsPerFile,
+		WaitTimeoutSeconds:         opts.WaitSecs,
+		ElicitCooldownSeconds:      opts.ElicitCooldownSecs,
+	})
+
+	// Wire an OOB manager so prompts and pending UUIDs are consistently namespaced across tools.
+	provider := nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}})
+	store := oob.NewMemoryStore[ghservice.AuthOOBData]()
+	cb := func(id string) string { return strings.TrimRight(baseURL, "/") + "/github/auth/oob?uuid=" + id }
+	manager := &oob.Manager[ghservice.AuthOOBData]{Provider: provider, Store: store, CallbackBuilder: cb}
+	svc.SetOOBManager(manager)
 
 	// Base server options
+	// Build HTTP handlers, wrapping sensitive endpoints with OOB namespace remapping using the pending uuid.
+	extractUUID := func(r *http.Request) (string, error) { return r.URL.Query().Get("uuid"), nil }
+	tokenHandler := oob.NamespaceFromPending(manager.Store, extractUUID, func(ctx context.Context, _ oob.Pending[ghservice.AuthOOBData], w http.ResponseWriter, r *http.Request) error {
+		svc.TokenIngestHandler().ServeHTTP(w, r.WithContext(ctx))
+		return nil
+	})
+	checkHandler := oob.NamespaceFromPending(manager.Store, extractUUID, func(ctx context.Context, _ oob.Pending[ghservice.AuthOOBData], w http.ResponseWriter, r *http.Request) error {
+		svc.TokenCheckHandler().ServeHTTP(w, r.WithContext(ctx))
+		return nil
+	})
+	verifyHandler := oob.NamespaceFromPending(manager.Store, extractUUID, func(ctx context.Context, _ oob.Pending[ghservice.AuthOOBData], w http.ResponseWriter, r *http.Request) error {
+		svc.VerifyHandler().ServeHTTP(w, r.WithContext(ctx))
+		return nil
+	})
+
 	options := []mcpsrv.Option{
 		mcpsrv.WithImplementation(schema.Implementation{Name: "github-mcp", Version: "0.1.0"}),
 		mcpsrv.WithNewHandler(ghmcp.NewHandler(svc)),
@@ -70,11 +107,21 @@ func main() {
 		mcpsrv.WithCustomHTTPHandler("/github/auth/device/", svc.DeviceHandler()),
 		mcpsrv.WithCustomHTTPHandler("/github/auth/pending", svc.PendingListHandler()),
 		mcpsrv.WithCustomHTTPHandler("/github/auth/pending/clear", svc.PendingClearHandler()),
-		mcpsrv.WithCustomHTTPHandler("/github/auth/token", svc.TokenIngestHandler()),
+		mcpsrv.WithCustomHTTPHandler("/github/auth/token", func(w http.ResponseWriter, r *http.Request) { tokenHandler.ServeHTTP(w, r) }),
 		mcpsrv.WithCustomHTTPHandler("/github/auth/start", svc.DeviceStartHandler()),
-		mcpsrv.WithCustomHTTPHandler("/github/auth/check", svc.TokenCheckHandler()),
-		mcpsrv.WithCustomHTTPHandler("/github/auth/oob", svc.OOBHandler()),
-		mcpsrv.WithCustomHTTPHandler("/github/auth/verify", svc.VerifyHandler()),
+		mcpsrv.WithCustomHTTPHandler("/github/auth/check", func(w http.ResponseWriter, r *http.Request) { checkHandler.ServeHTTP(w, r) }),
+		mcpsrv.WithCustomHTTPHandler("/github/auth/oob", func(w http.ResponseWriter, r *http.Request) {
+			if id := r.URL.Query().Get("uuid"); strings.TrimSpace(id) != "" {
+				oob.NamespaceFromPending(manager.Store, extractUUID, func(ctx context.Context, p oob.Pending[ghservice.AuthOOBData], w http.ResponseWriter, r *http.Request) error {
+					svc.OOBHandler().ServeHTTP(w, r.WithContext(ctx))
+					return nil
+				}).ServeHTTP(w, r)
+				return
+			}
+			// No uuid: serve page without ns remap; token saves will still succeed into current/default ns.
+			svc.OOBHandler().ServeHTTP(w, r)
+		}),
+		mcpsrv.WithCustomHTTPHandler("/github/auth/verify", func(w http.ResponseWriter, r *http.Request) { verifyHandler.ServeHTTP(w, r) }),
 	}
 
 	// Optional: enable server-level OAuth2 via config

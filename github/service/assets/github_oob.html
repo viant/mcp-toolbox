@@ -1,0 +1,218 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitHub Authorization</title>
+  <style>
+    :root { --bg:#f3f4f6; --card:#ffffff; --muted:#6b7280; --fg:#111827; --primary:#dc4b43; --primary-600:#c0392b; --ring:#e5e7eb; }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:var(--bg); color:var(--fg); display:flex; align-items:center; justify-content:center; padding:24px}
+    .card{width:100%; max-width:640px; background:var(--card); border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,.08); overflow:hidden; border:1px solid var(--ring)}
+    .header{padding:28px 28px 0}
+    .brand{display:flex; align-items:center; gap:10px; color:var(--primary); font-weight:800; letter-spacing:.08em}
+    .brand svg{height:22px}
+    .title{margin:12px 0 6px; font-size:22px; font-weight:700}
+    .subtitle{margin:0; color:var(--muted); font-size:14px}
+    .body{padding:24px 28px 28px}
+    .stack{display:flex; flex-direction:column; gap:12px; margin-bottom:16px}
+    label{display:block; font-weight:600; margin-bottom:6px}
+    input{width:100%; padding:12px 14px; border:1px solid var(--ring); border-radius:10px; font-size:15px; outline:none}
+    input:focus{border-color:var(--primary); box-shadow:0 0 0 3px rgba(220,75,67,.15)}
+    .hint{font-size:12px; color:var(--muted); margin-top:4px}
+    #status.error{color:#b91c1c}
+    input.error{border-color:#dc2626 !important; box-shadow:0 0 0 3px rgba(220,38,38,.15) !important}
+    .tabs{display:flex; gap:8px; margin:10px 0 18px}
+    .tab{flex:0 0 auto; padding:8px 12px; border:1px solid var(--ring); border-radius:999px; cursor:pointer; font-size:13px; color:#374151; background:#fafafa}
+    .tab.active{background:var(--primary); color:#fff; border-color:var(--primary)}
+    .section{display:none}
+    .section.active{display:block}
+    .actions{display:flex; gap:10px; margin-top:18px}
+    .btn{appearance:none; border:none; cursor:pointer; border-radius:10px; padding:10px 14px; font-size:15px}
+    .btn.primary{background:var(--primary); color:#fff}
+    .btn.primary:hover{background:var(--primary-600)}
+    .btn.secondary{background:#f9fafb; border:1px solid var(--ring)}
+    .device-hint{background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:10px 12px; border-radius:8px; font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="brand">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 2L20 5V12C20 16.97 16.42 21.43 12 22C7.58 21.43 4 16.97 4 12V5L12 2Z" stroke="currentColor" stroke-width="1.5"/></svg>
+        MCP Toolbox · GitHub
+      </div>
+      <h1 class="title">Authorize GitHub Access</h1>
+      <p class="subtitle">Provide credentials for alias <strong>{{ALIAS}}</strong> on <strong>{{DOMAIN}}</strong>.</p>
+    </div>
+    <div class="body">
+      <div class="stack">
+        <div>
+          <label for="alias">Alias</label>
+          <input id="alias" value="{{ALIAS}}" placeholder="e.g. personal" />
+        </div>
+        <div>
+          <label for="domain">Domain</label>
+          <input id="domain" value="{{DOMAIN}}" placeholder="github.com or enterprise host" />
+        </div>
+        <div>
+          <label for="repourl">Optional Repo URL</label>
+          <input id="repourl" value="{{REPOURL}}" placeholder="github.com/owner/repo (verifies access)" />
+          <div class="hint">If provided, we’ll validate that your token can access this repository.</div>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button class="tab" data-tab="bearer">Paste Token</button>
+        <button class="tab active" data-tab="basic">User + Token</button>
+        <button class="tab" data-tab="device">Device Login</button>
+      </div>
+
+      <div id="sec-bearer" class="section">
+        <label for="bearer">Token</label>
+        <input id="bearer" placeholder="ghp_... (personal or fine-grained)" />
+        <div class="hint">Your token is stored locally and scoped to your session namespace.</div>
+      </div>
+
+      <div id="sec-basic" class="section active">
+        <div class="stack">
+          <div>
+            <label for="user">Username</label>
+            <input id="user" placeholder="your GitHub username" />
+          </div>
+          <div>
+            <label for="pass">Token or Password</label>
+            <input id="pass" type="password" placeholder="personal access token (recommended)" />
+          </div>
+        </div>
+        <div class="hint">For GitHub, a personal access token works as a password in Basic auth.</div>
+      </div>
+
+      <div id="sec-device" class="section">
+        <div class="device-hint" id="deviceInfo">{{DEVICE}}</div>
+        <div class="hint">Device login opens GitHub in a new tab to complete sign-in.</div>
+      </div>
+
+      <div class="actions">
+        <button class="btn primary" onclick="onOK()">OK</button>
+        <button class="btn secondary" onclick="onCancel()">Cancel</button>
+      </div>
+      <div id="status" class="hint"></div>
+      <div id="sso" class="device-hint" style="display:none;margin-top:8px"></div>
+      <div style="margin-top:12px" class="hint">We only request the minimum necessary scopes for read/write operations you invoke. We never store your password; tokens are kept locally for this session.</div>
+    </div>
+  </div>
+
+<script>
+document.querySelectorAll('.tab').forEach(el => el.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  const tab = el.getAttribute('data-tab');
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById('sec-' + tab).classList.add('active');
+  // clear previous error highlights when switching methods
+  document.getElementById('status').classList.remove('error');
+  ['bearer','user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.remove('error')});
+}));
+async function pollCheck(alias, domain) {
+  const url = '{{BASE}}/github/auth/check?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}';
+  for (let i=0; i<60; i++) { // ~60 * 2s = 2 minutes
+    const r = await fetch(url);
+    const j = await r.json();
+    if (j.hasToken) return true;
+    await new Promise(rs => setTimeout(rs, 2000));
+  }
+  return false;
+}
+async function startDevice() {
+  const alias = document.getElementById('alias').value.trim();
+  const domain = document.getElementById('domain').value.trim();
+  const el = document.getElementById('deviceInfo'); el.textContent = 'Starting device flow...';
+  const r = await fetch('{{BASE}}/github/auth/start?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||''), { method:'POST' });
+  if (!r.ok) { el.textContent = 'Start error: ' + r.status; return }
+  const j = await r.json();
+  el.innerHTML = 'Open <a href="' + j.VerifyURL + '" target="_blank" rel="noopener">' + j.VerifyURL + '</a> and enter code <code>' + j.UserCode + '</code>.\nThen return here.';
+  if (await pollCheck(alias, domain)) { el.innerHTML += '<div>Token saved.</div>'; tryClose('Device flow completed.'); }
+}
+async function onOK() {
+  const alias = document.getElementById('alias').value.trim();
+  const domain = document.getElementById('domain').value.trim();
+  const bearer = document.getElementById('bearer').value.trim();
+  const user = document.getElementById('user').value.trim();
+  const pass = document.getElementById('pass').value.trim();
+  const status = document.getElementById('status'); status.textContent = 'Processing...'; status.classList.remove('error');
+  const flagTokenError = (msg)=>{ status.textContent = msg; status.classList.add('error'); const b=document.getElementById('bearer'); if(b) b.classList.add('error'); };
+  const flagBasicError = (msg)=>{ status.textContent = msg; status.classList.add('error'); ['user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.add('error')}); };
+  try {
+    if (bearer) {
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Bearer ' + bearer } });
+      if (!r.ok) { const txt = await r.text(); flagTokenError(r.status===401 ? 'Invalid token' : ('Save failed: ' + txt)); return }
+      if (await pollCheck(alias, domain)) {
+        const repourl = document.getElementById('repourl').value.trim();
+        if (repourl) {
+          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
+          if (vr.ok) {
+            const vj = await vr.json();
+            if (vj.ssoRequired) {
+              const box = document.getElementById('sso');
+              box.style.display = 'block';
+              box.innerHTML = 'Organization SSO authorization required for this token.' + (vj.ssoUrl? ' <a href="' + vj.ssoUrl + '" target="_blank" rel="noopener">Authorize on GitHub</a>':'' ) + '<div class="hint">After authorizing, return here; we will retry automatically.</div>';
+              // Retry verification a few times in the background
+              for (let i=0; i<12; i++) { // ~12 * 5s = ~1 minute
+                await new Promise(rs => setTimeout(rs, 5000));
+                const vr2 = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
+                if (vr2.ok) {
+                  const v2 = await vr2.json();
+                  if (v2.ok) { box.style.display='none'; status.textContent = 'OK: token authorized via SSO'; tryClose('OK'); return }
+                }
+              }
+              status.textContent = 'Token saved; SSO authorization pending';
+              return;
+            }
+          } else { flagTokenError('Verify failed: ' + (await vr.text())); return; }
+        }
+        status.textContent = 'OK: token saved'; tryClose('OK');
+      } else { status.textContent = 'Saved, but token not visible in check'; tryClose('Saved'); }
+      return;
+    }
+    if (user || pass) {
+      const basic = btoa((user||'') + ':' + (pass||''));
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Basic ' + basic } });
+      if (!r.ok) { const txt = await r.text(); flagBasicError(r.status===401 ? 'Invalid username or token' : ('Save failed: ' + txt)); return }
+      if (await pollCheck(alias, domain)) {
+        const repourl = document.getElementById('repourl').value.trim();
+        if (repourl) {
+          const vr = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
+          if (vr.ok) {
+            const vj = await vr.json();
+            if (vj.ssoRequired) {
+              const box = document.getElementById('sso');
+              box.style.display = 'block';
+              box.innerHTML = 'Organization SSO authorization required for this token.' + (vj.ssoUrl? ' <a href="' + vj.ssoUrl + '" target="_blank" rel="noopener">Authorize on GitHub</a>':'' ) + '<div class="hint">After authorizing, return here; we will retry automatically.</div>';
+              for (let i=0; i<12; i++) {
+                await new Promise(rs => setTimeout(rs, 5000));
+                const vr2 = await fetch('{{BASE}}/github/auth/verify?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&url=' + encodeURIComponent(repourl) + '&uuid={{UUID}}');
+                if (vr2.ok) { const v2 = await vr2.json(); if (v2.ok) { box.style.display='none'; status.textContent = 'OK: token authorized via SSO'; tryClose('OK'); return } }
+              }
+              status.textContent = 'Token saved; SSO authorization pending';
+              return;
+            }
+          } else { flagBasicError('Verify failed: ' + (await vr.text())); return; }
+        }
+        status.textContent = 'OK: basic saved'; tryClose('OK');
+      } else { status.textContent = 'Saved, but not visible in check'; tryClose('Saved'); }
+      return;
+    }
+    await startDevice(); status.textContent = 'Device flow started.';
+  } catch (e) { status.textContent = e.message; }
+}
+function tryClose(msg){
+  try { window.close(); } catch(e){}
+  const s = document.getElementById('status');
+  if (s) s.textContent = msg + ' — you can close this tab now.';
+}
+function onCancel(){ document.getElementById('status').textContent = 'Canceled by user.'; tryClose('Canceled'); }
+function onReject(){ document.getElementById('status').textContent = 'Rejected by user.'; tryClose('Rejected'); }
+ </script>
+</body></html>

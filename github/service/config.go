@@ -10,6 +10,11 @@ type Config struct {
 	// Examples: mem://localhost/mcp-github, file://~/.mcp/github, gs://bucket/path
 	SecretsBase string `json:"secretsBase,omitempty"`
 
+	// WaitTimeoutSeconds caps how long to wait for credentials during tooling calls (default 300s).
+	WaitTimeoutSeconds int `json:"waitTimeoutSeconds,omitempty"`
+	// ElicitCooldownSeconds sets the minimal gap between repeated OOB prompts per namespace+alias+domain (default 60s).
+	ElicitCooldownSeconds int `json:"elicitCooldownSeconds,omitempty"`
+
 	// SnapshotMemThresholdBytes controls the max size for in-memory snapshot caching (default 100MB).
 	SnapshotMemThresholdBytes int64 `json:"snapshotMemThresholdBytes,omitempty"`
 	// SnapshotMemTTLSeconds controls in-memory snapshot TTL (default 900 = 15 minutes).

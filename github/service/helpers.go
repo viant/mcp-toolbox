@@ -8,13 +8,40 @@ import (
 	"time"
 )
 
+func sleepWithCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func backoff(attempt int) time.Duration {
+	// 0:0ms, 1:500ms, 2:1s, 3:2s, 4:4s (cap at 4s)
+	if attempt <= 0 {
+		return 0
+	}
+	d := 500 * time.Millisecond
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d > 4*time.Second {
+			d = 4 * time.Second
+			break
+		}
+	}
+	return d
+}
+
 // withCredentialRetry uses domain-level token for non-repo operations.
 func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain string, prompt func(string), call func(token string) (T, error)) (T, error) {
 	var zero T
-	ns, _ := svc.auth.Namespace(ctx)
-	if ns == "" {
-		ns = "default"
-	}
+	ns := svc.Namespace(ctx)
 	// Normalize alias/domain to align waiter and notifier keys
 	aliasEff := svc.normalizeAlias(alias)
 	if aliasEff == "" {
@@ -60,24 +87,30 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or use /github/auth/start explicitly", aliasEff, domainEff)
 		}
 	}
-	// debug logging removed
-	out, err := call(token)
-	if err == nil {
-		return out, nil
+	// Call with limited retry on rate limiting
+	var out T
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		out, err = call(token)
+		if err == nil {
+			return out, nil
+		}
+		if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+			continue
+		}
+		break
 	}
-	if errors.Is(err, adapter.ErrUnauthorized) {
+	if errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) {
 		return zero, fmt.Errorf("unauthorized for alias=%s domain=%s; token invalid or insufficient scope", alias, domain)
 	}
 	return zero, err
 }
 
-// withRepoCredentialRetry prefers repo-level secret, falling back to domain-level.
+// withRepoCredentialRetry tries domain-level credentials first; on unauthorized, falls back to repo-level.
 func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain, owner, name string, prompt func(string), call func(token string) (T, error)) (T, error) {
 	var zero T
-	ns, _ := svc.auth.Namespace(ctx)
-	if ns == "" {
-		ns = "default"
-	}
+	ns := svc.Namespace(ctx)
+	cid := CID(ctx)
 	// Normalize alias/domain to align waiter and notifier keys
 	aliasEff := svc.normalizeAlias(alias)
 	if aliasEff == "" {
@@ -88,14 +121,23 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 		domainEff = "github.com"
 	}
 
-	token := svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
-	if token == "" {
-		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, owner, name); t != "" {
-			token = t
-			// hydrate memory
-			svc.saveTokenRepo(ns, aliasEff, domainEff, owner, name, token, false)
+	fmt.Printf("[GITHUB] AUTH cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s enter\n", cid, ns, aliasEff, domainEff, owner, name)
+	// Load domain-level first (including canonical alias fallback), then repo-level
+	domainTok := svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
+	if domainTok == "" {
+		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
+			domainTok = t
+			svc.saveTokenDomain(ns, aliasEff, domainEff, domainTok, false)
 		}
 	}
+	repoTok := svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+	if repoTok == "" {
+		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, owner, name); t != "" {
+			repoTok = t
+			svc.saveTokenRepo(ns, aliasEff, domainEff, owner, name, repoTok, false)
+		}
+	}
+	token := domainTok
 	if token == "" {
 		if prompt != nil {
 			// debug logs removed
@@ -109,12 +151,23 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 					wait = 0
 				}
 			}
+			fmt.Printf("[GITHUB] AUTH cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s wait=%s\n", cid, ns, aliasEff, domainEff, owner, name, wait)
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, owner, name, wait) {
-				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+				// After notify, prefer domain-level token
+				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
+				if token == "" {
+					// Fallback to repo-level if only that was provided
+					token = svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+				}
 				// Only allow cross-namespace fallback when operating in the shared default namespace.
 				if token == "" && ns == "default" {
-					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
+					// Try domain-wide first across NS, then repo-level across NS
+					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
+					if token == "" {
+						token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
+					}
 				}
+				fmt.Printf("[GITHUB] AUTH cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s got=%v\n", cid, ns, aliasEff, domainEff, owner, name, token != "")
 			}
 			// debug logs removed
 		}
@@ -122,12 +175,33 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or /github/auth/token", aliasEff, domainEff)
 		}
 	}
-	// debug logging removed
-	out, err := call(token)
-	if err == nil {
-		return out, nil
+	// First try with domain-level token (retry on rate limiting)
+	var out T
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		out, err = call(token)
+		if err == nil {
+			return out, nil
+		}
+		if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+			continue
+		}
+		break
 	}
-	if errors.Is(err, adapter.ErrUnauthorized) {
+	// On insufficient access or bad creds with domain token, retry once with repo token if present
+	if token == domainTok && repoTok != "" && repoTok != domainTok && (errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrNotFound)) {
+		for attempt := 0; attempt < 4; attempt++ {
+			out, err = call(repoTok)
+			if err == nil {
+				return out, nil
+			}
+			if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+				continue
+			}
+			break
+		}
+	}
+	if errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) {
 		return zero, fmt.Errorf("unauthorized for alias=%s domain=%s owner=%s repo=%s; token invalid or insufficient scope", alias, domain, owner, name)
 	}
 	return zero, err

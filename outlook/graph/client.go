@@ -20,6 +20,7 @@ import (
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/viant/afs"
 	oaauth "github.com/viant/mcp-toolbox/auth"
+	nsprov "github.com/viant/mcp/server/namespace"
 )
 
 // Manager provides Microsoft Graph client instances per account alias.
@@ -27,6 +28,7 @@ type Manager struct {
 	clientID   string
 	storageDir string
 	auth       *oaauth.Service
+	ns         *nsprov.DefaultProvider
 	// pending holds device-code prompts keyed by account alias.
 	pending map[string]*pendingAuth
 	// clients caches GraphServiceClient instances per alias+tenant+scopes.
@@ -45,6 +47,7 @@ func NewManager(clientID, storageDir string) *Manager {
 		clientID:   clientID,
 		storageDir: storageDir,
 		auth:       oaauth.New(),
+		ns:         nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
 		pending:    map[string]*pendingAuth{},
 		clients:    map[string]*msgraphsdk.GraphServiceClient{},
 		creds:      map[string]*azidentity.DeviceCodeCredential{},
@@ -110,7 +113,8 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 	if err := m.ensureDirs(); err != nil {
 		return true
 	}
-	ns, _ := m.auth.Namespace(ctx)
+	dsc, _ := m.ns.Namespace(ctx)
+	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
@@ -149,7 +153,8 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 
 // Client returns a ready-to-use GraphServiceClient with given scopes.
 func (m *Manager) Client(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*msgraphsdk.GraphServiceClient, error) {
-	ns, _ := m.auth.Namespace(ctx)
+	dsc, _ := m.ns.Namespace(ctx)
+	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
@@ -204,7 +209,8 @@ func (m *Manager) Acquire(ctx context.Context, alias, tenantID string, scopes []
 
 // HasAuthRecord reports whether an auth record exists for alias.
 func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
-	ns, _ := m.auth.Namespace(ctx)
+	dsc, _ := m.ns.Namespace(ctx)
+	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
@@ -246,7 +252,8 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 	if err := m.ensureDirs(); err != nil {
 		return nil, azidentity.AuthenticationRecord{}, err
 	}
-	ns, _ := m.auth.Namespace(ctx)
+	dsc, _ := m.ns.Namespace(ctx)
+	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
