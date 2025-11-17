@@ -354,16 +354,37 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// List repo path (without clone)
-	if err := protoserver.RegisterTool[*ghservice.ListRepoInput, *ghservice.ListRepoOutput](base.Registry, "listRepo", descListRepoPath, func(ctx context.Context, in *ghservice.ListRepoInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		start := logToolStart("listRepo")
-		stop := startToolPending("listRepo", in, start)
+	if err := protoserver.RegisterTool[*ghservice.ListReposInput, *ghservice.ListReposOutput](base.Registry, "listRepos", descListRepoPath, func(ctx context.Context, in *ghservice.ListReposInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("listRepos")
+		stop := startToolPending("listRepos", in, start)
+		defer stop()
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "listRepos", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.ListRepos(ctxNS, in, msgPrompt(ctxNS))
+		if err != nil {
+			logToolEnd("listRepos", start, err)
+			return buildErrorResult(err.Error())
+		}
+		logToolEnd("listRepos", start, nil)
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	// List repo path (without clone)
+	if err := protoserver.RegisterTool[*ghservice.ListRepoPathInput, *ghservice.ListRepoPathOutput](base.Registry, "listRepoPath", descListRepoPath, func(ctx context.Context, in *ghservice.ListRepoPathInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("listRepoPath")
+		stop := startToolPending("listRepoPath", in, start)
 		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
-			logToolEnd("listRepo", start, fmt.Errorf("missing repo or url"))
+			logToolEnd("listRepoPath", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		ctxNS, svc, rerr := h.resolveService(ctx)
-		logToolNS(h, "listRepo", ctxNS)
+		logToolNS(h, "listRepoPath", ctxNS)
 		if rerr != nil {
 			return buildErrorResult("resolve namespace: " + rerr.Error())
 		}

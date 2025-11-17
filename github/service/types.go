@@ -124,7 +124,7 @@ type CheckoutRepoOutput struct {
 }
 
 // List path (assets) types — compact contract optimized for LLM usage.
-type ListRepoInput struct {
+type ListRepoPathInput struct {
 	GitTarget
 	Path      string   `json:"path"`
 	Recursive bool     `json:"recursive,omitempty"`
@@ -132,7 +132,7 @@ type ListRepoInput struct {
 	Exclude   []string `json:"exclude,omitempty"`
 }
 
-type ListRepoOutput struct {
+type ListRepoPathOutput struct {
 	Ref     string   `json:"ref,omitempty"` // effective ref used (default branch when omitted)
 	Paths   []string `json:"paths"`         // repo-relative paths under the requested scope
 	Warning string   `json:"warning,omitempty"`

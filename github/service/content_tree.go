@@ -10,7 +10,7 @@ import (
 )
 
 // ListRepoPath lists paths under the given repo path/ref. Returns repo-relative paths only.
-func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt func(string)) (*ListRepoOutput, error) {
+func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoPathInput, prompt func(string)) (*ListRepoPathOutput, error) {
 	if in == nil {
 		return nil, fmt.Errorf("input is nil")
 	}
@@ -23,7 +23,7 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 	if aerr != nil {
 		return nil, aerr
 	}
-	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*ListRepoOutput, error) {
+	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*ListRepoPathOutput, error) {
 		// Normalize empty ref to default branch
 		ref = s.effectiveRef(ctx, domain, owner, name, ref, token)
 		if in.Recursive {
@@ -41,7 +41,7 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 				// Fallback to contents-based DFS over directories
 				walker := s.makeContentAPI(domain)
 				startPath := strings.Trim(strings.TrimPrefix(in.Path, "/"), "/")
-				var out ListRepoOutput
+				var out ListRepoPathOutput
 				var stack = []string{startPath}
 				visited := map[string]bool{}
 				for len(stack) > 0 {
@@ -137,7 +137,7 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 					collected = append(collected, e.Path)
 				}
 			}
-			return &ListRepoOutput{Ref: ref, Paths: collected}, nil
+			return &ListRepoPathOutput{Ref: ref, Paths: collected}, nil
 		}
 		// Non-recursive: single directory via contents API
 		cli := s.makeContentAPI(domain)
@@ -161,7 +161,7 @@ func (s *Service) ListRepoPath(ctx context.Context, in *ListRepoInput, prompt fu
 			}
 			collected = append(collected, v.Path)
 		}
-		return &ListRepoOutput{Ref: useRef, Paths: collected}, nil
+		return &ListRepoPathOutput{Ref: useRef, Paths: collected}, nil
 	})
 }
 

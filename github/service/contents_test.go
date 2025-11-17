@@ -89,7 +89,7 @@ func Test_ListRepoPath_and_Download_without_clone(t *testing.T) {
 	svc.makeContentAPI = func(domain string) contentAPI { return contentAPIShim{inner: fake} }
 
 	// List path
-	lst, err := svc.ListRepoPath(context.Background(), &ListRepoInput{GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}}, Path: "/"}, nil)
+	lst, err := svc.ListRepoPath(context.Background(), &ListRepoPathInput{GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}}, Path: "/"}, nil)
 	if err != nil {
 		t.Fatalf("list error: %v", err)
 	}
