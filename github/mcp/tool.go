@@ -49,39 +49,23 @@ var descListRepoPath string
 //go:embed tools/downloadRepoFile.md
 var descDownloadRepoFile string
 
-//go:embed tools/findFilesPreview.md
+//go:embed tools/searchRepoContent.md
 var descFindFilesPreview string
 
 // Types moved to types.go
 
-func logToolStart(name string) time.Time {
-	ts := time.Now()
-	fmt.Printf("[MCP][%s] START tool=%s\n", ts.Format(time.RFC3339Nano), name)
-	return ts
-}
+func logToolStart(name string) time.Time { return time.Now() }
 
-func logToolEnd(name string, start time.Time, err error) {
-	dur := time.Since(start)
-	if err != nil {
-		fmt.Printf("[MCP][%s] END tool=%s dur=%s err=%v\n", time.Now().Format(time.RFC3339Nano), name, dur, err)
-	} else {
-		fmt.Printf("[MCP][%s] END tool=%s dur=%s ok\n", time.Now().Format(time.RFC3339Nano), name, dur)
-	}
-}
+func logToolEnd(name string, start time.Time, err error) {}
 
 // startToolPending prints a start line with summarized args and returns a stopper that prints end.
-func startToolPending(name string, args any, start time.Time) func() {
-	fmt.Printf("[MCP] ARGS tool=%s args=%s\n", name, summarizeArgs(args))
-	return func() {}
-}
+func startToolPending(name string, args any, start time.Time) func() { return func() {} }
 
 func logToolNS(h *Handler, name string, ctx context.Context) {
 	if h == nil {
 		return
 	}
-	if d, err := h.nsProvider.Namespace(ctx); err == nil {
-		fmt.Printf("[MCP] NS tool=%s ns=%s\n", name, d.Name)
-	}
+	_ = h
 }
 
 func summarizeArgs(args any) string {
@@ -121,7 +105,6 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 				// Short timeout to prevent long blocking if client/UI is slow.
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
-				fmt.Printf("[MCP] ELICIT SEND id=%s url=%s\n", elicitID, u)
 				_, _ = ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
 					Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
 				}})
@@ -415,7 +398,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		}
 		cid := newUUID()
 		ctxNS = ghservice.WithCID(ctxNS, cid)
-		fmt.Printf("[MCP] CID tool=download cid=%s path=%s\n", cid, in.Path)
+		_ = cid
 		out, err := svc.DownloadRepoFile(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
 			logToolEnd("download", start, err)
@@ -428,7 +411,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// Find files with preview (no apply), supports sed-like preview on snapshot
-	if err := protoserver.RegisterTool[*ghservice.FindFilesPreviewInput, *ghservice.FindFilesPreviewOutput](base.Registry, "searchRepoContent", descFindFilesPreview, func(ctx context.Context, in *ghservice.FindFilesPreviewInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.SearchRepoContentInput, *ghservice.SearchRepoContentOutput](base.Registry, "searchRepoContent", descFindFilesPreview, func(ctx context.Context, in *ghservice.SearchRepoContentInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		start := logToolStart("searchRepoContent")
 		stop := startToolPending("searchRepoContent", in, start)
 		defer stop()

@@ -260,13 +260,9 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 		// removed log.Printf diagnostics
 		p := strings.TrimPrefix(in.Path, "/")
 		// First try contents API
-		t0 := time.Now()
-		cid := CID(ctx)
 		if data, err := cli.GetFileContent(ctx, token, owner, name, p, useRef); err == nil {
-			fmt.Printf("[GITHUB] DL content ok cid=%s domain=%s owner=%s repo=%s ref=%s path=%s dur=%s\n", cid, domain, owner, name, useRef, p, time.Since(t0))
 			return data, nil
 		}
-		fmt.Printf("[GITHUB] DL content miss cid=%s domain=%s owner=%s repo=%s ref=%s path=%s dur=%s (fallback)\n", cid, domain, owner, name, useRef, p, time.Since(t0))
 		// Fallback: list parent directory via contents on the same ref to obtain file SHA, then fetch blob by SHA.
 		parent := p
 		if idx := strings.LastIndex(parent, "/"); idx >= 0 {
@@ -275,18 +271,14 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 			parent = ""
 		}
 		// Try listing on the effective ref first; if that fails, fall back to default branch.
-		t1 := time.Now()
 		items, err := cli.ListContents(ctx, token, owner, name, parent, useRef)
 		if err != nil {
 			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
 				items, err = cli.ListContents(ctx, token, owner, name, parent, def)
-				fmt.Printf("[GITHUB] DL parent list default cid=%s domain=%s owner=%s repo=%s defRef=%s parent=%s dur=%s err=%v\n", cid, domain, owner, name, def, parent, time.Since(t1), err)
 			}
 			if err != nil {
 				return nil, err
 			}
-		} else {
-			fmt.Printf("[GITHUB] DL parent list ref cid=%s domain=%s owner=%s repo=%s ref=%s parent=%s dur=%s\n", cid, domain, owner, name, useRef, parent, time.Since(t1))
 		}
 		var sha string
 		for _, it := range items {
@@ -296,12 +288,47 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 			}
 		}
 		if sha == "" {
-			return nil, fmt.Errorf("get content failed: %s", "sha not found in parent listing on ref")
+			// Fallback 2: Trees API traversal to resolve blob SHA at commit-ish
+			// Attempt on the effective ref first
+			var treeErr error
+			var entries []adapter.TreeEntry
+			if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, useRef); terr == nil && strings.TrimSpace(treeSHA) != "" {
+				if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
+					entries, _ = ents, trunc
+				} else {
+					treeErr = terr2
+				}
+			} else if terr != nil {
+				treeErr = terr
+			}
+			// If not found and effective ref differs from default, try default branch as a last resort
+			if len(entries) == 0 {
+				if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
+					if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, def); terr == nil && strings.TrimSpace(treeSHA) != "" {
+						if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
+							entries, _ = ents, trunc
+						} else {
+							treeErr = terr2
+						}
+					} else if terr != nil {
+						treeErr = terr
+					}
+				}
+			}
+			if len(entries) > 0 {
+				for _, e := range entries {
+					if e.Path == p && e.Type == "blob" && e.Sha != "" {
+						sha = e.Sha
+						break
+					}
+				}
+			}
+			if sha == "" {
+				// Provide a more actionable error with context
+				return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q (trees fallback err=%v)", p, useRef, treeErr)
+			}
 		}
-		t2 := time.Now()
-		blob, berr := adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
-		fmt.Printf("[GITHUB] DL blob cid=%s domain=%s owner=%s repo=%s sha=%s dur=%s err=%v\n", cid, domain, owner, name, sha, time.Since(t2), berr)
-		return blob, berr
+		return adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
 	})
 	if err != nil {
 		return nil, err

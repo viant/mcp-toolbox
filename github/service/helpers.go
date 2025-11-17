@@ -61,6 +61,24 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 		}
 	}
 	if token == "" {
+		// For public github.com, attempt unauthenticated call first; only elicit on permission errors.
+		if domainEff == "github.com" {
+			var out T
+			var err error
+			for attempt := 0; attempt < 4; attempt++ {
+				out, err = call("")
+				if err == nil {
+					return out, nil
+				}
+				if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+					continue
+				}
+				break
+			}
+			if !(errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrSSORequired)) {
+				return zero, err
+			}
+		}
 		if prompt != nil {
 			// Elicit once and wait briefly for token to arrive
 			// debug logs removed
@@ -110,7 +128,6 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain, owner, name string, prompt func(string), call func(token string) (T, error)) (T, error) {
 	var zero T
 	ns := svc.Namespace(ctx)
-	cid := CID(ctx)
 	// Normalize alias/domain to align waiter and notifier keys
 	aliasEff := svc.normalizeAlias(alias)
 	if aliasEff == "" {
@@ -121,7 +138,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 		domainEff = "github.com"
 	}
 
-	fmt.Printf("[GITHUB] AUTH cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s enter\n", cid, ns, aliasEff, domainEff, owner, name)
+	// debug logs removed
 	// Load domain-level first (including canonical alias fallback), then repo-level
 	domainTok := svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
 	if domainTok == "" {
@@ -139,6 +156,24 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	}
 	token := domainTok
 	if token == "" {
+		// For public github.com, try unauthenticated call first; only elicit on permission errors.
+		if domainEff == "github.com" {
+			var out T
+			var err error
+			for attempt := 0; attempt < 4; attempt++ {
+				out, err = call("")
+				if err == nil {
+					return out, nil
+				}
+				if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+					continue
+				}
+				break
+			}
+			if !(errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrSSORequired)) {
+				return zero, err
+			}
+		}
 		if prompt != nil {
 			// debug logs removed
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, owner, name, prompt)
@@ -151,7 +186,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 					wait = 0
 				}
 			}
-			fmt.Printf("[GITHUB] AUTH cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s wait=%s\n", cid, ns, aliasEff, domainEff, owner, name, wait)
+			// debug logs removed
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, owner, name, wait) {
 				// After notify, prefer domain-level token
 				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
@@ -167,7 +202,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 						token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
 					}
 				}
-				fmt.Printf("[GITHUB] AUTH cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s got=%v\n", cid, ns, aliasEff, domainEff, owner, name, token != "")
+				// debug logs removed
 			}
 			// debug logs removed
 		}

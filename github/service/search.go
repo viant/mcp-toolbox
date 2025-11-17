@@ -9,7 +9,7 @@ import (
 )
 
 // SearchRepoContent searches files and returns previews (with optional content-based matches), no apply.
-func (s *Service) SearchRepoContent(ctx context.Context, in *FindFilesPreviewInput, prompt func(string)) (*FindFilesPreviewOutput, error) {
+func (s *Service) SearchRepoContent(ctx context.Context, in *SearchRepoContentInput, prompt func(string)) (*SearchRepoContentOutput, error) {
 	if in == nil {
 		return nil, fmt.Errorf("input is nil")
 	}
@@ -23,11 +23,12 @@ func (s *Service) SearchRepoContent(ctx context.Context, in *FindFilesPreviewInp
 		return nil, aerr
 	}
 
-	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*FindFilesPreviewOutput, error) {
+	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*SearchRepoContentOutput, error) {
 		includeQs := filterContentPatterns(in.Queries)
 		excludeQs := filterContentPatterns(in.ExcludeQueries)
 		ci := in.CaseInsensitive
-		if len(includeQs) > 0 && !ci {
+		// Default to case-insensitive when any content filters are provided (include or exclude).
+		if (len(includeQs) > 0 || len(excludeQs) > 0) && !ci {
 			ci = true
 		}
 		skipBinary := in.SkipBinary
@@ -53,7 +54,7 @@ func (s *Service) SearchRepoContent(ctx context.Context, in *FindFilesPreviewInp
 			maxSnippetsPerFile = 5
 		}
 
-		out := &FindFilesPreviewOutput{Stats: PreviewStats{}}
+		out := &SearchRepoContentOutput{Stats: PreviewStats{}}
 		// Resolve ref if empty to default branch
 		ref = s.effectiveRef(ctx, domain, owner, name, ref, token)
 
@@ -222,20 +223,10 @@ func (s *Service) SearchRepoContent(ctx context.Context, in *FindFilesPreviewInp
 			}
 			pv := PreviewFile{Path: it.Path}
 			pv.Matches = countMatches(content, includeQs, ci)
-			// Decide preview mode
-			mode := previewMode
-			if mode != "matches" && mode != "head" {
-				if len(includeQs) > 0 || len(excludeQs) > 0 {
-					mode = "matches"
-				} else {
-					mode = "head"
-				}
-			}
-			effMode := mode
-			if mode == "matches" && len(includeQs) == 0 && len(excludeQs) == 0 {
-				effMode = "head"
-			}
-			if effMode == "matches" {
+			// Decide preview mode using normalized, effective mode.
+			hasFilters := len(includeQs) > 0 || len(excludeQs) > 0
+			effMode := effectivePreviewMode(previewMode, hasFilters)
+			if effMode == "match" {
 				snips, _, coveredMatches, totalMatches := buildMatchSnippetsCompact(content, includeQs, ci, snippetLines, previewBytes, maxSnippetsPerFile)
 				pv.Snippets = snips
 				if totalMatches > coveredMatches {

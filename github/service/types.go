@@ -156,8 +156,8 @@ type DownloadOutput struct {
 	SedPreview      *SedResult `json:"sedPreview,omitempty"`
 }
 
-// FindFilesPreviewInput defines a search + preview (no-apply) request on a repo snapshot.
-type FindFilesPreviewInput struct {
+// SearchRepoContentInput defines a search + preview (no-apply) request on a repo snapshot.
+type SearchRepoContentInput struct {
 	GitTarget
 	// Scope
 	Path      string   `json:"path"`
@@ -169,7 +169,7 @@ type FindFilesPreviewInput struct {
 	ExcludeQueries  []string `json:"excludeQueries,omitempty"`
 	CaseInsensitive bool     `json:"caseInsensitive,omitempty"`
 	// Preview shaping
-	Mode      string `json:"mode,omitempty"`
+	Mode      string `json:"mode,omitempty"  description:"match mode returns lines around matches"  choice:"head" choice:"match" `
 	Bytes     int    `json:"bytes,omitempty"`
 	Lines     int    `json:"lines,omitempty"`
 	MaxFiles  int    `json:"maxFiles,omitempty"`
@@ -180,7 +180,7 @@ type FindFilesPreviewInput struct {
 	Concurrency int  `json:"concurrency,omitempty"`
 }
 
-type FindFilesPreviewOutput struct {
+type SearchRepoContentOutput struct {
 	Ref   string        `json:"ref,omitempty"`
 	Sha   string        `json:"sha"`
 	Stats PreviewStats  `json:"stats"`
@@ -216,7 +216,7 @@ type SedResult struct {
 	Diff  string `json:"diff,omitempty"`
 }
 
-// FindFilesPreviewInput requests finding files with optional sed-like preview (no apply).
+// SearchRepoContentInput requests finding files with optional sed-like preview (no apply).
 // (duplicate type removed)
 
 // (deprecated duplicate preview types removed)

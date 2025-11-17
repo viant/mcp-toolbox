@@ -859,6 +859,17 @@ func filterContentPatterns(in []string) []string {
 		if q == "" {
 			continue
 		}
+		// If not a delimited regex and contains '|', treat as OR of literals by splitting.
+		if ok, _, _ := parseDelimitedRegex(q); !ok && strings.Contains(q, "|") {
+			parts := strings.Split(q, "|")
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					out = append(out, p)
+				}
+			}
+			continue
+		}
 		out = append(out, q)
 	}
 	return out
@@ -905,7 +916,7 @@ func countMatches(b []byte, patterns []string, ci bool) int {
 			continue
 		}
 		if ok, pat, flags := parseDelimitedRegex(q); ok {
-			if strings.Contains(flags, "i") {
+			if strings.Contains(flags, "i") || ci {
 				pat = "(?i)" + pat
 			}
 			re, err := regexp.Compile(pat)
@@ -1034,7 +1045,7 @@ func findMatchRanges(b []byte, patterns []string, ci bool) [][2]int {
 			continue
 		}
 		if ok, pat, flags := parseDelimitedRegex(q); ok {
-			if strings.Contains(flags, "i") {
+			if strings.Contains(flags, "i") || ci {
 				pat = "(?i)" + pat
 			}
 			re, err := regexp.Compile(pat)

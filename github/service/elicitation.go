@@ -89,9 +89,6 @@ func (s *Service) notifyToken(ns, alias, domain string) {
 	if lk, ok := s.credLocks[key]; ok {
 		delete(s.credLocks, key)
 		close(lk.done)
-		fmt.Printf("[GITHUB] NOTIFY ns=%s alias=%s domain=%s gate=closed\n", ns, alias, domain)
-	} else {
-		fmt.Printf("[GITHUB] NOTIFY ns=%s alias=%s domain=%s gate=absent\n", ns, alias, domain)
 	}
 	s.credMu.Unlock()
 }
@@ -123,7 +120,7 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 	if prompt == nil {
 		return
 	}
-	cid := CID(ctx)
+	// derive correlation id if needed
 	// Minimal dedupe: per namespace+alias+domain within cooldown
 	namespace := s.Namespace(ctx)
 	keySess := joinKey("elicit", namespace, alias, domain)
@@ -133,12 +130,10 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 	s.elicitMu.Lock()
 	if t, ok := s.elicited[keySess]; ok && now.Sub(t) < cooldown {
 		s.elicitMu.Unlock()
-		fmt.Printf("[GITHUB] ELICIT-SKIP cid=%s ns=%s alias=%s domain=%s (cooldown)\n", cid, namespace, alias, domain)
 		return
 	}
 	if t, ok := s.elicitedGlobal[keyGlob]; ok && now.Sub(t) < cooldown {
 		s.elicitMu.Unlock()
-		fmt.Printf("[GITHUB] ELICIT-SKIP-GLOBAL cid=%s ns=%s alias=%s domain=%s (cooldown)\n", cid, namespace, alias, domain)
 		return
 	}
 	s.elicited[keySess] = now
@@ -170,25 +165,21 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 				sep = "&"
 			}
 			url := fmt.Sprintf("%s%s%s", cb, sep, q.Encode())
-			fmt.Printf("[GITHUB] ELICIT cid=%s ns=%s alias=%s domain=%s url=%s\n", cid, namespace, alias, domain, url)
 			prompt(fmt.Sprintf("Open %s to provide credentials", url))
 			return
 		}
 	}
 	// Fallback: plain OOB URL without uuid (less ideal; won’t bind namespace)
 	url := fmt.Sprintf("%s/github/auth/oob?%s", base, q.Encode())
-	fmt.Printf("[GITHUB] ELICIT-FALLBACK cid=%s ns=%s alias=%s domain=%s url=%s\n", cid, namespace, alias, domain, url)
 	prompt(fmt.Sprintf("Open %s to provide credentials", url))
 }
 
 // waitForToken checks for token existence, waiting up to timeout. Minimal shim returns immediately if present.
 func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, name string, timeout time.Duration) bool {
-	fmt.Printf("[GITHUB] WAIT cid=%s ns=%s alias=%s domain=%s owner=%s repo=%s timeout=%s\n", CID(ctx), ns, alias, domain, owner, name, timeout)
 	if t := s.loadTokenPreferred(ns, alias, domain, owner, name); t != "" {
-		fmt.Printf("[GITHUB] WAIT-READY ns=%s alias=%s domain=%s (token already present)\n", ns, alias, domain)
 		return true
 	}
-	leader, done, release := s.acquireCredLock(ns, alias, domain)
+	_, done, release := s.acquireCredLock(ns, alias, domain)
 	// If leader, do nothing special here (elicitation triggered upstream); just wait for done or timeout/cancel.
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -196,16 +187,13 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	case <-ctx.Done():
 		// Cancel: release without success to allow future attempts
 		release(false)
-		fmt.Printf("[GITHUB] WAIT-CANCEL ns=%s alias=%s domain=%s err=%v\n", ns, alias, domain, ctx.Err())
 		return false
 	case <-timer.C:
 		// Timeout: clean up gate without waking followers (they will also time out and re-attempt)
 		release(false)
 		has := s.loadTokenPreferred(ns, alias, domain, owner, name) != ""
-		fmt.Printf("[GITHUB] WAIT-TIMEOUT ns=%s alias=%s domain=%s leader=%v hasToken=%v\n", ns, alias, domain, leader, has)
 		return has
 	case <-done:
-		fmt.Printf("[GITHUB] WAIT-WAKE ns=%s alias=%s domain=%s leader=%v\n", ns, alias, domain, leader)
 		return true
 	}
 }
