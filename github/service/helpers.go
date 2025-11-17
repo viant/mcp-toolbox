@@ -47,7 +47,7 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 	if aliasEff == "" {
 		aliasEff = "default"
 	}
-	domainEff := domain
+	domainEff := svc.normalizeDomain(domain)
 	if domainEff == "" {
 		domainEff = "github.com"
 	}
@@ -62,7 +62,7 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 	}
 	if token == "" {
 		// For public github.com, attempt unauthenticated call first; only elicit on permission errors.
-		if domainEff == "github.com" {
+		if svc.normalizeDomain(domainEff) == "github.com" {
 			var out T
 			var err error
 			for attempt := 0; attempt < 4; attempt++ {
@@ -133,7 +133,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	if aliasEff == "" {
 		aliasEff = "default"
 	}
-	domainEff := domain
+	domainEff := svc.normalizeDomain(domain)
 	if domainEff == "" {
 		domainEff = "github.com"
 	}
@@ -157,7 +157,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	token := domainTok
 	if token == "" {
 		// For public github.com, try unauthenticated call first; only elicit on permission errors.
-		if domainEff == "github.com" {
+		if svc.normalizeDomain(domainEff) == "github.com" {
 			var out T
 			var err error
 			for attempt := 0; attempt < 4; attempt++ {

@@ -232,6 +232,16 @@ func (s *Service) SearchRepoContent(ctx context.Context, in *SearchRepoContentIn
 				if totalMatches > coveredMatches {
 					pv.Omitted = totalMatches - coveredMatches
 				}
+				// Always provide a preview: if no match snippets, fall back to head
+				if len(pv.Snippets) == 0 && previewBytes > 0 {
+					head := content
+					cut := false
+					if len(head) > previewBytes {
+						head = head[:previewBytes]
+						cut = true
+					}
+					pv.Snippets = []PreviewSnippet{{Start: 1, End: 1, Text: string(head), Cut: cut}}
+				}
 			} else {
 				if previewBytes > 0 {
 					head := content

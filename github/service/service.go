@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -357,7 +358,72 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 				}
 			}
 			if sha == "" {
-				// Provide a more actionable error with context
+				// Prepare actionable suggestions based on nearby files and tree scan.
+				// 1) Prefer suggestions from parent directory listing
+				var suggestions []string
+				// build base token without extension for fuzzy contains match
+				baseName := p
+				if idx := strings.LastIndex(baseName, "/"); idx >= 0 {
+					baseName = baseName[idx+1:]
+				}
+				baseStem := strings.TrimSuffix(baseName, path.Ext(baseName))
+				// parent directory items
+				for _, it := range items {
+					if it.Type != "file" {
+						continue
+					}
+					name := it.Name
+					if name == "" {
+						// fallback to basename from path if name empty
+						name = path.Base(it.Path)
+					}
+					if strings.Contains(strings.ToLower(name), strings.ToLower(baseStem)) {
+						suggestions = append(suggestions, it.Path)
+						if len(suggestions) >= 5 {
+							break
+						}
+					}
+				}
+				// 2) If none found in parent, look across tree entries (same dir first, then anywhere)
+				if len(suggestions) == 0 && len(entries) > 0 {
+					// same directory first
+					parentPrefix := parent
+					if parentPrefix != "" {
+						parentPrefix = strings.TrimSuffix(parentPrefix, "/") + "/"
+					}
+					for _, e := range entries {
+						if e.Type != "blob" {
+							continue
+						}
+						if parentPrefix != "" && !strings.HasPrefix(e.Path, parentPrefix) {
+							continue
+						}
+						if strings.Contains(strings.ToLower(path.Base(e.Path)), strings.ToLower(baseStem)) {
+							suggestions = append(suggestions, e.Path)
+							if len(suggestions) >= 5 {
+								break
+							}
+						}
+					}
+					// anywhere in the tree if still empty
+					if len(suggestions) == 0 {
+						for _, e := range entries {
+							if e.Type != "blob" {
+								continue
+							}
+							if strings.Contains(strings.ToLower(path.Base(e.Path)), strings.ToLower(baseStem)) {
+								suggestions = append(suggestions, e.Path)
+								if len(suggestions) >= 5 {
+									break
+								}
+							}
+						}
+					}
+				}
+				// Provide a more actionable error with context and suggestions if any
+				if len(suggestions) > 0 {
+					return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q; did you mean one of: %s (trees fallback err=%v)", p, useRef, strings.Join(suggestions, ", "), treeErr)
+				}
 				return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q (trees fallback err=%v)", p, useRef, treeErr)
 			}
 		}
@@ -400,3 +466,12 @@ func (s *Service) UseTextField() bool { return s.useText }
 // isProbablyText reports whether b looks like UTF-8 text with a low ratio of control characters.
 /* moved to snapshots.go */
 func (s *Service) normalizeAlias(a string) string { return a }
+
+// normalizeDomain lower-cases and trims the domain for stable keys and comparisons.
+func (s *Service) normalizeDomain(d string) string {
+	d = strings.TrimSpace(d)
+	if d == "" {
+		return ""
+	}
+	return strings.ToLower(d)
+}

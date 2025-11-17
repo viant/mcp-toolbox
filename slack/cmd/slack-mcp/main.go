@@ -30,8 +30,10 @@ func main() {
 		opts.SecretsBase = "mem://localhost/mcp-slack"
 	}
 	cfg := &slservice.Config{SecretsBase: opts.SecretsBase, TokenRef: scy.EncodedResource(opts.TokenRef), UseData: opts.UseData}
-	svc := slservice.NewService(cfg)
-
+	svc, err := slservice.NewService(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
 	server, err := mcpsrv.New(
 		mcpsrv.WithImplementation(schema.Implementation{Name: "slack-mcp", Version: "0.1.0"}),
 		mcpsrv.WithNewHandler(slmcp.NewHandler(svc)),

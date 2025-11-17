@@ -150,6 +150,8 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		if domain == "" {
 			domain = rb.Domain
 		}
+		// Normalize domain for stable storage and lookup
+		domain = s.normalizeDomain(domain)
 		if owner == "" {
 			owner = rb.Owner
 		}

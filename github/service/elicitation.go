@@ -3,10 +3,11 @@ package service
 import (
 	"context"
 	"fmt"
-	oob "github.com/viant/mcp/server/oob"
 	neturl "net/url"
 	"strings"
 	"time"
+
+	oob "github.com/viant/mcp/server/oob"
 )
 
 // Namespace returns the effective authorization namespace for this request context,
@@ -123,8 +124,11 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 	// derive correlation id if needed
 	// Minimal dedupe: per namespace+alias+domain within cooldown
 	namespace := s.Namespace(ctx)
-	keySess := joinKey("elicit", namespace, alias, domain)
-	keyGlob := joinKey("elicitNS", namespace, alias, domain)
+	domKey := s.normalizeDomain(domain)
+	keySess := joinKey("elicit", namespace, alias, domKey)
+	keyGlob := joinKey("elicitNS", namespace, alias, domKey)
+	// Domain-scoped dedupe (suppresses extra prompts for same ns+domain across different aliases)
+	keyDom := joinKey("elicitDomNS", namespace, domKey)
 	now := time.Now()
 	cooldown := s.ElicitCooldown()
 	s.elicitMu.Lock()
@@ -136,8 +140,13 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 		s.elicitMu.Unlock()
 		return
 	}
+	if t, ok := s.elicitedGlobal[keyDom]; ok && now.Sub(t) < cooldown {
+		s.elicitMu.Unlock()
+		return
+	}
 	s.elicited[keySess] = now
 	s.elicitedGlobal[keyGlob] = now
+	s.elicitedGlobal[keyDom] = now
 	s.elicitMu.Unlock()
 	base := strings.TrimRight(s.baseURL, "/")
 	q := neturl.Values{}

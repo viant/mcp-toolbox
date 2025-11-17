@@ -17,6 +17,8 @@ import (
 	slackapi "github.com/viant/mcp-toolbox/slack/api"
 	nsprov "github.com/viant/mcp/server/namespace"
 	"github.com/viant/scy"
+	"github.com/viant/scy/cred"
+	_ "github.com/viant/scy/kms/blowfish"
 )
 
 // Service is a lightweight Slack Web API client with scy-backed secret storage.
@@ -34,7 +36,7 @@ type Service struct {
 	defaultToken string
 }
 
-func NewService(cfg *Config) *Service {
+func NewService(cfg *Config) (*Service, error) {
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -48,39 +50,28 @@ func NewService(cfg *Config) *Service {
 	// Initialize namespace provider: prefer identity (email/sub) when available; fallback to token hash with prefix tkn-
 	svc.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
 	if cfg.TokenRef != "" {
-		if tok := loadTokenFromRef(cfg.TokenRef); tok != "" {
+		tok, err := loadTokenFromRef(cfg.TokenRef)
+		if tok != "" {
 			svc.defaultToken = tok
 		}
+		if err != nil {
+			return nil, err
+		}
 	}
-	return svc
+	return svc, nil
 }
 
-func loadTokenFromRef(ref scy.EncodedResource) string {
-	res := ref.Decode(context.Background(), map[string]any{})
+func loadTokenFromRef(ref scy.EncodedResource) (string, error) {
+	res := ref.Decode(context.Background(), &cred.SecretKey{})
 	sec, err := scy.New().Load(context.Background(), res)
 	if err != nil || sec == nil || sec.Target == nil {
-		return ""
+		return "", err
 	}
 	switch v := sec.Target.(type) {
-	case *string:
-		return strings.TrimSpace(*v)
-	case string:
-		return strings.TrimSpace(v)
-	case map[string]any:
-		if t, ok := v["token"].(string); ok {
-			return strings.TrimSpace(t)
-		}
-	default:
-		// try JSON marshal -> map
-		b, _ := json.Marshal(v)
-		var mm map[string]any
-		if json.Unmarshal(b, &mm) == nil {
-			if t, ok := mm["token"].(string); ok {
-				return strings.TrimSpace(t)
-			}
-		}
+	case *cred.SecretKey:
+		return v.Secret, nil
 	}
-	return ""
+	return "", fmt.Errorf("invalid target type: %T, expected: *cred.SecretKey", sec.Target)
 }
 
 // UseTextField indicates if MCP results should be put in the text field.

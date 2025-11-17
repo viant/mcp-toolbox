@@ -31,12 +31,12 @@ func (t *GitTarget) Init(s *Service) (domain, owner, name, ref, alias string, er
 		if len(parts) < 3 {
 			return "", "", "", "", "", fmt.Errorf("invalid url; expected domain/owner/repo")
 		}
-		domain = parts[0]
+		domain = strings.ToLower(parts[0])
 		owner = parts[1]
 		name = strings.TrimSuffix(parts[2], ".git")
 	} else {
 		// Fallback to explicit fields
-		domain = t.Account.Domain
+		domain = strings.ToLower(t.Account.Domain)
 		owner = t.Repo.Owner
 		name = t.Repo.Name
 	}
