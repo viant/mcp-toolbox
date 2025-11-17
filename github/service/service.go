@@ -287,6 +287,19 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 				break
 			}
 		}
+		// If listing on useRef succeeded but did not include the file, try default branch listing too
+		if sha == "" {
+			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
+				if defItems, lerr := cli.ListContents(ctx, token, owner, name, parent, def); lerr == nil {
+					for _, it := range defItems {
+						if it.Path == p && it.Sha != "" {
+							sha = it.Sha
+							break
+						}
+					}
+				}
+			}
+		}
 		if sha == "" {
 			// Fallback 2: Trees API traversal to resolve blob SHA at commit-ish
 			// Attempt on the effective ref first
@@ -320,6 +333,26 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 					if e.Path == p && e.Type == "blob" && e.Sha != "" {
 						sha = e.Sha
 						break
+					}
+				}
+			}
+			// If still not found, attempt default branch tree traversal as a last resort
+			if sha == "" {
+				if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
+					if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, def); terr == nil && strings.TrimSpace(treeSHA) != "" {
+						if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
+							_ = trunc
+							for _, e := range ents {
+								if e.Path == p && e.Type == "blob" && e.Sha != "" {
+									sha = e.Sha
+									break
+								}
+							}
+						} else {
+							treeErr = terr2
+						}
+					} else if terr != nil {
+						treeErr = terr
 					}
 				}
 			}
