@@ -354,7 +354,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	}
 
 	// List repo path (without clone)
-	if err := protoserver.RegisterTool[*ghservice.ListReposInput, *ghservice.ListReposOutput](base.Registry, "listRepos", descListRepoPath, func(ctx context.Context, in *ghservice.ListReposInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := protoserver.RegisterTool[*ghservice.ListReposInput, *ghservice.ListReposOutput](base.Registry, "listRepos", descListRepos, func(ctx context.Context, in *ghservice.ListReposInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		start := logToolStart("listRepos")
 		stop := startToolPending("listRepos", in, start)
 		defer stop()
