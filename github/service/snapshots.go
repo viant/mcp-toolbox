@@ -53,8 +53,38 @@ func (s *Service) sharedMemKey(domain, owner, name, sha string) string {
 const snapshotLargeThreshold = int64(100 * 1024 * 1024) // 100MB
 var snapshotTTL = 30 * time.Minute
 
-// GetOrFetchSnapshotZip fetches or returns a cached snapshot zip path for owner/name@ref
+// GetOrFetchSnapshotZip fetches or returns a cached snapshot zip path for owner/name@ref.
+// It will fall back to the repository's default branch if fetching a specific ref fails.
 func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, owner, name, ref, token string) (string, int64, bool, string, error) {
+	origRef := strings.TrimSpace(ref)
+	useRef := origRef
+	// If no ref was provided, prefer the default branch when available.
+	if useRef == "" {
+		if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
+			useRef = def
+		}
+	}
+
+	path, size, fromCache, sha, err := s.getOrFetchSnapshotZipOnce(ctx, ns, alias, domain, owner, name, useRef, token)
+	if err == nil {
+		return path, size, fromCache, sha, nil
+	}
+
+	// If caller didn't specify a ref, or we already tried default, just return the error.
+	if origRef == "" || strings.EqualFold(origRef, useRef) {
+		return path, size, fromCache, sha, err
+	}
+
+	// Fallback: resolve and use the default branch when a specific ref fails.
+	if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && !strings.EqualFold(def, useRef) {
+		return s.getOrFetchSnapshotZipOnce(ctx, ns, alias, domain, owner, name, def, token)
+	}
+	return path, size, fromCache, sha, err
+}
+
+// getOrFetchSnapshotZipOnce performs a single snapshot fetch attempt for the given ref
+// without any additional default-branch fallback.
+func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, domain, owner, name, ref, token string) (string, int64, bool, string, error) {
 	// Resolve ref to a SHA if needed
 	resolvedSHA := ref
 	if !looksLikeSHA(ref) {
@@ -65,6 +95,12 @@ func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, 
 	if resolvedSHA == "" {
 		resolvedSHA = ref
 	}
+	if strings.TrimSpace(resolvedSHA) == "" {
+		return "", 0, false, "", fmt.Errorf("empty ref and unable to resolve default SHA")
+	}
+
+	// Track previously cached shared snapshot to allow swap-on-new-SHA semantics.
+	prevSHA := s.findExistingSharedZip(domain, owner, name)
 	shared := s.sharedSnapshotPath(domain, owner, name, resolvedSHA)
 	memKey := s.sharedMemKey(domain, owner, name, resolvedSHA)
 
@@ -138,9 +174,15 @@ func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, 
 		return "", 0, false, "", err
 	}
 
-	// Indexing/cleanup and cache population
-	cacheDir := filepath.Dir(shared)
-	cleanupOldSharedRepoFiles(cacheDir, s.sharedCleanOlder)
+	// If we downloaded a new SHA for this repo, remove the previously cached zip.
+	if prevSHA != "" && !strings.EqualFold(prevSHA, resolvedSHA) {
+		oldPath := s.sharedSnapshotPath(domain, owner, name, prevSHA)
+		if oldPath != shared {
+			_ = os.Remove(oldPath)
+		}
+	}
+
+	// Cache population (no TTL-based deletion).
 	if n >= snapshotLargeThreshold {
 		// large: leave on disk only
 	} else {
