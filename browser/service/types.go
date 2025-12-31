@@ -198,11 +198,6 @@ type DriverInstallInput struct {
 	Driver string
 	// InstallDir overrides the service install dir (when empty, service default is used).
 	InstallDir string
-	// Version is optional and driver-specific.
-	// For chromedriver: supports full version (e.g. "143.0.1234.5"), major only (e.g. "143"),
-	// or "stable"/"latest" for latest stable.
-	// For geckodriver: expects "vX.Y.Z" (or "X.Y.Z").
-	Version string
 	// Force re-downloads even if the binary already exists (i.e. "update").
 	Force bool
 }
@@ -354,14 +349,14 @@ type Rect struct {
 
 type FindMatch struct {
 	// Selector is a best-effort generated CSS selector for follow-up calls.
-	Selector string `json:"selector,omitempty"`
-	Tag      string `json:"tag,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Role     string `json:"role,omitempty"`
-	Name     string `json:"name,omitempty"`
+	Selector string            `json:"selector,omitempty"`
+	Tag      string            `json:"tag,omitempty"`
+	Text     string            `json:"text,omitempty"`
+	Role     string            `json:"role,omitempty"`
+	Name     string            `json:"name,omitempty"`
 	Attrs    map[string]string `json:"attrs,omitempty"`
-	Rect     *Rect  `json:"rect,omitempty"`
-	Visible  bool   `json:"visible,omitempty"`
+	Rect     *Rect             `json:"rect,omitempty"`
+	Visible  bool              `json:"visible,omitempty"`
 }
 
 type FindInput struct {
@@ -390,17 +385,17 @@ type FindInput struct {
 
 type FindOutput struct {
 	SessionID string
-	Matches   []*FindMatch `json:"matches,omitempty"`
+	Matches   []*FindMatch   `json:"matches,omitempty"`
 	Data      map[string]any `json:"data,omitempty"`
-	Warning   string `json:"warning,omitempty"`
+	Warning   string         `json:"warning,omitempty"`
 }
 
 type ClickInput struct {
-	SessionID    string   `json:"sessionID,omitempty"`
-	Locator      *Locator `json:"locator,omitempty"`
-	TimeoutMs    int      `json:"timeoutMs,omitempty"`
-	Strict       bool     `json:"strict,omitempty"`
-	VisibleOnly  bool     `json:"visibleOnly,omitempty"`
+	SessionID   string   `json:"sessionID,omitempty"`
+	Locator     *Locator `json:"locator,omitempty"`
+	TimeoutMs   int      `json:"timeoutMs,omitempty"`
+	Strict      bool     `json:"strict,omitempty"`
+	VisibleOnly bool     `json:"visibleOnly,omitempty"`
 }
 
 type ClickOutput struct {

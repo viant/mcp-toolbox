@@ -29,10 +29,11 @@ const (
 
 // Service provides WebDriver automation utilities for the Browser MCP server.
 type Service struct {
-	useText bool
-	install string
-	fs      afs.Service
-	headful bool
+	useText               bool
+	install               string
+	fs                    afs.Service
+	headful               bool
+	autoMatchChromeDriver bool
 
 	mux      sync.Mutex
 	sessions map[string]*Session
@@ -62,11 +63,12 @@ func NewService(cfg *Config) *Service {
 	}
 	install := defaultInstallDir(cfg.InstallDir)
 	return &Service{
-		useText:  !cfg.UseData,
-		install:  install,
-		fs:       afs.New(),
-		headful:  cfg.ForceHeadful,
-		sessions: map[string]*Session{},
+		useText:               !cfg.UseData,
+		install:               install,
+		fs:                    afs.New(),
+		headful:               cfg.ForceHeadful,
+		autoMatchChromeDriver: cfg.AutoMatchChromeDriver,
+		sessions:              map[string]*Session{},
 	}
 }
 
@@ -104,7 +106,19 @@ func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, erro
 		return nil, fmt.Errorf("unsupported driver: %s", in.Driver)
 	}
 
-	path, err := ensureDriverAvailable(ctx, s.install, driver)
+	var (
+		path string
+		err  error
+	)
+	if s.autoMatchChromeDriver && driver == ChromeDriver {
+		path, err = ensureChromeDriverMatchesInstalledChrome(ctx, s.install)
+	} else {
+		path, err = ensureDriverAvailable(ctx, s.install, driver)
+	}
+	if err != nil && s.autoMatchChromeDriver && driver == ChromeDriver {
+		// Fallback to the pinned/default driver if auto-match fails.
+		path, err = ensureDriverAvailable(ctx, s.install, driver)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +300,19 @@ func (s *Service) ensureLocalDriverService(ctx context.Context, sess *Session, i
 		driverName = GeckoDriver
 	}
 	if sess.DriverPath == "" {
-		path, err := ensureDriverAvailable(ctx, s.install, driverName)
+		var (
+			path string
+			err  error
+		)
+		if s.autoMatchChromeDriver && driverName == ChromeDriver {
+			path, err = ensureChromeDriverMatchesInstalledChrome(ctx, s.install)
+		} else {
+			path, err = ensureDriverAvailable(ctx, s.install, driverName)
+		}
+		if err != nil && s.autoMatchChromeDriver && driverName == ChromeDriver {
+			// Fallback to the pinned/default driver if auto-match fails.
+			path, err = ensureDriverAvailable(ctx, s.install, driverName)
+		}
 		if err != nil {
 			return err
 		}

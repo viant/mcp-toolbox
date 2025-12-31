@@ -13,4 +13,8 @@ type Config struct {
 
 	// ForceHeadful removes headless capability args (for monitoring what the agent is doing).
 	ForceHeadful bool
+
+	// AutoMatchChromeDriver attempts to detect the locally installed Chrome/Chromium major version
+	// and downloads/updates chromedriver to the matching Chrome-for-Testing release (best-effort).
+	AutoMatchChromeDriver bool
 }
