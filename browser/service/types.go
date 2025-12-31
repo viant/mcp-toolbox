@@ -19,9 +19,10 @@ type StartInput struct {
 }
 
 type StartOutput struct {
-	Pid        int
-	DriverPath string
-	SessionID  string // host:port
+	Pid           int
+	DriverPath    string
+	DriverVersion string
+	SessionID     string // host:port
 }
 
 type StopInput struct {
@@ -267,8 +268,9 @@ type SessionInfo struct {
 	Browser   string
 	Remote    string
 
-	DriverPath   string
-	Capabilities []string
+	DriverPath    string
+	DriverVersion string
+	Capabilities  []string
 
 	Open           bool
 	CaptureEnabled bool

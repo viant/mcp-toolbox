@@ -40,12 +40,13 @@ type Service struct {
 }
 
 type Session struct {
-	ID           string
-	Browser      string
-	Pid          int
-	DriverPath   string
-	Capabilities []string
-	Remote       string
+	ID            string
+	Browser       string
+	Pid           int
+	DriverPath    string
+	DriverVersion string
+	Capabilities  []string
+	Remote        string
 
 	driver  selenium.WebDriver
 	service *selenium.Service
@@ -123,6 +124,11 @@ func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, erro
 		return nil, err
 	}
 	sess.DriverPath = path
+	if sess.Browser == ChromeBrowser {
+		if v, ok := chromedriverFullVersion(ctx, path); ok {
+			sess.DriverVersion = v
+		}
+	}
 
 	// Start driver service.
 	switch driver {
@@ -145,9 +151,10 @@ func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, erro
 	s.mux.Unlock()
 
 	return &StartOutput{
-		Pid:        sess.Pid,
-		DriverPath: sess.DriverPath,
-		SessionID:  sess.ID,
+		Pid:           sess.Pid,
+		DriverPath:    sess.DriverPath,
+		DriverVersion: sess.DriverVersion,
+		SessionID:     sess.ID,
 	}, nil
 }
 
@@ -317,6 +324,11 @@ func (s *Service) ensureLocalDriverService(ctx context.Context, sess *Session, i
 			return err
 		}
 		sess.DriverPath = path
+		if sess.Browser == ChromeBrowser {
+			if v, ok := chromedriverFullVersion(ctx, path); ok {
+				sess.DriverVersion = v
+			}
+		}
 	}
 
 	switch driverName {

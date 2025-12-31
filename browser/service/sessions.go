@@ -24,6 +24,7 @@ func (s *Service) Sessions(_ context.Context, in *SessionsInput) (*SessionsOutpu
 			Browser:        sess.Browser,
 			Remote:         sess.Remote,
 			DriverPath:     sess.DriverPath,
+			DriverVersion:  sess.DriverVersion,
 			Capabilities:   append([]string(nil), sess.Capabilities...),
 			Open:           open,
 			CaptureEnabled: captureEnabled,

@@ -7,3 +7,5 @@ By default returns only currently open sessions; set `includeAll=true` to includ
 ## Input
 - `includeAll`: bool
 
+## Output
+- `sessions[].driverVersion`: best-effort driver version string (for chromedriver)
