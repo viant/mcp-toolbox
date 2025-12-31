@@ -18,6 +18,7 @@ var supportedSelectors = map[string]bool{
 	selenium.ByID:              true,
 	selenium.ByLinkText:        true,
 	selenium.ByPartialLinkText: true,
+	"locator":                  true,
 }
 
 // ByAndValue returns Selenium selector type and value.
@@ -25,6 +26,12 @@ func (s WebSelector) ByAndValue() (string, string) {
 	selector := string(s)
 	if selector == "" {
 		return selenium.ByXPATH, selector
+	}
+	// Locator expressions (Playwright-ish) are encoded in selector blocks like:
+	//   (text='Sign in') or (role=button name="Sign in")
+	// These are not Selenium "By" strategies, so we mark them with a special By.
+	if _, ok := parseLocatorExpr(selector); ok {
+		return "locator", selector
 	}
 	if strings.HasPrefix(selector, "css:") {
 		return selenium.ByCSSSelector, selector[4:]

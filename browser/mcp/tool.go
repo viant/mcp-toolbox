@@ -71,6 +71,18 @@ var descScreenshotData string
 //go:embed tools/browserEvalJS.md
 var descEvalJS string
 
+//go:embed tools/browserFind.md
+var descFind string
+
+//go:embed tools/browserClick.md
+var descClick string
+
+//go:embed tools/browserFill.md
+var descFill string
+
+//go:embed tools/browserPress.md
+var descPress string
+
 func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	svc := h.service
 
@@ -471,6 +483,46 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	if err := protoserver.RegisterTool[*browsersvc.EvalJSInput, *browsersvc.EvalJSOutput](base.Registry, "webdriverEvalJS", descEvalJS, func(ctx context.Context, in *browsersvc.EvalJSInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		out, err := svc.EvalJS(ctx, in)
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	if err := protoserver.RegisterTool[*browsersvc.FindInput, *browsersvc.FindOutput](base.Registry, "browserFind", descFind, func(ctx context.Context, in *browsersvc.FindInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		out, err := svc.Find(ctx, in)
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	if err := protoserver.RegisterTool[*browsersvc.ClickInput, *browsersvc.ClickOutput](base.Registry, "browserClick", descClick, func(ctx context.Context, in *browsersvc.ClickInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		out, err := svc.Click(ctx, in)
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	if err := protoserver.RegisterTool[*browsersvc.FillInput, *browsersvc.FillOutput](base.Registry, "browserFill", descFill, func(ctx context.Context, in *browsersvc.FillInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		out, err := svc.Fill(ctx, in)
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	if err := protoserver.RegisterTool[*browsersvc.PressInput, *browsersvc.PressOutput](base.Registry, "browserPress", descPress, func(ctx context.Context, in *browsersvc.PressInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		out, err := svc.Press(ctx, in)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}

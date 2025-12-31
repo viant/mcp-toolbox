@@ -309,6 +309,134 @@ type EvalJSOutput struct {
 	Result any
 }
 
+// Locator is a Playwright-inspired element query that can be resolved by the service.
+// It is intentionally small and maps to WebDriver + JS filtering as needed.
+//
+// Resolution order (rough):
+// 1) base selector (CSS/XPath) if present
+// 2) role/name/text filters applied by JS when needed
+type Locator struct {
+	// CSS is an optional CSS selector to narrow down candidates.
+	CSS string `json:"css,omitempty"`
+	// XPath is an optional XPath selector to narrow down candidates.
+	XPath string `json:"xpath,omitempty"`
+
+	// Role matches aria role (explicit role attr only for now).
+	Role string `json:"role,omitempty"`
+	// Name matches accessible-ish name (uses aria-label, aria-labelledby, and element text).
+	Name string `json:"name,omitempty"`
+	// Text matches visible-ish text (uses innerText when available).
+	Text string `json:"text,omitempty"`
+	// Exact controls Text/Name exactness (defaults false = contains).
+	Exact bool `json:"exact,omitempty"`
+
+	// TestID matches data-testid attribute by default (configurable on server later).
+	TestID string `json:"testID,omitempty"`
+
+	// Within optionally scopes the search to a container selector (CSS or XPath).
+	Within *Locator `json:"within,omitempty"`
+
+	// Composition:
+	// - All: intersection (element must match all locators)
+	// - Any: union (element can match any locator)
+	// - Not: exclusion (exclude elements matching this locator)
+	All []*Locator `json:"all,omitempty"`
+	Any []*Locator `json:"any,omitempty"`
+	Not *Locator   `json:"not,omitempty"`
+}
+
+type Rect struct {
+	X      float64 `json:"x,omitempty"`
+	Y      float64 `json:"y,omitempty"`
+	Width  float64 `json:"width,omitempty"`
+	Height float64 `json:"height,omitempty"`
+}
+
+type FindMatch struct {
+	// Selector is a best-effort generated CSS selector for follow-up calls.
+	Selector string `json:"selector,omitempty"`
+	Tag      string `json:"tag,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Role     string `json:"role,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Attrs    map[string]string `json:"attrs,omitempty"`
+	Rect     *Rect  `json:"rect,omitempty"`
+	Visible  bool   `json:"visible,omitempty"`
+}
+
+type FindInput struct {
+	SessionID string `json:"sessionID,omitempty"`
+
+	// Locator describes what to find.
+	Locator *Locator `json:"locator,omitempty"`
+
+	// Key stores the output matches under Data[key] when set.
+	Key string `json:"key,omitempty"`
+
+	// MaxWaitMs controls auto-wait for matches (default 10000).
+	MaxWaitMs int `json:"maxWaitMs,omitempty"`
+	// PollMs controls polling interval (default 200).
+	PollMs int `json:"pollMs,omitempty"`
+
+	// MinMatches waits until at least N matches are found (default 1).
+	MinMatches int `json:"minMatches,omitempty"`
+	// MaxMatches limits returned matches (default 20).
+	MaxMatches int `json:"maxMatches,omitempty"`
+	// Strict fails if matches != 1.
+	Strict bool `json:"strict,omitempty"`
+	// VisibleOnly filters to displayed elements only.
+	VisibleOnly bool `json:"visibleOnly,omitempty"`
+}
+
+type FindOutput struct {
+	SessionID string
+	Matches   []*FindMatch `json:"matches,omitempty"`
+	Data      map[string]any `json:"data,omitempty"`
+	Warning   string `json:"warning,omitempty"`
+}
+
+type ClickInput struct {
+	SessionID    string   `json:"sessionID,omitempty"`
+	Locator      *Locator `json:"locator,omitempty"`
+	TimeoutMs    int      `json:"timeoutMs,omitempty"`
+	Strict       bool     `json:"strict,omitempty"`
+	VisibleOnly  bool     `json:"visibleOnly,omitempty"`
+}
+
+type ClickOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
+type FillInput struct {
+	SessionID   string   `json:"sessionID,omitempty"`
+	Locator     *Locator `json:"locator,omitempty"`
+	Text        string   `json:"text,omitempty"`
+	ClearFirst  bool     `json:"clearFirst,omitempty"`
+	TimeoutMs   int      `json:"timeoutMs,omitempty"`
+	Strict      bool     `json:"strict,omitempty"`
+	VisibleOnly bool     `json:"visibleOnly,omitempty"`
+}
+
+type FillOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
+type PressInput struct {
+	SessionID   string   `json:"sessionID,omitempty"`
+	Locator     *Locator `json:"locator,omitempty"`
+	Key         string   `json:"key,omitempty"`
+	TimeoutMs   int      `json:"timeoutMs,omitempty"`
+	Strict      bool     `json:"strict,omitempty"`
+	VisibleOnly bool     `json:"visibleOnly,omitempty"`
+}
+
+type PressOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
 type CaptureSummary struct {
 	StartedAt         time.Time
 	RequestsInFlight  int

@@ -20,6 +20,11 @@ go run ./browser/cmd/browser-mcp -a :8089 --headful
 - `browserOpen` / `browserClose`: opens/closes a browser session (auto-starts a local driver for `localhost:PORT` sessions).
 - `browserRun`: runs Endly-style commands.
 - `browserCallDriver` / `browserCallElement`: reflection proxies to selenium WebDriver/WebElement methods.
+- `browserFind`: Playwright-like locator discovery (multi-match) with metadata (text/attrs/rect) + auto-wait.
+- Locator supports composition: `within` (scope), `any` (union), `all` (intersection), `not` (exclude).
+- `locator.role` matches explicit `role` attribute or common implicit roles (best-effort).
+- `locator.name` is accessible-ish (aria-label/labelledby/label/alt/title/value/placeholder/text).
+- `browserClick` / `browserFill` / `browserPress`: locator-based actions with auto-wait.
 - `browserDriverInstall` / `browserDriverUpdate`: install or update driver binaries (chromedriver supports `"stable"` / major / full version).
 - `browserGetSource`: returns page source HTML (optionally writes to `destURL` via `viant/afs`).
 - `browserGetDOM`: returns DOM `outerHTML` (cross-browser) or Chrome/Edge CDP snapshot.

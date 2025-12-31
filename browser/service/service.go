@@ -439,7 +439,7 @@ func (s *Service) CallDriver(_ context.Context, in *WebDriverCallInput) (*CallOu
 	return resp, s.call(sess, sess.driver, sess.driver, in.Call, resp, key, in.PathKind)
 }
 
-func (s *Service) CallElement(_ context.Context, in *WebElementCallInput) (*WebElementCallOutput, error) {
+func (s *Service) CallElement(ctx context.Context, in *WebElementCallInput) (*WebElementCallOutput, error) {
 	if in == nil || in.Call == nil || in.Selector == nil {
 		return nil, errors.New("selector and call are required")
 	}
@@ -454,6 +454,72 @@ func (s *Service) CallElement(_ context.Context, in *WebElementCallInput) (*WebE
 
 	if err := in.Selector.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid selector: %v", err)
+	}
+
+	// Locator selectors are resolved via DOM-side query (multi-match) + best-effort WebElement conversion.
+	if in.Selector.By == "locator" {
+		loc, ok := parseLocatorExpr(in.Selector.Value)
+		if !ok {
+			out.LookupError = fmt.Sprintf("invalid locator: %s", in.Selector.Value)
+			return out, nil
+		}
+		visibleOnly := false
+		switch in.Call.Method {
+		case "Click", "SendKeys", "Clear", "Submit":
+			visibleOnly = true
+		}
+		waitMs := in.Call.WaitTimeMs
+		elements, matches, err := s.ResolveLocator(ctx, sess, loc, &ResolveLocatorOptions{
+			MaxWaitMs:       waitMs,
+			MinMatches:      1,
+			MaxMatches:      1,
+			Strict:          false,
+			VisibleOnly:     visibleOnly,
+			ResolveElements: true,
+		})
+		if err != nil {
+			out.LookupError = fmt.Sprintf("failed to resolve locator: %v", err)
+			return out, nil
+		}
+		if len(elements) == 0 {
+			out.LookupError = fmt.Sprintf("no element matched locator")
+			return out, nil
+		}
+		_ = matches
+		// proceed with the resolved element as if found by selector
+		element := elements[0]
+		callOut := &CallOutput{Data: map[string]any{}}
+		key := in.Selector.Key
+		if key == "" {
+			key = in.Selector.Value
+		}
+		if in.Call.Method == "Click" || in.Call.Method == "SendKeys" || in.Call.Method == "Clear" || in.Call.Method == "Submit" {
+			if err := s.ensureVisible(element); err != nil {
+				out.LookupError = fmt.Sprintf("element %s is not visible: %v", in.Selector.Value, err)
+				return nil, err
+			}
+		}
+		err = s.call(sess, sess.driver, element, in.Call, callOut, key, in.PathKind)
+		if isStaleElementError(err) {
+			// best-effort: re-resolve
+			elements, _, _ = s.ResolveLocator(ctx, sess, loc, &ResolveLocatorOptions{
+				MaxWaitMs:       waitMs,
+				MinMatches:      1,
+				MaxMatches:      1,
+				Strict:          false,
+				VisibleOnly:     visibleOnly,
+				ResolveElements: true,
+			})
+			if len(elements) > 0 {
+				err = s.call(sess, sess.driver, elements[0], in.Call, callOut, key, in.PathKind)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		merge(out.Data, callOut.Data)
+		out.Result = callOut.Result
+		return out, nil
 	}
 
 	var element selenium.WebElement
