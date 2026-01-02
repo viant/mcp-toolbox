@@ -50,12 +50,23 @@ type Session struct {
 
 	driver  selenium.WebDriver
 	service *selenium.Service
+	lock    sync.Mutex
+
+	handlesMux sync.Mutex
+	handleSeq  uint64
+	handles    map[string]*elementHandle
 
 	// state provides $var expansion for command parameters and exit checks.
 	state data.Map
 
 	capture *CaptureState
 	net     *netTracker
+}
+
+type elementHandle struct {
+	element  selenium.WebElement
+	created  time.Time
+	lastUsed time.Time
 }
 
 func NewService(cfg *Config) *Service {
@@ -93,6 +104,18 @@ func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, erro
 	old := s.sessions[sessionID]
 	s.mux.Unlock()
 	if old != nil {
+		// If an existing driver on this port appears healthy, reuse it instead of
+		// stopping. This prevents disrupting active sessions and avoids timeouts.
+		host, portStr := splitHostPort(sessionID)
+		port, _ := strconv.Atoi(portStr)
+		if !in.Restart && driverStatusOK(host, port) {
+			return &StartOutput{
+				Pid:           old.Pid,
+				DriverPath:    old.DriverPath,
+				DriverVersion: old.DriverVersion,
+				SessionID:     old.ID,
+			}, nil
+		}
 		_ = s.stopSession(old)
 	}
 
@@ -131,6 +154,7 @@ func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, erro
 	}
 
 	// Start driver service.
+	// Start driver service and wait until it responds healthy.
 	switch driver {
 	case ChromeDriver:
 		svc, err := selenium.NewChromeDriverService(sess.DriverPath, port)
@@ -138,12 +162,25 @@ func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, erro
 			return nil, fmt.Errorf("failed to start chromedriver service %w", err)
 		}
 		sess.service = svc
+		// Best-effort set PID if available (tebeka/selenium doesn't expose directly).
 	case GeckoDriver:
 		svc, err := selenium.NewGeckoDriverService(sess.DriverPath, port)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start geckodriver service %w", err)
 		}
 		sess.service = svc
+	}
+
+	// Probe readiness with backoff up to ~10s.
+	start := time.Now()
+	for {
+		if driverStatusOK("localhost", port) {
+			break
+		}
+		if time.Since(start) > 10*time.Second {
+			return nil, fmt.Errorf("webdriver did not become ready on port %d", port)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	s.mux.Lock()
@@ -263,6 +300,9 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	}
 	sess.driver = driver
 	sess.Remote = in.Remote
+	if sess.handles == nil {
+		sess.handles = map[string]*elementHandle{}
+	}
 
 	// Reset trackers per open.
 	if sess.capture != nil {
@@ -274,7 +314,20 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 
 	// Ensure session cleanup.
 	_ = ctx
-	return &OpenSessionOutput{SessionID: sess.ID}, nil
+	out := &OpenSessionOutput{SessionID: sess.ID}
+	if sess.driver != nil {
+		out.WebDriverSessionID = sess.driver.SessionID()
+	}
+	if strings.TrimSpace(in.URL) != "" {
+		nav := navigationWithDefaults(in.Navigation)
+		if err := s.getWithGuard(sess, in.URL, nav); err != nil {
+			return nil, err
+		}
+		if err := s.afterNavigate(ctx, sess, nav); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) ensureLocalDriverService(ctx context.Context, sess *Session, in *OpenSessionInput) error {
@@ -426,6 +479,9 @@ func (s *Service) Run(ctx context.Context, in *RunInput) (*RunOutput, error) {
 					if err := s.getWithGuard(sess, URL, nav); err != nil {
 						return nil, err
 					}
+					if err := s.afterNavigate(ctx, sess, nav); err != nil {
+						return nil, err
+					}
 					sess.drainTrackers()
 					continue
 				}
@@ -474,6 +530,8 @@ func (s *Service) CallDriver(_ context.Context, in *WebDriverCallInput) (*CallOu
 	if key == "" {
 		key = in.Call.Method
 	}
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
 	return resp, s.call(sess, sess.driver, sess.driver, in.Call, resp, key, in.PathKind)
 }
 
@@ -561,6 +619,8 @@ func (s *Service) CallElement(ctx context.Context, in *WebElementCallInput) (*We
 	}
 
 	var element selenium.WebElement
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
 	err = sess.driver.WaitWithTimeout(func(wd selenium.WebDriver) (bool, error) {
 		element, err = sess.driver.FindElement(in.Selector.By, in.Selector.Value)
 		if element != nil {

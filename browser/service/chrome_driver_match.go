@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,7 +51,7 @@ func ensureChromeDriverMatchesInstalledChromeWithDetails(ctx context.Context, in
 	if strings.TrimSpace(installDir) == "" {
 		return "", "", "", false, fmt.Errorf("installDir was empty")
 	}
-	major, _, derr := detectInstalledChromeMajor(ctx)
+	major, rawOut, derr := detectInstalledChromeMajor(ctx)
 	if derr != nil || major <= 0 {
 		path, usedVersion, artifactURL, downloaded, err = ensureDriverAvailableWithOptions(ctx, installDir, ChromeDriver, "", force)
 		if err == nil && usedVersion == "" {
@@ -58,15 +59,27 @@ func ensureChromeDriverMatchesInstalledChromeWithDetails(ctx context.Context, in
 				usedVersion = v
 			}
 		}
+		if err == nil {
+			msg := "chromedriver match: could not detect local Chrome; using default chromedriver"
+			if usedVersion != "" {
+				msg += fmt.Sprintf(" (driver %s)", usedVersion)
+			}
+			log.Printf("%s", msg)
+		}
 		return path, usedVersion, artifactURL, downloaded, err
 	}
+	// We detected a local Chrome major; log it.
+	_ = rawOut
+	log.Printf("chromedriver match: detected Chrome major %d", major)
 
 	dest := filepath.Join(installDir, ChromeDriver)
 	if info, statErr := os.Stat(dest); !force && statErr == nil && info.Mode().IsRegular() {
 		if drvMajor, ok := chromedriverMajor(ctx, dest); ok && drvMajor == major {
 			if v, ok := chromedriverFullVersion(ctx, dest); ok {
+				log.Printf("chromedriver match: using existing chromedriver %s (for Chrome %d)", v, major)
 				return dest, v, "", false, nil
 			}
+			log.Printf("chromedriver match: using existing chromedriver (major %d)", major)
 			return dest, strconv.Itoa(major), "", false, nil
 		}
 		// mismatch -> force update to correct major
@@ -77,6 +90,21 @@ func ensureChromeDriverMatchesInstalledChromeWithDetails(ctx context.Context, in
 	if err == nil && usedVersion == "" {
 		if v, ok := chromedriverFullVersion(ctx, path); ok {
 			usedVersion = v
+		}
+	}
+	if err == nil {
+		if downloaded {
+			if usedVersion != "" {
+				log.Printf("chromedriver match: downloaded chromedriver %s for Chrome %d", usedVersion, major)
+			} else {
+				log.Printf("chromedriver match: downloaded chromedriver for Chrome %d", major)
+			}
+		} else {
+			if usedVersion != "" {
+				log.Printf("chromedriver match: prepared chromedriver %s for Chrome %d", usedVersion, major)
+			} else {
+				log.Printf("chromedriver match: prepared chromedriver for Chrome %d", major)
+			}
 		}
 	}
 	return path, usedVersion, artifactURL, downloaded, err

@@ -157,7 +157,7 @@ func fetchChromeForTestingVersion(ctx context.Context, url string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -181,7 +181,7 @@ func download(ctx context.Context, u string, dest string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}

@@ -559,7 +559,7 @@ func postW3C(remote, wdSession, endpoint string, payload map[string]any) (json.R
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

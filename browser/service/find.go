@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/tebeka/selenium"
 )
 
 const (
@@ -61,7 +63,7 @@ func (s *Service) Find(ctx context.Context, in *FindInput) (*FindOutput, error) 
 	var last []*FindMatch
 	var lastErr error
 	for time.Since(start) < time.Duration(maxWait)*time.Millisecond {
-		matches, err := s.findOnce(sess, in.Locator, max, in.VisibleOnly)
+		matches, err := s.findOnce(sess, in.Locator, max, in.VisibleOnly, in.returnSelectors())
 		if err != nil {
 			lastErr = err
 		} else {
@@ -69,10 +71,10 @@ func (s *Service) Find(ctx context.Context, in *FindInput) (*FindOutput, error) 
 			last = matches
 			if in.Strict {
 				if len(matches) == 1 {
-					return s.findOutput(in, matches), nil
+					return s.findOutput(sess, in, matches), nil
 				}
 			} else if len(matches) >= min {
-				return s.findOutput(in, matches), nil
+				return s.findOutput(sess, in, matches), nil
 			}
 		}
 		select {
@@ -84,28 +86,52 @@ func (s *Service) Find(ctx context.Context, in *FindInput) (*FindOutput, error) 
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	out := s.findOutput(in, last)
+	out := s.findOutput(sess, in, last)
 	if in.Strict {
 		out.Warning = fmt.Sprintf("strict locator expected 1 match, got %d", len(last))
 	}
 	return out, nil
 }
 
-func (s *Service) findOutput(in *FindInput, matches []*FindMatch) *FindOutput {
+func (in *FindInput) returnSelectors() bool {
+	if in == nil || in.ReturnSelectors == nil {
+		return true
+	}
+	return *in.ReturnSelectors
+}
+
+func (s *Service) findOutput(sess *Session, in *FindInput, matches []*FindMatch) *FindOutput {
 	out := &FindOutput{SessionID: in.SessionID, Matches: matches, Data: map[string]any{}}
 	key := strings.TrimSpace(in.Key)
 	if key != "" {
 		out.Data[key] = matches
 	}
+	if in.ReturnHandles && sess != nil && sess.driver != nil {
+		sess.lock.Lock()
+		defer sess.lock.Unlock()
+		for _, m := range matches {
+			if m == nil || m.Handle != "" {
+				continue
+			}
+			if m.Selector == "" {
+				continue
+			}
+			el, err := sess.driver.FindElement(selenium.ByCSSSelector, m.Selector)
+			if err != nil || el == nil {
+				continue
+			}
+			m.Handle = sess.storeHandle(el)
+		}
+	}
 	return out
 }
 
-func (s *Service) findOnce(sess *Session, loc *Locator, limit int, visibleOnly bool) ([]*FindMatch, error) {
+func (s *Service) findOnce(sess *Session, loc *Locator, limit int, visibleOnly bool, returnSelectors bool) ([]*FindMatch, error) {
 	raw, err := json.Marshal(loc)
 	if err != nil {
 		return nil, err
 	}
-	res, err := sess.driver.ExecuteScript(findScript, []any{string(raw), limit, visibleOnly})
+	res, err := sess.driver.ExecuteScript(findScript, []any{string(raw), limit, visibleOnly, returnSelectors})
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +148,12 @@ func (s *Service) findOnce(sess *Session, loc *Locator, limit int, visibleOnly b
 }
 
 const findScript = `
-return (function(locatorJSON, limit, visibleOnly) {
+return (function(locatorJSON, limit, visibleOnly, returnSelectors) {
+  // Backwards-compatible default: older servers/callers passed only 3 args.
+  // In that case returnSelectors is undefined; treat it as true.
+  if (returnSelectors === undefined || returnSelectors === null) {
+    returnSelectors = true;
+  }
   function safeStr(v) { return (v == null) ? "" : String(v); }
   function norm(s) { return safeStr(s).trim(); }
   function lc(s) { return norm(s).toLowerCase(); }
@@ -144,11 +175,25 @@ return (function(locatorJSON, limit, visibleOnly) {
   }
 
   function cssEscapeIdent(s) {
+    s = safeStr(s);
+    // Prefer native implementation when available (correct for all Unicode).
+    if (window.CSS && typeof CSS.escape === 'function') {
+      return CSS.escape(s);
+    }
     // Minimal escape for ids/testids in generated selectors.
-    return safeStr(s).replace(/([ #;?%&,.+*~':\"!^$\\[\\]()=>|\\/])/g,'\\\\$1');
+    // Avoid regex literals here (some environments reject identity escapes within
+    // character classes); do it with a simple loop.
+    const specials = " #;?%&,.+*~':\\\"!^$[]()=>|/\\\\";
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      out += (specials.indexOf(ch) !== -1) ? ('\\\\' + ch) : ch;
+    }
+    return out;
   }
 
   function cssPath(el) {
+    if (!returnSelectors) return '';
     if (!el || el.nodeType !== 1) return '';
     const id = el.getAttribute && el.getAttribute('id');
     if (id) return '#' + cssEscapeIdent(id);

@@ -18,6 +18,8 @@ This tool is intended for:
 - `strict`: require exactly 1 match
 - `visibleOnly`: filter to visible elements
 - `key`: optional output key (stores matches under `result.data[key]`)
+- `returnSelectors`: when false, skips `matches[].selector` generation (default true)
+- `returnHandles`: when true, resolves server-side element handles returned as `matches[].handle` (default false)
 
 ### Locator fields
 
@@ -37,7 +39,7 @@ This tool is intended for:
 ## Output
 
 Returns:
-- `matches[]`: each has `{selector, tag, text, role, name, attrs, rect, visible}`
+- `matches[]`: each has `{selector, handle, tag, text, role, name, attrs, rect, visible}`
 - `data[key]`: optional copy of matches when `key` is set
 
 ## Example

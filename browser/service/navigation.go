@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -65,6 +66,89 @@ func (s *Service) getWithGuard(sess *Session, URL string, nav NavigationOptions)
 		s.autoScrollStabilize(sess, nav)
 	}
 	return nil
+}
+
+func (s *Service) afterNavigate(ctx context.Context, sess *Session, nav NavigationOptions) error {
+	if sess == nil || sess.driver == nil {
+		return fmt.Errorf("webdriver session not open")
+	}
+	// Ensure a network tracker exists when idle detection is requested.
+	if (nav.IdleMaxWaitMs > 0 || nav.IdleThreshold > 0) && sess.capture == nil && sess.net == nil {
+		sess.net = &netTracker{}
+	}
+
+	if err := s.waitDocumentReady(sess, time.Duration(nav.TimeoutMs)*time.Millisecond); err != nil {
+		// Treat readiness as best-effort; return errors since callers often rely on it for determinism.
+		return err
+	}
+
+	// Optional post-nav wait for selector/locator.
+	waitLoc := nav.WaitFor
+	if waitLoc == nil && strings.TrimSpace(nav.WaitForSelector) != "" {
+		waitLoc = &Locator{CSS: strings.TrimSpace(nav.WaitForSelector)}
+	}
+	if waitLoc != nil {
+		state := strings.ToLower(strings.TrimSpace(nav.WaitForState))
+		if state == "" {
+			state = WaitStateVisible
+		}
+		_, err := s.Wait(ctx, &WaitInput{
+			SessionID:   sess.ID,
+			Locator:     waitLoc,
+			State:       state,
+			TimeoutMs:   nav.TimeoutMs,
+			PollMs:      defaultFindPollMs,
+			VisibleOnly: state == WaitStateVisible,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	// Optional idle wait (with or without auto-scroll).
+	if nav.IdleMaxWaitMs > 0 || nav.IdleThreshold > 0 {
+		s.waitNetworkIdle(sess, nav)
+	}
+	return nil
+}
+
+func (s *Service) waitDocumentReady(sess *Session, timeout time.Duration) error {
+	if sess == nil || sess.driver == nil {
+		return fmt.Errorf("webdriver session not open")
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		sess.lock.Lock()
+		v, err := sess.driver.ExecuteScript("return document.readyState;", nil)
+		sess.lock.Unlock()
+		if err == nil {
+			if st, ok := v.(string); ok {
+				if st == "complete" || st == "interactive" {
+					return nil
+				}
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return fmt.Errorf("document did not reach ready state within %s", timeout)
+}
+
+func (s *Service) waitNetworkIdle(sess *Session, nav NavigationOptions) {
+	maxWaitMs := nav.IdleMaxWaitMs
+	if maxWaitMs <= 0 {
+		maxWaitMs = nav.TimeoutMs
+	}
+	deadline := time.Now().Add(time.Duration(maxWaitMs) * time.Millisecond)
+	idleWindow := time.Duration(nav.IdleWindowMs) * time.Millisecond
+	idleSince := time.Time{}
+
+	for time.Now().Before(deadline) {
+		if s.isNetworkIdle(sess, nav.IdleThreshold, idleWindow, &idleSince) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		sess.drainTrackers()
+	}
 }
 
 func isPageLoadTimeout(err error) bool {

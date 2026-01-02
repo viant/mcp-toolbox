@@ -7,12 +7,13 @@ import (
 )
 
 // parseLocatorExpr parses a minimal locator expression used in browserRun selector blocks, e.g.:
-//   "text=Sign in"
-//   "role=button name='Sign in' exact=true"
-//   "within(text='Dialog') role=button name='Sign in'"
-//   "or(text='Sign in', text='Log in')"
-//   "and(role=button, name='Submit')"    (equivalent to multiple terms, but explicit)
-//   "not(text='Cancel')"
+//
+//	"text=Sign in"
+//	"role=button name='Sign in' exact=true"
+//	"within(text='Dialog') role=button name='Sign in'"
+//	"or(text='Sign in', text='Log in')"
+//	"and(role=button, name='Submit')"    (equivalent to multiple terms, but explicit)
+//	"not(text='Cancel')"
 //
 // It returns (locator, ok). When ok=false, caller should treat it as a normal selector.
 func parseLocatorExpr(expr string) (*Locator, bool) {
@@ -186,7 +187,7 @@ func extractFuncCall(expr string, name string) (inner string, after string, ok b
 		if c == ')' {
 			depth--
 			if depth == 0 {
-				inner = strings.TrimSpace(expr[len(prefix) : i])
+				inner = strings.TrimSpace(expr[len(prefix):i])
 				after = strings.TrimSpace(expr[i+1:])
 				return inner, after, true
 			}
@@ -298,12 +299,53 @@ func scanKeyValueTokens(s string) map[string]string {
 				i++
 			}
 			v = s[vStart:i]
+
+			// Support multi-word unquoted values (e.g. "text=Sign in").
+			// Continue consuming tokens until the next key=value pair is detected.
+			for {
+				j := i
+				for j < n && isSpace(s[j]) {
+					j++
+				}
+				if j >= n {
+					break
+				}
+				// If the next token looks like a new "key=value" pair, stop.
+				if looksLikeKeyValueToken(s[j:]) {
+					break
+				}
+				// Otherwise, treat it as a continuation of the current value.
+				tStart := j
+				for j < n && !isSpace(s[j]) {
+					j++
+				}
+				v += " " + s[tStart:j]
+				i = j
+			}
 		}
 		if k != "" {
 			out[k] = v
 		}
 	}
 	return out
+}
+
+func looksLikeKeyValueToken(s string) bool {
+	s = strings.TrimLeft(s, " \t\r\n")
+	if s == "" {
+		return false
+	}
+	// token key must be non-empty and contain no whitespace.
+	eq := strings.IndexByte(s, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i := 0; i < eq; i++ {
+		if isSpace(s[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSpace(b byte) bool {

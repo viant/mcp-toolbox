@@ -71,7 +71,7 @@ func (s *Service) ResolveLocator(ctx context.Context, sess *Session, locator *Lo
 	var last []*FindMatch
 	var lastErr error
 	for time.Since(start) < time.Duration(maxWait)*time.Millisecond {
-		matches, err := s.findOnce(sess, locator, max, o.VisibleOnly)
+		matches, err := s.findOnce(sess, locator, max, o.VisibleOnly, true)
 		if err != nil {
 			lastErr = err
 		} else {
@@ -125,4 +125,3 @@ func (s *Service) ResolveLocator(ctx context.Context, sess *Session, locator *Lo
 	}
 	return elements, outMatches, nil
 }
-

@@ -4,7 +4,7 @@ Fills an input/textarea-like element resolved by a Playwright-like `locator`, wi
 
 ## Input
 - `sessionID`: `host:port` (default `localhost:4444`)
-- `locator`: see `browserFind` locator schema
+- `locator`: see `browserFind` locator schema (supports `locator.handle` from `browserFind` when `returnHandles=true`)
 - `text`: text to send
 - `clearFirst`: call `Clear()` before typing (default false)
 - `timeoutMs`: resolution timeout (default 10000)
@@ -13,4 +13,3 @@ Fills an input/textarea-like element resolved by a Playwright-like `locator`, wi
 
 ## Output
 - `match`: metadata of the filled element (best-effort)
-

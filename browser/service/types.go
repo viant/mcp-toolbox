@@ -16,6 +16,8 @@ type StartInput struct {
 	Driver       string
 	Capabilities []string
 	Port         int
+	// Restart forces restarting the driver on the port even if a healthy one is detected.
+	Restart bool
 }
 
 type StartOutput struct {
@@ -36,9 +38,17 @@ type OpenSessionInput struct {
 	Capabilities []string
 	SessionID    string // host:port
 	Remote       string // optional; computed from SessionID if empty
+
+	// URL optionally navigates right after session open.
+	URL string
+	// Navigation optionally controls navigation behavior when URL is set (and is used by browserRun get(url) guard too).
+	Navigation *NavigationOptions
 }
 
-type OpenSessionOutput struct{ SessionID string }
+type OpenSessionOutput struct {
+	SessionID          string
+	WebDriverSessionID string
+}
 
 type CloseSessionInput struct{ SessionID string }
 type CloseSessionOutput struct{ SessionID string }
@@ -83,6 +93,13 @@ type NavigationOptions struct {
 	IdleThreshold  int
 	IdleWindowMs   int
 	IdleMaxWaitMs  int
+
+	// WaitForSelector optionally waits for a CSS selector to appear (and, by default, become visible) after navigation.
+	WaitForSelector string
+	// WaitFor optionally waits for a locator to appear after navigation (takes precedence over WaitForSelector when set).
+	WaitFor *Locator
+	// WaitForState controls how WaitFor is evaluated: "attached"|"visible"|"hidden"|"detached" (default: "visible").
+	WaitForState string
 }
 
 type RunInput struct {
@@ -280,6 +297,24 @@ type SessionsOutput struct {
 	Sessions []*SessionInfo
 }
 
+type HealthInput struct {
+	IncludeAll bool
+}
+
+type HealthItem struct {
+	SessionID     string   `json:"sessionID"`
+	Open          bool     `json:"open"`
+	DriverStatus  string   `json:"driverStatus"`
+	Remote        string   `json:"remote,omitempty"`
+	DriverPath    string   `json:"driverPath,omitempty"`
+	DriverVersion string   `json:"driverVersion,omitempty"`
+	Warnings      []string `json:"warnings,omitempty"`
+}
+
+type HealthOutput struct {
+	Sessions []*HealthItem `json:"sessions"`
+}
+
 type EvalJSInput struct {
 	SessionID string
 
@@ -313,6 +348,10 @@ type EvalJSOutput struct {
 // 1) base selector (CSS/XPath) if present
 // 2) role/name/text filters applied by JS when needed
 type Locator struct {
+	// Handle is an optional server-side element token returned by browserFind when ReturnHandles is enabled.
+	// When set, resolution will use the stored element instead of re-querying the DOM.
+	Handle string `json:"handle,omitempty"`
+
 	// CSS is an optional CSS selector to narrow down candidates.
 	CSS string `json:"css,omitempty"`
 	// XPath is an optional XPath selector to narrow down candidates.
@@ -351,14 +390,16 @@ type Rect struct {
 
 type FindMatch struct {
 	// Selector is a best-effort generated CSS selector for follow-up calls.
-	Selector string            `json:"selector,omitempty"`
-	Tag      string            `json:"tag,omitempty"`
-	Text     string            `json:"text,omitempty"`
-	Role     string            `json:"role,omitempty"`
-	Name     string            `json:"name,omitempty"`
-	Attrs    map[string]string `json:"attrs,omitempty"`
-	Rect     *Rect             `json:"rect,omitempty"`
-	Visible  bool              `json:"visible,omitempty"`
+	Selector string `json:"selector,omitempty"`
+	// Handle is an optional server-side element token that can be used for follow-up calls without re-querying the DOM.
+	Handle  string            `json:"handle,omitempty"`
+	Tag     string            `json:"tag,omitempty"`
+	Text    string            `json:"text,omitempty"`
+	Role    string            `json:"role,omitempty"`
+	Name    string            `json:"name,omitempty"`
+	Attrs   map[string]string `json:"attrs,omitempty"`
+	Rect    *Rect             `json:"rect,omitempty"`
+	Visible bool              `json:"visible,omitempty"`
 }
 
 type FindInput struct {
@@ -383,6 +424,14 @@ type FindInput struct {
 	Strict bool `json:"strict,omitempty"`
 	// VisibleOnly filters to displayed elements only.
 	VisibleOnly bool `json:"visibleOnly,omitempty"`
+
+	// ReturnSelectors controls whether Matches[].Selector is computed (default true).
+	// Disabling selector generation reduces DOM-side work when selectors are not needed.
+	ReturnSelectors *bool `json:"returnSelectors,omitempty"`
+
+	// ReturnHandles controls whether the server resolves and returns Matches[].Handle tokens (default false).
+	// This can improve reliability and performance by avoiding selector-based re-querying for follow-up actions.
+	ReturnHandles bool `json:"returnHandles,omitempty"`
 }
 
 type FindOutput struct {
@@ -432,6 +481,81 @@ type PressInput struct {
 type PressOutput struct {
 	SessionID string     `json:"sessionID,omitempty"`
 	Match     *FindMatch `json:"match,omitempty"`
+}
+
+const (
+	WaitStateAttached = "attached"
+	WaitStateVisible  = "visible"
+	WaitStateHidden   = "hidden"
+	WaitStateDetached = "detached"
+)
+
+type WaitInput struct {
+	SessionID string   `json:"sessionID,omitempty"`
+	Locator   *Locator `json:"locator,omitempty"`
+
+	// State: "attached"|"visible"|"hidden"|"detached" (default "visible").
+	State string `json:"state,omitempty"`
+
+	// TimeoutMs controls total wait time (default 10000).
+	TimeoutMs int `json:"timeoutMs,omitempty"`
+	// PollMs controls polling interval (default 200).
+	PollMs int `json:"pollMs,omitempty"`
+
+	// VisibleOnly affects matching when State is "visible" (defaults true).
+	VisibleOnly bool `json:"visibleOnly,omitempty"`
+}
+
+type WaitOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	State     string     `json:"state,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
+type ClickTextInput struct {
+	SessionID string   `json:"sessionID,omitempty"`
+	Text      string   `json:"text,omitempty"`
+	Exact     bool     `json:"exact,omitempty"`
+	Within    *Locator `json:"within,omitempty"`
+	TimeoutMs int      `json:"timeoutMs,omitempty"`
+}
+
+type ClickTextOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
+type FillByLabelInput struct {
+	SessionID  string   `json:"sessionID,omitempty"`
+	Label      string   `json:"label,omitempty"`
+	Text       string   `json:"text,omitempty"`
+	Exact      bool     `json:"exact,omitempty"`
+	Within     *Locator `json:"within,omitempty"`
+	ClearFirst bool     `json:"clearFirst,omitempty"`
+	TimeoutMs  int      `json:"timeoutMs,omitempty"`
+}
+
+type FillByLabelOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
+type DebugDumpInput struct {
+	SessionID      string `json:"sessionID,omitempty"`
+	IncludeDOM     bool   `json:"includeDOM,omitempty"`
+	IncludeSource  bool   `json:"includeSource,omitempty"`
+	IncludeConsole bool   `json:"includeConsole,omitempty"`
+	IncludeNetwork bool   `json:"includeNetwork,omitempty"`
+	MaxEntries     int    `json:"maxEntries,omitempty"`
+	MaxBytes       int    `json:"maxBytes,omitempty"`
+}
+
+type DebugDumpOutput struct {
+	SessionID string               `json:"sessionID,omitempty"`
+	Source    string               `json:"source,omitempty"`
+	DOM       string               `json:"dom,omitempty"`
+	Capture   *CaptureExportOutput `json:"capture,omitempty"`
+	Warning   string               `json:"warning,omitempty"`
 }
 
 type CaptureSummary struct {

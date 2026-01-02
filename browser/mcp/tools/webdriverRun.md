@@ -5,7 +5,7 @@ Runs a sequence of webdriver commands using Endly-compatible command syntax.
 ## Input
 - `sessionID`: `host:port` (default `localhost:4444`)
 - `commands`: list of command strings or wait-maps
-- `navigation`: options for `get(url)` guard (timeout/autoscroll/network-idle)
+- `navigation`: options for `get(url)` guard (timeout/autoscroll/network-idle + optional `waitForSelector` / `waitFor` / `waitForState`)
 - `actionDelaysMs`: optional delay between actions
 
 ### Command syntax

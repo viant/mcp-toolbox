@@ -65,6 +65,9 @@ var descGetDOM string
 //go:embed tools/browserSessions.md
 var descSessions string
 
+//go:embed tools/browserHealth.md
+var descHealth string
+
 //go:embed tools/browserScreenshotData.md
 var descScreenshotData string
 
@@ -83,455 +86,177 @@ var descFill string
 //go:embed tools/browserPress.md
 var descPress string
 
+//go:embed tools/browserWait.md
+var descWait string
+
+//go:embed tools/browserClickText.md
+var descClickText string
+
+//go:embed tools/browserFillByLabel.md
+var descFillByLabel string
+
+//go:embed tools/browserDebugDump.md
+var descDebugDump string
+
 func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	svc := h.service
+	legacyNames := h != nil && h.legacyToolNames
 
-	if err := protoserver.RegisterTool[*browsersvc.StartInput, *browsersvc.StartOutput](base.Registry, "webdriverStart", descStart, func(ctx context.Context, in *browsersvc.StartInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Start(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("start", legacyNames, "browserStart", "webdriverStart"), descStart, svc, svc.Start); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("stop", legacyNames, "browserStop", "webdriverStop"), descStop, svc, svc.Stop); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("open", legacyNames, "browserOpen", "webdriverOpen"), descOpen, svc, svc.OpenSession); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("close", legacyNames, "browserClose", "webdriverClose"), descClose, svc, svc.CloseSession); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("run", legacyNames, "browserRun", "webdriverRun"), descRun, svc, svc.Run); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("callDriver", legacyNames, "browserCallDriver", "webdriverCallDriver"), descCallDriver, svc, svc.CallDriver); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("callElement", legacyNames, "browserCallElement", "webdriverCallElement"), descCallElement, svc, svc.CallElement); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.StartInput, *browsersvc.StartOutput](base.Registry, "browserStart", descStart, func(ctx context.Context, in *browsersvc.StartInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Start(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("captureStart", legacyNames, "browserCaptureStart", "webdriverCaptureStart"), descCaptureStart, svc, svc.CaptureStart); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureStop", legacyNames, "browserCaptureStop", "webdriverCaptureStop"), descCaptureStop, svc, svc.CaptureStop); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureStatus", legacyNames, "browserCaptureStatus", "webdriverCaptureStatus"), descCaptureStatus, svc, svc.CaptureStatus); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureClear", legacyNames, "browserCaptureClear", "webdriverCaptureClear"), descCaptureClear, svc, svc.CaptureClear); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureExport", legacyNames, "browserCaptureExport", "webdriverCaptureExport"), descCaptureExport, svc, svc.CaptureExport); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.StopInput, *browsersvc.StopOutput](base.Registry, "webdriverStop", descStop, func(ctx context.Context, in *browsersvc.StopInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Stop(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("screenshot", legacyNames, "browserScreenshot", "webdriverScreenshot"), descScreenshot, svc, svc.Screenshot); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.StopInput, *browsersvc.StopOutput](base.Registry, "browserStop", descStop, func(ctx context.Context, in *browsersvc.StopInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Stop(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.OpenSessionInput, *browsersvc.OpenSessionOutput](base.Registry, "webdriverOpen", descOpen, func(ctx context.Context, in *browsersvc.OpenSessionInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.OpenSession(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.OpenSessionInput, *browsersvc.OpenSessionOutput](base.Registry, "browserOpen", descOpen, func(ctx context.Context, in *browsersvc.OpenSessionInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.OpenSession(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CloseSessionInput, *browsersvc.CloseSessionOutput](base.Registry, "webdriverClose", descClose, func(ctx context.Context, in *browsersvc.CloseSessionInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CloseSession(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CloseSessionInput, *browsersvc.CloseSessionOutput](base.Registry, "browserClose", descClose, func(ctx context.Context, in *browsersvc.CloseSessionInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CloseSession(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.RunInput, *browsersvc.RunOutput](base.Registry, "webdriverRun", descRun, func(ctx context.Context, in *browsersvc.RunInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Run(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.RunInput, *browsersvc.RunOutput](base.Registry, "browserRun", descRun, func(ctx context.Context, in *browsersvc.RunInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Run(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.WebDriverCallInput, *browsersvc.CallOutput](base.Registry, "webdriverCallDriver", descCallDriver, func(ctx context.Context, in *browsersvc.WebDriverCallInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CallDriver(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.WebDriverCallInput, *browsersvc.CallOutput](base.Registry, "browserCallDriver", descCallDriver, func(ctx context.Context, in *browsersvc.WebDriverCallInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CallDriver(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.WebElementCallInput, *browsersvc.WebElementCallOutput](base.Registry, "webdriverCallElement", descCallElement, func(ctx context.Context, in *browsersvc.WebElementCallInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CallElement(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.WebElementCallInput, *browsersvc.WebElementCallOutput](base.Registry, "browserCallElement", descCallElement, func(ctx context.Context, in *browsersvc.WebElementCallInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CallElement(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureStartInput, *browsersvc.CaptureStartOutput](base.Registry, "webdriverCaptureStart", descCaptureStart, func(ctx context.Context, in *browsersvc.CaptureStartInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureStart(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureStartInput, *browsersvc.CaptureStartOutput](base.Registry, "browserCaptureStart", descCaptureStart, func(ctx context.Context, in *browsersvc.CaptureStartInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureStart(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureStopInput, *browsersvc.CaptureStopOutput](base.Registry, "webdriverCaptureStop", descCaptureStop, func(ctx context.Context, in *browsersvc.CaptureStopInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureStop(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureStopInput, *browsersvc.CaptureStopOutput](base.Registry, "browserCaptureStop", descCaptureStop, func(ctx context.Context, in *browsersvc.CaptureStopInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureStop(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureStatusInput, *browsersvc.CaptureStatusOutput](base.Registry, "webdriverCaptureStatus", descCaptureStatus, func(ctx context.Context, in *browsersvc.CaptureStatusInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureStatus(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureStatusInput, *browsersvc.CaptureStatusOutput](base.Registry, "browserCaptureStatus", descCaptureStatus, func(ctx context.Context, in *browsersvc.CaptureStatusInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureStatus(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureClearInput, *browsersvc.CaptureClearOutput](base.Registry, "webdriverCaptureClear", descCaptureClear, func(ctx context.Context, in *browsersvc.CaptureClearInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureClear(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureClearInput, *browsersvc.CaptureClearOutput](base.Registry, "browserCaptureClear", descCaptureClear, func(ctx context.Context, in *browsersvc.CaptureClearInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureClear(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureExportInput, *browsersvc.CaptureExportOutput](base.Registry, "webdriverCaptureExport", descCaptureExport, func(ctx context.Context, in *browsersvc.CaptureExportInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureExport(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.CaptureExportInput, *browsersvc.CaptureExportOutput](base.Registry, "browserCaptureExport", descCaptureExport, func(ctx context.Context, in *browsersvc.CaptureExportInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.CaptureExport(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.ScreenshotInput, *browsersvc.ScreenshotOutput](base.Registry, "webdriverScreenshot", descScreenshot, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := registerToolNames(base.Registry, toolNames("screenshotData", legacyNames, "browserScreenshotData", "webdriverScreenshotData"), descScreenshotData, svc, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*browsersvc.ScreenshotOutput, error) {
 		if in == nil {
 			in = &browsersvc.ScreenshotInput{}
 		}
-		if in.DestURL == "" {
-			destURL, derr := browsersvc.DefaultScreenshotDestURL(in.SessionID)
-			if derr != nil {
-				return buildErrorResult(derr.Error())
-			}
-			in.DestURL = destURL
-		}
-		out, err := svc.Screenshot(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
+		req := *in
+		req.DestURL = ""
+		return svc.Screenshot(ctx, &req)
 	}); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.ScreenshotInput, *browsersvc.ScreenshotOutput](base.Registry, "browserScreenshot", descScreenshot, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		if in == nil {
-			in = &browsersvc.ScreenshotInput{}
-		}
-		if in.DestURL == "" {
-			destURL, derr := browsersvc.DefaultScreenshotDestURL(in.SessionID)
-			if derr != nil {
-				return buildErrorResult(derr.Error())
-			}
-			in.DestURL = destURL
-		}
-		out, err := svc.Screenshot(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("driverInstall", legacyNames, "browserDriverInstall"), descDriverInstall, svc, svc.DriverInstall); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.ScreenshotInput, *browsersvc.ScreenshotOutput](base.Registry, "browserScreenshotData", descScreenshotData, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		// For inline/base64 results, do not force destURL.
-		out, err := svc.Screenshot(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.ScreenshotInput, *browsersvc.ScreenshotOutput](base.Registry, "webdriverScreenshotData", descScreenshotData, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Screenshot(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.DriverInstallInput, *browsersvc.DriverInstallOutput](base.Registry, "browserDriverInstall", descDriverInstall, func(ctx context.Context, in *browsersvc.DriverInstallInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.DriverInstall(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.DriverInstallInput, *browsersvc.DriverInstallOutput](base.Registry, "browserDriverUpdate", descDriverUpdate, func(ctx context.Context, in *browsersvc.DriverInstallInput) (*schema.CallToolResult, *jsonrpc.Error) {
+	if err := registerToolNames(base.Registry, toolNames("driverUpdate", legacyNames, "browserDriverUpdate", "webdriverDriverUpdate"), descDriverUpdate, svc, func(ctx context.Context, in *browsersvc.DriverInstallInput) (*browsersvc.DriverInstallOutput, error) {
 		if in == nil {
 			in = &browsersvc.DriverInstallInput{}
 		}
-		in.Force = true
-		out, err := svc.DriverInstall(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
+		req := *in
+		req.Force = true
+		return svc.DriverInstall(ctx, &req)
 	}); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.GetSourceInput, *browsersvc.GetSourceOutput](base.Registry, "browserGetSource", descGetSource, func(ctx context.Context, in *browsersvc.GetSourceInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.GetSource(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("getSource", legacyNames, "browserGetSource"), descGetSource, svc, svc.GetSource); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("getDOM", legacyNames, "browserGetDOM", "webdriverGetDOM"), descGetDOM, svc, svc.GetDOM); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.GetSourceInput, *browsersvc.GetSourceOutput](base.Registry, "webdriverGetSource", descGetSource, func(ctx context.Context, in *browsersvc.GetSourceInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.GetSource(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("sessions", legacyNames, "browserSessions", "webdriverSessions"), descSessions, svc, svc.Sessions); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("health", legacyNames, "browserHealth"), descHealth, svc, svc.Health); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.GetDOMInput, *browsersvc.GetDOMOutput](base.Registry, "browserGetDOM", descGetDOM, func(ctx context.Context, in *browsersvc.GetDOMInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.GetDOM(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("evalJS", legacyNames, "browserEvalJS", "webdriverEvalJS"), descEvalJS, svc, svc.EvalJS); err != nil {
 		return err
 	}
 
-	if err := protoserver.RegisterTool[*browsersvc.GetDOMInput, *browsersvc.GetDOMOutput](base.Registry, "webdriverGetDOM", descGetDOM, func(ctx context.Context, in *browsersvc.GetDOMInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.GetDOM(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("find", legacyNames, "browserFind"), descFind, svc, svc.Find); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.SessionsInput, *browsersvc.SessionsOutput](base.Registry, "browserSessions", descSessions, func(ctx context.Context, in *browsersvc.SessionsInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Sessions(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("click", legacyNames, "browserClick"), descClick, svc, svc.Click); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.SessionsInput, *browsersvc.SessionsOutput](base.Registry, "webdriverSessions", descSessions, func(ctx context.Context, in *browsersvc.SessionsInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Sessions(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("fill", legacyNames, "browserFill"), descFill, svc, svc.Fill); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.EvalJSInput, *browsersvc.EvalJSOutput](base.Registry, "browserEvalJS", descEvalJS, func(ctx context.Context, in *browsersvc.EvalJSInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.EvalJS(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("press", legacyNames, "browserPress"), descPress, svc, svc.Press); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.EvalJSInput, *browsersvc.EvalJSOutput](base.Registry, "webdriverEvalJS", descEvalJS, func(ctx context.Context, in *browsersvc.EvalJSInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.EvalJS(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("wait", legacyNames, "browserWait"), descWait, svc, svc.Wait); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.FindInput, *browsersvc.FindOutput](base.Registry, "browserFind", descFind, func(ctx context.Context, in *browsersvc.FindInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Find(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("clickText", legacyNames, "browserClickText"), descClickText, svc, svc.ClickText); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.ClickInput, *browsersvc.ClickOutput](base.Registry, "browserClick", descClick, func(ctx context.Context, in *browsersvc.ClickInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Click(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("fillByLabel", legacyNames, "browserFillByLabel"), descFillByLabel, svc, svc.FillByLabel); err != nil {
 		return err
 	}
-
-	if err := protoserver.RegisterTool[*browsersvc.FillInput, *browsersvc.FillOutput](base.Registry, "browserFill", descFill, func(ctx context.Context, in *browsersvc.FillInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Fill(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
-		return err
-	}
-
-	if err := protoserver.RegisterTool[*browsersvc.PressInput, *browsersvc.PressOutput](base.Registry, "browserPress", descPress, func(ctx context.Context, in *browsersvc.PressInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		out, err := svc.Press(ctx, in)
-		if err != nil {
-			return buildErrorResult(err.Error())
-		}
-		return buildSuccessResultOut(svc, out)
-	}); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("debugDump", legacyNames, "browserDebugDump"), descDebugDump, svc, svc.DebugDump); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func toolNames(primary string, includeLegacy bool, legacy ...string) []string {
+	names := []string{primary}
+	if !includeLegacy {
+		return names
+	}
+	for _, n := range legacy {
+		if n == "" {
+			continue
+		}
+		names = append(names, n)
+	}
+	return names
+}
+
+func registerToolNames[I any, O any](
+	registry *protoserver.Registry,
+	names []string,
+	description string,
+	service *browsersvc.Service,
+	fn func(context.Context, *I) (*O, error),
+) error {
+	for _, name := range names {
+		if err := registerTool(registry, name, description, service, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func registerTool[I any, O any](
+	registry *protoserver.Registry,
+	name string,
+	description string,
+	service *browsersvc.Service,
+	fn func(context.Context, *I) (*O, error),
+) error {
+	return protoserver.RegisterTool[*I, *O](registry, name, description, func(ctx context.Context, in *I) (*schema.CallToolResult, *jsonrpc.Error) {
+		out, err := fn(ctx, in)
+		if err != nil {
+			return buildErrorResult(err.Error())
+		}
+		return buildSuccessResultOut(service, out)
+	})
 }
 
 func buildErrorResult(message string) (*schema.CallToolResult, *jsonrpc.Error) {

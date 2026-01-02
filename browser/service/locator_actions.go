@@ -9,6 +9,46 @@ import (
 	"github.com/tebeka/selenium"
 )
 
+func (s *Service) resolveSingleElement(ctx context.Context, sess *Session, locator *Locator, timeoutMs int, strict bool, visibleOnly bool) (selenium.WebElement, *FindMatch, error) {
+	if sess == nil || sess.driver == nil {
+		return nil, nil, fmt.Errorf("session not open")
+	}
+	if locator == nil {
+		return nil, nil, fmt.Errorf("locator is required")
+	}
+	if handle := strings.TrimSpace(locator.Handle); handle != "" {
+		el, ok := sess.getHandle(handle)
+		if !ok || el == nil {
+			return nil, nil, fmt.Errorf("unknown handle: %s", handle)
+		}
+		// Best-effort match metadata for handle-based calls.
+		return el, &FindMatch{Handle: handle}, nil
+	}
+	elements, matches, err := s.ResolveLocator(ctx, sess, locator, &ResolveLocatorOptions{
+		MaxWaitMs:  timeoutMs,
+		MinMatches: 1,
+		// Allow multiple matches so we can skip non-actionable elements (e.g. <html>/<body>)
+		// and still resolve a real element by selector.
+		MaxMatches:         defaultFindMax,
+		Strict:             strict,
+		VisibleOnly:        visibleOnly,
+		ResolveElements:    true,
+		ResolveAllElements: false,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(elements) == 0 {
+		return nil, nil, fmt.Errorf("no element matched locator")
+	}
+	var match *FindMatch
+	if len(matches) > 0 {
+		m := matches[0]
+		match = &m
+	}
+	return elements[0], match, nil
+}
+
 func (s *Service) Click(ctx context.Context, in *ClickInput) (*ClickOutput, error) {
 	if in == nil {
 		in = &ClickInput{}
@@ -30,22 +70,12 @@ func (s *Service) Click(ctx context.Context, in *ClickInput) (*ClickOutput, erro
 	if !visibleOnly {
 		visibleOnly = true
 	}
-	elements, matches, err := s.ResolveLocator(ctx, sess, in.Locator, &ResolveLocatorOptions{
-		MaxWaitMs:          in.TimeoutMs,
-		MinMatches:         1,
-		MaxMatches:         1,
-		Strict:             in.Strict,
-		VisibleOnly:        visibleOnly,
-		ResolveElements:    true,
-		ResolveAllElements: false,
-	})
+	el, match, err := s.resolveSingleElement(ctx, sess, in.Locator, in.TimeoutMs, in.Strict, visibleOnly)
 	if err != nil {
 		return nil, err
 	}
-	if len(elements) == 0 {
-		return nil, fmt.Errorf("no element matched locator")
-	}
-	el := elements[0]
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
 	if err := s.ensureVisible(el); err != nil {
 		return nil, err
 	}
@@ -53,12 +83,15 @@ func (s *Service) Click(ctx context.Context, in *ClickInput) (*ClickOutput, erro
 		return nil, err
 	}
 	if err := el.Click(); err != nil {
+		if isStaleElementError(err) {
+			sess.deleteHandle(in.Locator.Handle)
+		}
 		return nil, err
 	}
 	out := &ClickOutput{SessionID: in.SessionID}
-	if len(matches) > 0 {
-		m := matches[0]
-		out.Match = &m
+	out.Match = match
+	if in.Locator != nil && strings.TrimSpace(in.Locator.Handle) != "" {
+		sess.deleteHandle(in.Locator.Handle)
 	}
 	return out, nil
 }
@@ -84,22 +117,12 @@ func (s *Service) Fill(ctx context.Context, in *FillInput) (*FillOutput, error) 
 	if !visibleOnly {
 		visibleOnly = true
 	}
-	elements, matches, err := s.ResolveLocator(ctx, sess, in.Locator, &ResolveLocatorOptions{
-		MaxWaitMs:          in.TimeoutMs,
-		MinMatches:         1,
-		MaxMatches:         1,
-		Strict:             in.Strict,
-		VisibleOnly:        visibleOnly,
-		ResolveElements:    true,
-		ResolveAllElements: false,
-	})
+	el, match, err := s.resolveSingleElement(ctx, sess, in.Locator, in.TimeoutMs, in.Strict, visibleOnly)
 	if err != nil {
 		return nil, err
 	}
-	if len(elements) == 0 {
-		return nil, fmt.Errorf("no element matched locator")
-	}
-	el := elements[0]
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
 	if err := s.ensureVisible(el); err != nil {
 		return nil, err
 	}
@@ -110,12 +133,15 @@ func (s *Service) Fill(ctx context.Context, in *FillInput) (*FillOutput, error) 
 		_ = el.Clear()
 	}
 	if err := el.SendKeys(in.Text); err != nil {
+		if isStaleElementError(err) {
+			sess.deleteHandle(in.Locator.Handle)
+		}
 		return nil, err
 	}
 	out := &FillOutput{SessionID: in.SessionID}
-	if len(matches) > 0 {
-		m := matches[0]
-		out.Match = &m
+	out.Match = match
+	if in.Locator != nil && strings.TrimSpace(in.Locator.Handle) != "" {
+		sess.deleteHandle(in.Locator.Handle)
 	}
 	return out, nil
 }
@@ -145,22 +171,12 @@ func (s *Service) Press(ctx context.Context, in *PressInput) (*PressOutput, erro
 	if !visibleOnly {
 		visibleOnly = true
 	}
-	elements, matches, err := s.ResolveLocator(ctx, sess, in.Locator, &ResolveLocatorOptions{
-		MaxWaitMs:          in.TimeoutMs,
-		MinMatches:         1,
-		MaxMatches:         1,
-		Strict:             in.Strict,
-		VisibleOnly:        visibleOnly,
-		ResolveElements:    true,
-		ResolveAllElements: false,
-	})
+	el, match, err := s.resolveSingleElement(ctx, sess, in.Locator, in.TimeoutMs, in.Strict, visibleOnly)
 	if err != nil {
 		return nil, err
 	}
-	if len(elements) == 0 {
-		return nil, fmt.Errorf("no element matched locator")
-	}
-	el := elements[0]
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
 	if err := s.ensureVisible(el); err != nil {
 		return nil, err
 	}
@@ -169,12 +185,15 @@ func (s *Service) Press(ctx context.Context, in *PressInput) (*PressOutput, erro
 	}
 	sk := normalizeKey(key)
 	if err := el.SendKeys(sk); err != nil {
+		if isStaleElementError(err) {
+			sess.deleteHandle(in.Locator.Handle)
+		}
 		return nil, err
 	}
 	out := &PressOutput{SessionID: in.SessionID}
-	if len(matches) > 0 {
-		m := matches[0]
-		out.Match = &m
+	out.Match = match
+	if in.Locator != nil && strings.TrimSpace(in.Locator.Handle) != "" {
+		sess.deleteHandle(in.Locator.Handle)
 	}
 	return out, nil
 }
@@ -226,4 +245,3 @@ func normalizeKey(key string) string {
 		return key
 	}
 }
-
