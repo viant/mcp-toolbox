@@ -23,7 +23,6 @@ type Options struct {
 	Headful             bool   `long:"headful" description:"Force non-headless mode (removes headless args from capabilities)"`
 	MatchChromeDriver   bool   `long:"match-chrome-driver" description:"Best-effort detect installed Chrome/Chromium major version and download/update matching Chrome-for-Testing chromedriver"`
 	NoMatchChromeDriver bool   `long:"no-match-chrome-driver" description:"Disable Chrome/Chromium auto-detection for chromedriver downloads"`
-	LegacyToolNames     bool   `long:"legacy-tool-names" description:"Also register legacy prefixed tool names (browser*/webdriver*) for backward compatibility"`
 }
 
 func main() {
@@ -65,7 +64,7 @@ func main() {
 	}
 	server, err := mcpsrv.New(
 		mcpsrv.WithImplementation(schema.Implementation{Name: "browser-mcp", Version: "0.1.0"}),
-		mcpsrv.WithNewHandler(bmcp.NewHandlerWithOptions(svc, bmcp.HandlerOptions{LegacyToolNames: opts.LegacyToolNames})),
+		mcpsrv.WithNewHandler(bmcp.NewHandler(svc)),
 		mcpsrv.WithEndpointAddress(opts.HTTPAddr),
 		mcpsrv.WithRootRedirect(true),
 		mcpsrv.WithStreamableURI("/mcp"),

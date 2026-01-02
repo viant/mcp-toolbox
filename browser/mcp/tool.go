@@ -100,50 +100,49 @@ var descDebugDump string
 
 func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	svc := h.service
-	legacyNames := h != nil && h.legacyToolNames
 
-	if err := registerToolNames(base.Registry, toolNames("start", legacyNames, "browserStart", "webdriverStart"), descStart, svc, svc.Start); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("start"), descStart, svc, svc.Start); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("stop", legacyNames, "browserStop", "webdriverStop"), descStop, svc, svc.Stop); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("stop"), descStop, svc, svc.Stop); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("open", legacyNames, "browserOpen", "webdriverOpen"), descOpen, svc, svc.OpenSession); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("open"), descOpen, svc, svc.OpenSession); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("close", legacyNames, "browserClose", "webdriverClose"), descClose, svc, svc.CloseSession); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("close"), descClose, svc, svc.CloseSession); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("run", legacyNames, "browserRun", "webdriverRun"), descRun, svc, svc.Run); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("run"), descRun, svc, svc.Run); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("callDriver", legacyNames, "browserCallDriver", "webdriverCallDriver"), descCallDriver, svc, svc.CallDriver); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("callDriver"), descCallDriver, svc, svc.CallDriver); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("callElement", legacyNames, "browserCallElement", "webdriverCallElement"), descCallElement, svc, svc.CallElement); err != nil {
-		return err
-	}
-
-	if err := registerToolNames(base.Registry, toolNames("captureStart", legacyNames, "browserCaptureStart", "webdriverCaptureStart"), descCaptureStart, svc, svc.CaptureStart); err != nil {
-		return err
-	}
-	if err := registerToolNames(base.Registry, toolNames("captureStop", legacyNames, "browserCaptureStop", "webdriverCaptureStop"), descCaptureStop, svc, svc.CaptureStop); err != nil {
-		return err
-	}
-	if err := registerToolNames(base.Registry, toolNames("captureStatus", legacyNames, "browserCaptureStatus", "webdriverCaptureStatus"), descCaptureStatus, svc, svc.CaptureStatus); err != nil {
-		return err
-	}
-	if err := registerToolNames(base.Registry, toolNames("captureClear", legacyNames, "browserCaptureClear", "webdriverCaptureClear"), descCaptureClear, svc, svc.CaptureClear); err != nil {
-		return err
-	}
-	if err := registerToolNames(base.Registry, toolNames("captureExport", legacyNames, "browserCaptureExport", "webdriverCaptureExport"), descCaptureExport, svc, svc.CaptureExport); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("callElement"), descCallElement, svc, svc.CallElement); err != nil {
 		return err
 	}
 
-	if err := registerToolNames(base.Registry, toolNames("screenshot", legacyNames, "browserScreenshot", "webdriverScreenshot"), descScreenshot, svc, svc.Screenshot); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("captureStart"), descCaptureStart, svc, svc.CaptureStart); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("screenshotData", legacyNames, "browserScreenshotData", "webdriverScreenshotData"), descScreenshotData, svc, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*browsersvc.ScreenshotOutput, error) {
+	if err := registerToolNames(base.Registry, toolNames("captureStop"), descCaptureStop, svc, svc.CaptureStop); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureStatus"), descCaptureStatus, svc, svc.CaptureStatus); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureClear"), descCaptureClear, svc, svc.CaptureClear); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("captureExport"), descCaptureExport, svc, svc.CaptureExport); err != nil {
+		return err
+	}
+
+	if err := registerToolNames(base.Registry, toolNames("screenshot"), descScreenshot, svc, svc.Screenshot); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("screenshotData"), descScreenshotData, svc, func(ctx context.Context, in *browsersvc.ScreenshotInput) (*browsersvc.ScreenshotOutput, error) {
 		if in == nil {
 			in = &browsersvc.ScreenshotInput{}
 		}
@@ -154,10 +153,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		return err
 	}
 
-	if err := registerToolNames(base.Registry, toolNames("driverInstall", legacyNames, "browserDriverInstall"), descDriverInstall, svc, svc.DriverInstall); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("driverInstall"), descDriverInstall, svc, svc.DriverInstall); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("driverUpdate", legacyNames, "browserDriverUpdate", "webdriverDriverUpdate"), descDriverUpdate, svc, func(ctx context.Context, in *browsersvc.DriverInstallInput) (*browsersvc.DriverInstallOutput, error) {
+	if err := registerToolNames(base.Registry, toolNames("driverUpdate"), descDriverUpdate, svc, func(ctx context.Context, in *browsersvc.DriverInstallInput) (*browsersvc.DriverInstallOutput, error) {
 		if in == nil {
 			in = &browsersvc.DriverInstallInput{}
 		}
@@ -168,64 +167,54 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		return err
 	}
 
-	if err := registerToolNames(base.Registry, toolNames("getSource", legacyNames, "browserGetSource"), descGetSource, svc, svc.GetSource); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("getSource"), descGetSource, svc, svc.GetSource); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("getDOM", legacyNames, "browserGetDOM", "webdriverGetDOM"), descGetDOM, svc, svc.GetDOM); err != nil {
-		return err
-	}
-
-	if err := registerToolNames(base.Registry, toolNames("sessions", legacyNames, "browserSessions", "webdriverSessions"), descSessions, svc, svc.Sessions); err != nil {
-		return err
-	}
-	if err := registerToolNames(base.Registry, toolNames("health", legacyNames, "browserHealth"), descHealth, svc, svc.Health); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("getDOM"), descGetDOM, svc, svc.GetDOM); err != nil {
 		return err
 	}
 
-	if err := registerToolNames(base.Registry, toolNames("evalJS", legacyNames, "browserEvalJS", "webdriverEvalJS"), descEvalJS, svc, svc.EvalJS); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("sessions"), descSessions, svc, svc.Sessions); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("health"), descHealth, svc, svc.Health); err != nil {
 		return err
 	}
 
-	if err := registerToolNames(base.Registry, toolNames("find", legacyNames, "browserFind"), descFind, svc, svc.Find); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("evalJS"), descEvalJS, svc, svc.EvalJS); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("click", legacyNames, "browserClick"), descClick, svc, svc.Click); err != nil {
+
+	if err := registerToolNames(base.Registry, toolNames("find"), descFind, svc, svc.Find); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("fill", legacyNames, "browserFill"), descFill, svc, svc.Fill); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("click"), descClick, svc, svc.Click); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("press", legacyNames, "browserPress"), descPress, svc, svc.Press); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("fill"), descFill, svc, svc.Fill); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("wait", legacyNames, "browserWait"), descWait, svc, svc.Wait); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("press"), descPress, svc, svc.Press); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("clickText", legacyNames, "browserClickText"), descClickText, svc, svc.ClickText); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("wait"), descWait, svc, svc.Wait); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("fillByLabel", legacyNames, "browserFillByLabel"), descFillByLabel, svc, svc.FillByLabel); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("clickText"), descClickText, svc, svc.ClickText); err != nil {
 		return err
 	}
-	if err := registerToolNames(base.Registry, toolNames("debugDump", legacyNames, "browserDebugDump"), descDebugDump, svc, svc.DebugDump); err != nil {
+	if err := registerToolNames(base.Registry, toolNames("fillByLabel"), descFillByLabel, svc, svc.FillByLabel); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("debugDump"), descDebugDump, svc, svc.DebugDump); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func toolNames(primary string, includeLegacy bool, legacy ...string) []string {
-	names := []string{primary}
-	if !includeLegacy {
-		return names
-	}
-	for _, n := range legacy {
-		if n == "" {
-			continue
-		}
-		names = append(names, n)
-	}
-	return names
+func toolNames(primary string) []string {
+	return []string{primary}
 }
 
 func registerToolNames[I any, O any](
