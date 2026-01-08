@@ -9,6 +9,48 @@ import (
 	"github.com/tebeka/selenium"
 )
 
+func isElementClickIntercepted(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "element click intercepted") ||
+		strings.Contains(msg, "other element would receive the click")
+}
+
+func (s *Service) scrollIntoView(driver selenium.WebDriver, el selenium.WebElement) {
+	if driver == nil || el == nil {
+		return
+	}
+	// Best-effort: ignore errors (some drivers/pages can reject script execution during transitions).
+	_, _ = driver.ExecuteScript("arguments[0].scrollIntoView({block:'center', inline:'center', behavior:'instant'});", []any{el})
+}
+
+func (s *Service) jsClick(driver selenium.WebDriver, el selenium.WebElement) error {
+	if driver == nil || el == nil {
+		return fmt.Errorf("missing driver/element")
+	}
+	_, err := driver.ExecuteScript("arguments[0].click();", []any{el})
+	return err
+}
+
+func (s *Service) hoverElement(driver selenium.WebDriver, el selenium.WebElement) error {
+	if driver == nil || el == nil {
+		return fmt.Errorf("missing driver/element")
+	}
+	s.scrollIntoView(driver, el)
+	_, err := driver.ExecuteScript(`
+		(function(el){
+			if(!el) return;
+			var opts = {bubbles:true, cancelable:true, view:window};
+			['mouseover','mouseenter','mousemove'].forEach(function(t){
+				el.dispatchEvent(new MouseEvent(t, opts));
+			});
+		})(arguments[0]);
+	`, []any{el})
+	return err
+}
+
 func (s *Service) resolveSingleElement(ctx context.Context, sess *Session, locator *Locator, timeoutMs int, strict bool, visibleOnly bool) (selenium.WebElement, *FindMatch, error) {
 	if sess == nil || sess.driver == nil {
 		return nil, nil, fmt.Errorf("session not open")
@@ -82,17 +124,76 @@ func (s *Service) Click(ctx context.Context, in *ClickInput) (*ClickOutput, erro
 	if err := ensureEnabled(el); err != nil {
 		return nil, err
 	}
+	// Many modern UIs (modals/flyouts/sticky headers) can intercept clicks. Be resilient:
+	// - scroll into view
+	// - retry native click
+	// - fallback to JS click for intercepted-click errors
+	s.scrollIntoView(sess.driver, el)
 	if err := el.Click(); err != nil {
-		if isStaleElementError(err) {
-			sess.deleteHandle(in.Locator.Handle)
+		if isElementClickIntercepted(err) {
+			time.Sleep(75 * time.Millisecond)
+			s.scrollIntoView(sess.driver, el)
+			if err2 := el.Click(); err2 == nil {
+				err = nil
+			} else if jsErr := s.jsClick(sess.driver, el); jsErr == nil {
+				err = nil
+			} else {
+				err = err2
+			}
 		}
-		return nil, err
+		if err != nil {
+			if isStaleElementError(err) {
+				sess.deleteHandle(in.Locator.Handle)
+			}
+			return nil, err
+		}
 	}
 	out := &ClickOutput{SessionID: in.SessionID}
 	out.Match = match
 	if in.Locator != nil && strings.TrimSpace(in.Locator.Handle) != "" {
 		sess.deleteHandle(in.Locator.Handle)
 	}
+	return out, nil
+}
+
+func (s *Service) Hover(ctx context.Context, in *HoverInput) (*HoverOutput, error) {
+	if in == nil {
+		in = &HoverInput{}
+	}
+	if in.SessionID == "" {
+		in.SessionID = "localhost:4444"
+	}
+	sess, err := s.session(in.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if sess.driver == nil {
+		return nil, fmt.Errorf("session not open: %s", in.SessionID)
+	}
+	if in.Locator == nil {
+		return nil, fmt.Errorf("locator is required")
+	}
+	visibleOnly := in.VisibleOnly
+	if !visibleOnly {
+		visibleOnly = true
+	}
+	el, match, err := s.resolveSingleElement(ctx, sess, in.Locator, in.TimeoutMs, in.Strict, visibleOnly)
+	if err != nil {
+		return nil, err
+	}
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	if err := s.ensureVisible(el); err != nil {
+		return nil, err
+	}
+	if err := s.hoverElement(sess.driver, el); err != nil {
+		if isStaleElementError(err) {
+			sess.deleteHandle(in.Locator.Handle)
+		}
+		return nil, err
+	}
+	out := &HoverOutput{SessionID: in.SessionID}
+	out.Match = match
 	return out, nil
 }
 

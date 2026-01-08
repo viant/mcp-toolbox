@@ -92,6 +92,20 @@ func (s *Service) afterNavigate(ctx context.Context, sess *Session, nav Navigati
 		if state == "" {
 			state = WaitStateVisible
 		}
+		// Back-compat: some callers set WaitForState to common navigation states. Treat them
+		// as presets instead of erroring inside Wait().
+		switch state {
+		case "load", "domcontentloaded", "dom-content-loaded", "dom_content_loaded":
+			state = WaitStateAttached
+		case "networkidle", "network-idle", "network_idle":
+			state = WaitStateAttached
+			// If idle wait wasn't explicitly requested, enable it with sensible defaults.
+			if nav.IdleMaxWaitMs <= 0 && nav.IdleThreshold <= 0 {
+				nav.IdleThreshold = 2
+				nav.IdleWindowMs = 1000
+				nav.IdleMaxWaitMs = nav.TimeoutMs
+			}
+		}
 		_, err := s.Wait(ctx, &WaitInput{
 			SessionID:   sess.ID,
 			Locator:     waitLoc,

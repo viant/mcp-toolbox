@@ -23,7 +23,7 @@ func (s *Service) CaptureStart(ctx context.Context, in *CaptureStartInput) (*Cap
 	}
 	sess.capture = newCaptureState(in)
 	if in.SinkURL != "" {
-		if err := sess.capture.StartSink(s.fs, in.SinkURL, in.FlushIntervalMs); err != nil {
+		if err := sess.capture.StartSink(s.fs, in.SinkURL, in.FlushIntervalMs, in.SplitArtifacts); err != nil {
 			return nil, err
 		}
 	}
@@ -121,14 +121,22 @@ func (s *Service) CaptureExport(_ context.Context, in *CaptureExportInput) (*Cap
 
 	includeConsole := true
 	includeNetwork := true
+	includeWebSocket := true
+	includeStreams := true
 	if in.IncludeConsole != nil {
 		includeConsole = *in.IncludeConsole
 	}
 	if in.IncludeNetwork != nil {
 		includeNetwork = *in.IncludeNetwork
 	}
-	console, network := sess.capture.Snapshot(in.MaxEntries, includeConsole, includeNetwork)
-	return &CaptureExportOutput{SessionID: sess.ID, Summary: sess.capture.Summary(), Console: console, Network: network}, nil
+	if in.IncludeWebSocket != nil {
+		includeWebSocket = *in.IncludeWebSocket
+	}
+	if in.IncludeStreams != nil {
+		includeStreams = *in.IncludeStreams
+	}
+	console, network, ws, streams := sess.capture.Snapshot(in.MaxEntries, includeConsole, includeNetwork, includeWebSocket, includeStreams)
+	return &CaptureExportOutput{SessionID: sess.ID, Summary: sess.capture.Summary(), Console: console, Network: network, WebSocket: ws, Streams: streams}, nil
 }
 
 func captureSummary(sess *Session) *CaptureSummary {

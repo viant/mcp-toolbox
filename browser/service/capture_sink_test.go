@@ -20,7 +20,7 @@ func TestCapture_SinkWritesJSONL(t *testing.T) {
 
 	includeBodies := false
 	state := newCaptureState(&CaptureStartInput{IncludeBodies: &includeBodies})
-	if err := state.StartSink(afs.New(), "file://"+p, 1); err != nil {
+	if err := state.StartSink(afs.New(), "file://"+p, 1, false); err != nil {
 		t.Fatalf("StartSink: %v", err)
 	}
 	state.mux.Lock()

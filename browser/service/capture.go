@@ -36,6 +36,9 @@ type CaptureState struct {
 	inflight  map[string]*NetworkTransaction
 	completed []*NetworkTransaction
 	console   []*ConsoleEntry
+	wsURL     map[string]string
+	wsFrames  []*WebSocketFrame
+	streams   []*StreamMessage
 	errors    []string
 
 	sink *captureSink
@@ -54,6 +57,9 @@ func newCaptureState(req *CaptureStartInput) *CaptureState {
 		inflight:      map[string]*NetworkTransaction{},
 		completed:     []*NetworkTransaction{},
 		console:       []*ConsoleEntry{},
+		wsURL:         map[string]string{},
+		wsFrames:      []*WebSocketFrame{},
+		streams:       []*StreamMessage{},
 		errors:        []string{},
 	}
 	for _, h := range []string{"authorization", "cookie", "set-cookie", "x-api-key"} {
@@ -94,6 +100,8 @@ func (s *CaptureState) Summary() *CaptureSummary {
 		RequestsInFlight:  len(s.inflight),
 		RequestsCompleted: len(s.completed),
 		ConsoleEntries:    len(s.console),
+		WebSocketFrames:   len(s.wsFrames),
+		StreamMessages:    len(s.streams),
 		Errors:            append([]string(nil), s.errors...),
 	}
 }
@@ -104,15 +112,20 @@ func (s *CaptureState) Clear() {
 	s.inflight = map[string]*NetworkTransaction{}
 	s.completed = []*NetworkTransaction{}
 	s.console = []*ConsoleEntry{}
+	s.wsURL = map[string]string{}
+	s.wsFrames = []*WebSocketFrame{}
+	s.streams = []*StreamMessage{}
 	s.errors = []string{}
 	s.started = time.Now()
 	if s.sink != nil {
 		s.sink.nextConsole = 0
 		s.sink.nextNetwork = 0
+		s.sink.nextWS = 0
+		s.sink.nextStreams = 0
 	}
 }
 
-func (s *CaptureState) Snapshot(maxEntries int, includeConsole, includeNetwork bool) (console []*ConsoleEntry, network []*NetworkTransaction) {
+func (s *CaptureState) Snapshot(maxEntries int, includeConsole, includeNetwork, includeWebSocket, includeStreams bool) (console []*ConsoleEntry, network []*NetworkTransaction, ws []*WebSocketFrame, streams []*StreamMessage) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 	if maxEntries <= 0 {
@@ -125,6 +138,14 @@ func (s *CaptureState) Snapshot(maxEntries int, includeConsole, includeNetwork b
 	if includeNetwork {
 		limit := min(maxEntries, len(s.completed))
 		network = append([]*NetworkTransaction(nil), s.completed[len(s.completed)-limit:]...)
+	}
+	if includeWebSocket {
+		limit := min(maxEntries, len(s.wsFrames))
+		ws = append([]*WebSocketFrame(nil), s.wsFrames[len(s.wsFrames)-limit:]...)
+	}
+	if includeStreams {
+		limit := min(maxEntries, len(s.streams))
+		streams = append([]*StreamMessage(nil), s.streams[len(s.streams)-limit:]...)
 	}
 	return
 }
@@ -203,6 +224,34 @@ func (s *CaptureState) drainPerformance(sess *Session) {
 			if s.enableNetwork {
 				s.onLoadingFailed(params)
 			}
+		case "Network.requestServedFromCache":
+			if s.enableNetwork {
+				s.onRequestServedFromCache(params)
+			}
+		case "Network.dataReceived":
+			if s.enableNetwork {
+				s.onDataReceived(params)
+			}
+		case "Network.eventSourceMessageReceived":
+			if s.enableNetwork {
+				s.onEventSourceMessage(params)
+			}
+		case "Network.webSocketCreated":
+			if s.enableNetwork {
+				s.onWebSocketCreated(params)
+			}
+		case "Network.webSocketFrameSent":
+			if s.enableNetwork {
+				s.onWebSocketFrame(params, "sent")
+			}
+		case "Network.webSocketFrameReceived":
+			if s.enableNetwork {
+				s.onWebSocketFrame(params, "received")
+			}
+		case "Network.webSocketClosed":
+			if s.enableNetwork {
+				s.onWebSocketClosed(params)
+			}
 		case "Runtime.consoleAPICalled":
 			s.onRuntimeConsole(params)
 		case "Runtime.exceptionThrown":
@@ -271,10 +320,13 @@ func (s *CaptureState) onRequestExtraInfo(params json.RawMessage) {
 
 func (s *CaptureState) onResponseReceived(params json.RawMessage) {
 	type response struct {
-		Status     int            `json:"status"`
-		StatusText string         `json:"statusText"`
-		MimeType   string         `json:"mimeType"`
-		Headers    map[string]any `json:"headers"`
+		Status            int            `json:"status"`
+		StatusText        string         `json:"statusText"`
+		MimeType          string         `json:"mimeType"`
+		Headers           map[string]any `json:"headers"`
+		FromDiskCache     bool           `json:"fromDiskCache,omitempty"`
+		FromPrefetchCache bool           `json:"fromPrefetchCache,omitempty"`
+		FromServiceWorker bool           `json:"fromServiceWorker,omitempty"`
 	}
 	type input struct {
 		RequestID string   `json:"requestId"`
@@ -296,6 +348,9 @@ func (s *CaptureState) onResponseReceived(params json.RawMessage) {
 	tx.Status = in.Response.Status
 	tx.StatusText = in.Response.StatusText
 	tx.MimeType = in.Response.MimeType
+	tx.FromDiskCache = in.Response.FromDiskCache
+	tx.FromPrefetchCache = in.Response.FromPrefetchCache
+	tx.FromServiceWorker = in.Response.FromServiceWorker
 	tx.ResponseHeaders = redactIfNeeded(in.Response.Headers, s.redact, s.redactHeaders)
 	if tx.ResourceType == "" {
 		tx.ResourceType = in.Type
@@ -378,6 +433,10 @@ func (s *CaptureState) onLoadingFinished(sess *Session, params json.RawMessage) 
 			s.mux.Lock()
 			tx.ResponseBody = &CapturedBody{Encoding: enc, Data: body, Truncated: truncated}
 			s.mux.Unlock()
+		} else if berr != nil {
+			s.mux.Lock()
+			tx.ResponseBodyError = berr.Error()
+			s.mux.Unlock()
 		}
 	}
 
@@ -392,6 +451,135 @@ func (s *CaptureState) onLoadingFinished(sess *Session, params json.RawMessage) 
 func (s *CaptureState) finishLocked(requestID string, tx *NetworkTransaction) {
 	s.completed = append(s.completed, tx)
 	delete(s.inflight, requestID)
+}
+
+func (s *CaptureState) onRequestServedFromCache(params json.RawMessage) {
+	type input struct {
+		RequestID string `json:"requestId"`
+	}
+	in := &input{}
+	if err := json.Unmarshal(params, in); err != nil {
+		return
+	}
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	tx := s.inflight[in.RequestID]
+	if tx == nil {
+		tx = &NetworkTransaction{RequestID: in.RequestID}
+		s.inflight[in.RequestID] = tx
+	}
+	tx.ServedFromCache = true
+}
+
+func (s *CaptureState) onDataReceived(params json.RawMessage) {
+	type input struct {
+		RequestID  string  `json:"requestId"`
+		DataLength float64 `json:"dataLength"`
+	}
+	in := &input{}
+	if err := json.Unmarshal(params, in); err != nil {
+		return
+	}
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	tx := s.inflight[in.RequestID]
+	if tx == nil {
+		tx = &NetworkTransaction{RequestID: in.RequestID}
+		s.inflight[in.RequestID] = tx
+	}
+	tx.DataReceivedBytes += int64(in.DataLength)
+}
+
+func (s *CaptureState) onEventSourceMessage(params json.RawMessage) {
+	type input struct {
+		RequestID string  `json:"requestId"`
+		Timestamp float64 `json:"timestamp"`
+		EventName string  `json:"eventName"`
+		EventID   string  `json:"eventId"`
+		Data      string  `json:"data"`
+	}
+	in := &input{}
+	if err := json.Unmarshal(params, in); err != nil {
+		return
+	}
+	msg := &StreamMessage{
+		RequestID: in.RequestID,
+		Timestamp: in.Timestamp,
+		EventName: in.EventName,
+		EventID:   in.EventID,
+		Data:      capBody(in.Data, false, s.maxBodyBytes),
+	}
+	s.mux.Lock()
+	if tx := s.inflight[in.RequestID]; tx != nil {
+		msg.URL = tx.URL
+	} else if u, ok := s.wsURL[in.RequestID]; ok {
+		msg.URL = u
+	}
+	s.streams = append(s.streams, msg)
+	s.mux.Unlock()
+}
+
+func (s *CaptureState) onWebSocketCreated(params json.RawMessage) {
+	type input struct {
+		RequestID string `json:"requestId"`
+		URL       string `json:"url"`
+	}
+	in := &input{}
+	if err := json.Unmarshal(params, in); err != nil {
+		return
+	}
+	s.mux.Lock()
+	s.wsURL[in.RequestID] = in.URL
+	s.mux.Unlock()
+}
+
+func (s *CaptureState) onWebSocketFrame(params json.RawMessage, direction string) {
+	type frame struct {
+		Opcode      int    `json:"opcode"`
+		Mask        bool   `json:"mask"`
+		PayloadData string `json:"payloadData"`
+	}
+	type input struct {
+		RequestID string  `json:"requestId"`
+		Timestamp float64 `json:"timestamp"`
+		Response  frame   `json:"response"`
+	}
+	in := &input{}
+	if err := json.Unmarshal(params, in); err != nil {
+		type input2 struct {
+			RequestID string  `json:"requestId"`
+			Timestamp float64 `json:"timestamp"`
+			Request   frame   `json:"request"`
+		}
+		in2 := &input2{}
+		if err2 := json.Unmarshal(params, in2); err2 != nil {
+			return
+		}
+		in.RequestID = in2.RequestID
+		in.Timestamp = in2.Timestamp
+		in.Response = in2.Request
+	}
+	f := &WebSocketFrame{
+		RequestID: in.RequestID,
+		Timestamp: in.Timestamp,
+		Direction: direction,
+		Opcode:    in.Response.Opcode,
+		Mask:      in.Response.Mask,
+		Payload:   capBody(in.Response.PayloadData, false, s.maxBodyBytes),
+	}
+	s.mux.Lock()
+	if u, ok := s.wsURL[in.RequestID]; ok {
+		f.URL = u
+	} else if tx := s.inflight[in.RequestID]; tx != nil {
+		f.URL = tx.URL
+	}
+	s.wsFrames = append(s.wsFrames, f)
+	s.mux.Unlock()
+}
+
+func (s *CaptureState) onWebSocketClosed(params json.RawMessage) {
+	// Currently unused; placeholder for future diagnostics.
+	_ = params
 }
 
 func (s *CaptureState) onRuntimeConsole(params json.RawMessage) {
@@ -581,15 +769,21 @@ func postW3C(remote, wdSession, endpoint string, payload map[string]any) (json.R
 }
 
 type captureSink struct {
-	url           string
-	writer        io.WriteCloser
+	fs             afs.Service
+	baseURL        string
+	indexURL       string
+	indexWriter    io.WriteCloser
+	splitArtifacts bool
+
 	flushInterval time.Duration
 	lastSync      time.Time
 	nextConsole   int
 	nextNetwork   int
+	nextWS        int
+	nextStreams   int
 }
 
-func (s *CaptureState) StartSink(fs afs.Service, sinkURL string, flushIntervalMs int) error {
+func (s *CaptureState) StartSink(fs afs.Service, sinkURL string, flushIntervalMs int, splitArtifacts bool) error {
 	if sinkURL == "" {
 		return nil
 	}
@@ -599,22 +793,38 @@ func (s *CaptureState) StartSink(fs afs.Service, sinkURL string, flushIntervalMs
 	if flushIntervalMs <= 0 {
 		flushIntervalMs = 500
 	}
-	w, err := fs.NewWriter(context.Background(), sinkURL, os.FileMode(0644))
+	baseURL := sinkURL
+	indexURL := sinkURL
+	if splitArtifacts {
+		baseURL = deriveArtifactsBaseURL(sinkURL)
+		indexURL = joinURLPath(baseURL, "index.jsonl")
+		// Best-effort create directory structure.
+		_ = fs.Create(context.Background(), baseURL, 0o755, true)
+		_ = fs.Create(context.Background(), joinURLPath(baseURL, "roundtrip"), 0o755, true)
+		_ = fs.Create(context.Background(), joinURLPath(baseURL, "ws"), 0o755, true)
+		_ = fs.Create(context.Background(), joinURLPath(baseURL, "streams"), 0o755, true)
+	}
+	w, err := fs.NewWriter(context.Background(), indexURL, os.FileMode(0644))
 	if err != nil {
 		return err
 	}
 	s.mux.Lock()
 	defer s.mux.Unlock()
-	if s.sink != nil && s.sink.writer != nil {
-		_ = s.sink.writer.Close()
+	if s.sink != nil && s.sink.indexWriter != nil {
+		_ = s.sink.indexWriter.Close()
 	}
 	s.sink = &captureSink{
-		url:           sinkURL,
-		writer:        w,
-		flushInterval: time.Duration(flushIntervalMs) * time.Millisecond,
-		lastSync:      time.Now(),
-		nextConsole:   0,
-		nextNetwork:   0,
+		fs:             fs,
+		baseURL:        baseURL,
+		indexURL:       indexURL,
+		indexWriter:    w,
+		splitArtifacts: splitArtifacts,
+		flushInterval:  time.Duration(flushIntervalMs) * time.Millisecond,
+		lastSync:       time.Now(),
+		nextConsole:    0,
+		nextNetwork:    0,
+		nextWS:         0,
+		nextStreams:    0,
 	}
 	return nil
 }
@@ -622,26 +832,28 @@ func (s *CaptureState) StartSink(fs afs.Service, sinkURL string, flushIntervalMs
 func (s *CaptureState) CloseSink() error {
 	s.mux.Lock()
 	defer s.mux.Unlock()
-	if s.sink == nil || s.sink.writer == nil {
+	if s.sink == nil || s.sink.indexWriter == nil {
 		return nil
 	}
-	err := s.sink.writer.Close()
-	s.sink.writer = nil
+	err := s.sink.indexWriter.Close()
+	s.sink.indexWriter = nil
 	return err
 }
 
 func (s *CaptureState) FlushSink() error {
 	s.mux.Lock()
 	sink := s.sink
-	if sink == nil || sink.writer == nil {
+	if sink == nil || sink.indexWriter == nil {
 		s.mux.Unlock()
 		return nil
 	}
 	pendingConsole := append([]*ConsoleEntry(nil), s.console[sink.nextConsole:]...)
 	pendingNetwork := append([]*NetworkTransaction(nil), s.completed[sink.nextNetwork:]...)
+	pendingWS := append([]*WebSocketFrame(nil), s.wsFrames[sink.nextWS:]...)
+	pendingStreams := append([]*StreamMessage(nil), s.streams[sink.nextStreams:]...)
 	s.mux.Unlock()
 
-	if len(pendingConsole) == 0 && len(pendingNetwork) == 0 {
+	if len(pendingConsole) == 0 && len(pendingNetwork) == 0 && len(pendingWS) == 0 && len(pendingStreams) == 0 {
 		return nil
 	}
 	writeLine := func(v any) error {
@@ -649,7 +861,7 @@ func (s *CaptureState) FlushSink() error {
 		if err != nil {
 			return err
 		}
-		_, err = sink.writer.Write(append(b, '\n'))
+		_, err = sink.indexWriter.Write(append(b, '\n'))
 		return err
 	}
 	for _, entry := range pendingConsole {
@@ -657,8 +869,113 @@ func (s *CaptureState) FlushSink() error {
 			return err
 		}
 	}
-	for _, tx := range pendingNetwork {
-		if err := writeLine(map[string]any{"type": "network", "tx": tx}); err != nil {
+	startID := sink.nextNetwork + 1
+	for i, tx := range pendingNetwork {
+		if !sink.splitArtifacts {
+			if err := writeLine(map[string]any{"type": "network", "tx": tx}); err != nil {
+				return err
+			}
+			continue
+		}
+		id := startID + i
+
+		reqRel := fmt.Sprintf("roundtrip/request_%05d.json", id)
+		resRel := fmt.Sprintf("roundtrip/response_%05d.json", id)
+		reqURL := joinURLPath(sink.baseURL, reqRel)
+		resURL := joinURLPath(sink.baseURL, resRel)
+
+		reqObj := map[string]any{
+			"id":             id,
+			"requestId":      tx.RequestID,
+			"url":            tx.URL,
+			"method":         tx.Method,
+			"resourceType":   tx.ResourceType,
+			"initiator":      tx.Initiator,
+			"startTimestamp": tx.StartTimestamp,
+			"headers":        tx.RequestHeaders,
+			"body":           tx.RequestBody,
+		}
+		resObj := map[string]any{
+			"id":                id,
+			"requestId":         tx.RequestID,
+			"url":               tx.URL,
+			"status":            tx.Status,
+			"statusText":        tx.StatusText,
+			"mimeType":          tx.MimeType,
+			"endTimestamp":      tx.EndTimestamp,
+			"durationMs":        tx.DurationMs,
+			"encodedDataSize":   tx.EncodedDataSize,
+			"errorText":         tx.ErrorText,
+			"wasCanceled":       tx.WasCanceled,
+			"headers":           tx.ResponseHeaders,
+			"body":              tx.ResponseBody,
+			"servedFromCache":   tx.ServedFromCache,
+			"fromDiskCache":     tx.FromDiskCache,
+			"fromPrefetchCache": tx.FromPrefetchCache,
+			"fromServiceWorker": tx.FromServiceWorker,
+			"responseBodyError": tx.ResponseBodyError,
+			"dataReceivedBytes": tx.DataReceivedBytes,
+		}
+		if err := sink.fs.Upload(context.Background(), reqURL, 0o644, bytes.NewReader(mustJSON(reqObj))); err != nil {
+			return err
+		}
+		if err := sink.fs.Upload(context.Background(), resURL, 0o644, bytes.NewReader(mustJSON(resObj))); err != nil {
+			return err
+		}
+		if err := writeLine(map[string]any{
+			"type":              "network",
+			"id":                id,
+			"url":               tx.URL,
+			"method":            tx.Method,
+			"status":            tx.Status,
+			"mimeType":          tx.MimeType,
+			"servedFromCache":   tx.ServedFromCache,
+			"fromDiskCache":     tx.FromDiskCache,
+			"fromPrefetchCache": tx.FromPrefetchCache,
+			"fromServiceWorker": tx.FromServiceWorker,
+			"responseBodyError": tx.ResponseBodyError,
+			"dataReceivedBytes": tx.DataReceivedBytes,
+			"requestFile":       reqRel,
+			"responseFile":      resRel,
+		}); err != nil {
+			return err
+		}
+	}
+
+	startWS := sink.nextWS + 1
+	for i, f := range pendingWS {
+		if !sink.splitArtifacts {
+			if err := writeLine(map[string]any{"type": "ws", "frame": f}); err != nil {
+				return err
+			}
+			continue
+		}
+		id := startWS + i
+		wsRel := fmt.Sprintf("ws/ws_%05d.json", id)
+		wsURL := joinURLPath(sink.baseURL, wsRel)
+		if err := sink.fs.Upload(context.Background(), wsURL, 0o644, bytes.NewReader(mustJSON(f))); err != nil {
+			return err
+		}
+		if err := writeLine(map[string]any{"type": "ws", "id": id, "file": wsRel, "requestId": f.RequestID, "url": f.URL, "direction": f.Direction, "opcode": f.Opcode}); err != nil {
+			return err
+		}
+	}
+
+	startStream := sink.nextStreams + 1
+	for i, m := range pendingStreams {
+		if !sink.splitArtifacts {
+			if err := writeLine(map[string]any{"type": "stream", "message": m}); err != nil {
+				return err
+			}
+			continue
+		}
+		id := startStream + i
+		rel := fmt.Sprintf("streams/stream_%05d.json", id)
+		u := joinURLPath(sink.baseURL, rel)
+		if err := sink.fs.Upload(context.Background(), u, 0o644, bytes.NewReader(mustJSON(m))); err != nil {
+			return err
+		}
+		if err := writeLine(map[string]any{"type": "stream", "id": id, "file": rel, "requestId": m.RequestID, "url": m.URL, "eventName": m.EventName}); err != nil {
 			return err
 		}
 	}
@@ -666,12 +983,14 @@ func (s *CaptureState) FlushSink() error {
 	if s.sink != nil {
 		s.sink.nextConsole += len(pendingConsole)
 		s.sink.nextNetwork += len(pendingNetwork)
+		s.sink.nextWS += len(pendingWS)
+		s.sink.nextStreams += len(pendingStreams)
 	}
 	shouldSync := s.sink != nil && s.sink.flushInterval > 0 && time.Since(s.sink.lastSync) >= s.sink.flushInterval
 	var writer io.WriteCloser
 	if shouldSync && s.sink != nil {
 		s.sink.lastSync = time.Now()
-		writer = s.sink.writer
+		writer = s.sink.indexWriter
 	}
 	s.mux.Unlock()
 	if shouldSync {
@@ -680,6 +999,39 @@ func (s *CaptureState) FlushSink() error {
 		}
 	}
 	return nil
+}
+
+func deriveArtifactsBaseURL(sinkURL string) string {
+	u, err := neturl.Parse(sinkURL)
+	if err != nil || u == nil {
+		// Fallback: treat as raw path-ish string.
+		sinkURL = strings.TrimSuffix(sinkURL, "/")
+		if strings.HasSuffix(sinkURL, ".jsonl") {
+			sinkURL = strings.TrimSuffix(sinkURL, ".jsonl")
+		}
+		return sinkURL
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	ext := path.Ext(p)
+	if ext != "" {
+		p = strings.TrimSuffix(p, ext)
+	}
+	u.Path = p
+	return u.String()
+}
+
+func joinURLPath(baseURL, elem string) string {
+	u, err := neturl.Parse(baseURL)
+	if err != nil || u == nil {
+		return strings.TrimSuffix(baseURL, "/") + "/" + strings.TrimPrefix(elem, "/")
+	}
+	u.Path = path.Join(u.Path, elem)
+	return u.String()
+}
+
+func mustJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 func min(a, b int) int {

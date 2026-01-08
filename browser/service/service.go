@@ -258,7 +258,7 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	s.mux.Unlock()
 	ensureSessionState(sess)
 
-	if sess.driver != nil {
+	if sess.driver != nil && !in.Reuse {
 		_ = sess.driver.Quit()
 		sess.driver = nil
 	}
@@ -279,6 +279,21 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 
 	if err := s.ensureLocalDriverService(ctx, sess, in); err != nil {
 		return nil, err
+	}
+
+	// If reusing an existing driver, avoid creating a new remote session.
+	if sess.driver != nil && in.Reuse {
+		out := &OpenSessionOutput{SessionID: sess.ID, WebDriverSessionID: sess.driver.SessionID()}
+		if strings.TrimSpace(in.URL) != "" {
+			nav := navigationWithDefaults(in.Navigation)
+			if err := s.getWithGuard(sess, in.URL, nav); err != nil {
+				return nil, err
+			}
+			if err := s.afterNavigate(ctx, sess, nav); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
 	}
 
 	caps := selenium.Capabilities{}
@@ -676,6 +691,44 @@ func (s *Service) ensureVisible(element selenium.WebElement) error {
 }
 
 func (s *Service) call(sess *Session, driver selenium.WebDriver, caller any, call *MethodCall, response *CallOutput, key string, kind PathKind) error {
+	// Provide a few higher-level actions that aren't native selenium methods on WebElement
+	// (and that benefit from extra resiliency in modern UIs).
+	if call != nil {
+		switch strings.ToLower(strings.TrimSpace(call.Method)) {
+		case "hover":
+			el, ok := caller.(selenium.WebElement)
+			if !ok {
+				return fmt.Errorf("Hover requires WebElement caller, got %T", caller)
+			}
+			if err := s.hoverElement(driver, el); err != nil {
+				return err
+			}
+			return nil
+		case "click":
+			el, ok := caller.(selenium.WebElement)
+			if !ok {
+				break
+			}
+			if err := ensureEnabled(el); err != nil {
+				return err
+			}
+			s.scrollIntoView(driver, el)
+			if err := el.Click(); err != nil {
+				if isElementClickIntercepted(err) {
+					time.Sleep(75 * time.Millisecond)
+					s.scrollIntoView(driver, el)
+					if err2 := el.Click(); err2 == nil {
+						return nil
+					} else if jsErr := s.jsClick(driver, el); jsErr == nil {
+						return nil
+					}
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
 	if call.WaitTimeMs == 0 {
 		if err := s.callMethod(caller, call.Method, response, call.Parameters); err != nil {
 			return err

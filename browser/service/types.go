@@ -39,6 +39,10 @@ type OpenSessionInput struct {
 	SessionID    string // host:port
 	Remote       string // optional; computed from SessionID if empty
 
+	// Reuse keeps an existing browser session open (preserving cookies/localStorage).
+	// When false (default), OpenSession replaces any existing WebDriver session.
+	Reuse bool `json:"reuse,omitempty"`
+
 	// URL optionally navigates right after session open.
 	URL string
 	// Navigation optionally controls navigation behavior when URL is set (and is used by browserRun get(url) guard too).
@@ -150,6 +154,10 @@ type CaptureStartInput struct {
 	EnableConsole   *bool
 	EnableNetwork   *bool
 	IncludeBodies   *bool
+
+	// SplitArtifacts, when true, writes per-request/per-response JSON artifacts alongside an index JSONL.
+	// SinkURL is treated as a directory URL (best-effort) where index.jsonl, requests/, and responses/ are written.
+	SplitArtifacts bool `json:"splitArtifacts,omitempty"`
 }
 
 type CaptureStartOutput struct {
@@ -175,10 +183,12 @@ type CaptureClearInput struct{ SessionID string }
 type CaptureClearOutput struct{ SessionID string }
 
 type CaptureExportInput struct {
-	SessionID      string
-	MaxEntries     int
-	IncludeConsole *bool
-	IncludeNetwork *bool
+	SessionID        string
+	MaxEntries       int
+	IncludeConsole   *bool
+	IncludeNetwork   *bool
+	IncludeWebSocket *bool `json:"includeWebSocket,omitempty"`
+	IncludeStreams   *bool `json:"includeStreams,omitempty"`
 }
 
 type CaptureExportOutput struct {
@@ -186,6 +196,8 @@ type CaptureExportOutput struct {
 	Summary   *CaptureSummary
 	Console   []*ConsoleEntry
 	Network   []*NetworkTransaction
+	WebSocket []*WebSocketFrame
+	Streams   []*StreamMessage
 }
 
 type ScreenshotInput struct {
@@ -454,6 +466,19 @@ type ClickOutput struct {
 	Match     *FindMatch `json:"match,omitempty"`
 }
 
+type HoverInput struct {
+	SessionID   string   `json:"sessionID,omitempty"`
+	Locator     *Locator `json:"locator,omitempty"`
+	TimeoutMs   int      `json:"timeoutMs,omitempty"`
+	Strict      bool     `json:"strict,omitempty"`
+	VisibleOnly bool     `json:"visibleOnly,omitempty"`
+}
+
+type HoverOutput struct {
+	SessionID string     `json:"sessionID,omitempty"`
+	Match     *FindMatch `json:"match,omitempty"`
+}
+
 type FillInput struct {
 	SessionID   string   `json:"sessionID,omitempty"`
 	Locator     *Locator `json:"locator,omitempty"`
@@ -512,6 +537,25 @@ type WaitOutput struct {
 	Match     *FindMatch `json:"match,omitempty"`
 }
 
+type WaitURLInput struct {
+	SessionID string `json:"sessionID,omitempty"`
+
+	// Exact matches window.location.href exactly (optional).
+	Exact string `json:"exact,omitempty"`
+	// Contains matches when href contains this substring (optional).
+	Contains string `json:"contains,omitempty"`
+	// Regex matches href against a Go regexp (optional).
+	Regex string `json:"regex,omitempty"`
+
+	TimeoutMs int `json:"timeoutMs,omitempty"`
+	PollMs    int `json:"pollMs,omitempty"`
+}
+
+type WaitURLOutput struct {
+	SessionID string `json:"sessionID,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
 type ClickTextInput struct {
 	SessionID string   `json:"sessionID,omitempty"`
 	Text      string   `json:"text,omitempty"`
@@ -563,6 +607,8 @@ type CaptureSummary struct {
 	RequestsInFlight  int
 	RequestsCompleted int
 	ConsoleEntries    int
+	WebSocketFrames   int
+	StreamMessages    int
 	Errors            []string
 }
 
@@ -602,4 +648,33 @@ type NetworkTransaction struct {
 	MimeType        string
 	ResponseHeaders map[string]any
 	ResponseBody    *CapturedBody
+
+	// Cache/proxy flags (best-effort; only set when available in CDP events).
+	ServedFromCache   bool
+	FromDiskCache     bool
+	FromPrefetchCache bool
+	FromServiceWorker bool
+
+	// Body capture diagnostics (useful for cached/streaming bodies).
+	ResponseBodyError string
+	DataReceivedBytes int64
+}
+
+type WebSocketFrame struct {
+	RequestID string        `json:"requestId,omitempty"`
+	URL       string        `json:"url,omitempty"`
+	Timestamp float64       `json:"timestamp,omitempty"`
+	Direction string        `json:"direction,omitempty"` // "sent"|"received"
+	Opcode    int           `json:"opcode,omitempty"`
+	Mask      bool          `json:"mask,omitempty"`
+	Payload   *CapturedBody `json:"payload,omitempty"`
+}
+
+type StreamMessage struct {
+	RequestID string        `json:"requestId,omitempty"`
+	URL       string        `json:"url,omitempty"`
+	Timestamp float64       `json:"timestamp,omitempty"`
+	EventName string        `json:"eventName,omitempty"`
+	EventID   string        `json:"eventId,omitempty"`
+	Data      *CapturedBody `json:"data,omitempty"`
 }

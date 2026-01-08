@@ -89,6 +89,18 @@ var descPress string
 //go:embed tools/browserWait.md
 var descWait string
 
+//go:embed tools/browserHover.md
+var descHover string
+
+//go:embed tools/browserWaitURL.md
+var descWaitURL string
+
+//go:embed tools/browserStorageSave.md
+var descStorageSave string
+
+//go:embed tools/browserStorageLoad.md
+var descStorageLoad string
+
 //go:embed tools/browserClickText.md
 var descClickText string
 
@@ -191,6 +203,9 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	if err := registerToolNames(base.Registry, toolNames("click"), descClick, svc, svc.Click); err != nil {
 		return err
 	}
+	if err := registerToolNames(base.Registry, toolNames("hover"), descHover, svc, svc.Hover); err != nil {
+		return err
+	}
 	if err := registerToolNames(base.Registry, toolNames("fill"), descFill, svc, svc.Fill); err != nil {
 		return err
 	}
@@ -198,6 +213,15 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		return err
 	}
 	if err := registerToolNames(base.Registry, toolNames("wait"), descWait, svc, svc.Wait); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("waitURL"), descWaitURL, svc, svc.WaitURL); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("storageSave"), descStorageSave, svc, svc.StorageSave); err != nil {
+		return err
+	}
+	if err := registerToolNames(base.Registry, toolNames("storageLoad"), descStorageLoad, svc, svc.StorageLoad); err != nil {
 		return err
 	}
 	if err := registerToolNames(base.Registry, toolNames("clickText"), descClickText, svc, svc.ClickText); err != nil {
