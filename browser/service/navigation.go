@@ -49,8 +49,19 @@ func (s *Service) getWithGuard(sess *Session, URL string, nav NavigationOptions)
 	if sess == nil || sess.driver == nil {
 		return fmt.Errorf("webdriver session not open")
 	}
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	if isNilWebDriver(sess.driver) {
+		return fmt.Errorf("webdriver session not open")
+	}
+	var err error
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("webdriver Get panic: %v", r)
+		}
+	}()
 	_ = sess.driver.SetPageLoadTimeout(time.Duration(nav.TimeoutMs) * time.Millisecond)
-	err := sess.driver.Get(URL)
+	err = sess.driver.Get(URL)
 	if err == nil {
 		return nil
 	}
@@ -127,19 +138,37 @@ func (s *Service) afterNavigate(ctx context.Context, sess *Session, nav Navigati
 }
 
 func (s *Service) waitDocumentReady(sess *Session, timeout time.Duration) error {
-	if sess == nil || sess.driver == nil {
+	if sess == nil || isNilWebDriver(sess.driver) {
 		return fmt.Errorf("webdriver session not open")
 	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		var (
+			v         any
+			err       error
+			recovered any
+		)
 		sess.lock.Lock()
-		v, err := sess.driver.ExecuteScript("return document.readyState;", nil)
-		sess.lock.Unlock()
-		if err == nil {
-			if st, ok := v.(string); ok {
-				if st == "complete" || st == "interactive" {
-					return nil
-				}
+		if isNilWebDriver(sess.driver) {
+			sess.lock.Unlock()
+			return fmt.Errorf("webdriver session not open")
+		}
+		func() {
+			defer sess.lock.Unlock()
+			defer func() { recovered = recover() }()
+			v, err = sess.driver.ExecuteScript("return document.readyState;", nil)
+		}()
+		if recovered != nil {
+			return fmt.Errorf("webdriver ExecuteScript panic: %v", recovered)
+		}
+		if err != nil {
+			// Some drivers can error transiently during navigation; keep polling until timeout.
+			time.Sleep(150 * time.Millisecond)
+			continue
+		}
+		if st, ok := v.(string); ok {
+			if st == "complete" || st == "interactive" {
+				return nil
 			}
 		}
 		time.Sleep(150 * time.Millisecond)
@@ -215,7 +244,15 @@ func (s *Service) autoScrollStabilize(sess *Session, nav NavigationOptions) {
 			lastHeight = height
 		}
 
-		_, _ = sess.driver.ExecuteScript("window.scrollBy(0, window.innerHeight || 800);", nil)
+		func() {
+			sess.lock.Lock()
+			defer sess.lock.Unlock()
+			if isNilWebDriver(sess.driver) {
+				return
+			}
+			defer func() { _ = recover() }()
+			_, _ = sess.driver.ExecuteScript("window.scrollBy(0, window.innerHeight || 800);", nil)
+		}()
 		time.Sleep(delay)
 		sess.drainTrackers()
 		if time.Since(stableSince) >= stableWindow && s.isNetworkIdle(sess, nav.IdleThreshold, idleWindow, &idleSince) {
@@ -251,6 +288,11 @@ func (s *Service) isNetworkIdle(sess *Session, threshold int, window time.Durati
 
 func (s *Service) scrollHeight(sess *Session) float64 {
 	if sess == nil || sess.driver == nil {
+		return -1
+	}
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+	if isNilWebDriver(sess.driver) {
 		return -1
 	}
 	v, err := sess.driver.ExecuteScript("return (document.body && document.body.scrollHeight) ? document.body.scrollHeight : 0;", nil)

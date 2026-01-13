@@ -225,10 +225,15 @@ func (s *Service) stopSession(sess *Session) error {
 	if sess.capture != nil {
 		_ = sess.capture.CloseSink()
 	}
-	if sess.driver != nil {
-		_ = sess.driver.Quit()
-		sess.driver = nil
-	}
+	sess.lock.Lock()
+	func() {
+		defer sess.lock.Unlock()
+		defer func() { _ = recover() }()
+		if !isNilWebDriver(sess.driver) {
+			_ = sess.driver.Quit()
+			sess.driver = nil
+		}
+	}()
 	if sess.service != nil {
 		_ = sess.service.Stop()
 		sess.service = nil
@@ -258,9 +263,16 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	s.mux.Unlock()
 	ensureSessionState(sess)
 
-	if sess.driver != nil && !in.Reuse {
-		_ = sess.driver.Quit()
-		sess.driver = nil
+	if !in.Reuse {
+		sess.lock.Lock()
+		func() {
+			defer sess.lock.Unlock()
+			defer func() { _ = recover() }()
+			if !isNilWebDriver(sess.driver) {
+				_ = sess.driver.Quit()
+				sess.driver = nil
+			}
+		}()
 	}
 
 	// Merge capabilities: request overrides session capabilities if provided.
@@ -282,18 +294,24 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	}
 
 	// If reusing an existing driver, avoid creating a new remote session.
-	if sess.driver != nil && in.Reuse {
-		out := &OpenSessionOutput{SessionID: sess.ID, WebDriverSessionID: sess.driver.SessionID()}
-		if strings.TrimSpace(in.URL) != "" {
-			nav := navigationWithDefaults(in.Navigation)
-			if err := s.getWithGuard(sess, in.URL, nav); err != nil {
-				return nil, err
+	if in.Reuse {
+		sess.lock.Lock()
+		driver := sess.driver
+		sess.lock.Unlock()
+		if !isNilWebDriver(driver) {
+			out := &OpenSessionOutput{SessionID: sess.ID, WebDriverSessionID: driver.SessionID()}
+			if strings.TrimSpace(in.URL) != "" {
+				nav := navigationWithDefaults(in.Navigation)
+				if err := s.getWithGuard(sess, in.URL, nav); err != nil {
+					return nil, err
+				}
+				if err := s.afterNavigate(ctx, sess, nav); err != nil {
+					return nil, err
+				}
 			}
-			if err := s.afterNavigate(ctx, sess, nav); err != nil {
-				return nil, err
-			}
+			return out, nil
 		}
-		return out, nil
+		// Fall through to create a new remote session when the existing driver is missing.
 	}
 
 	caps := selenium.Capabilities{}
@@ -313,7 +331,9 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	if err != nil {
 		return nil, err
 	}
+	sess.lock.Lock()
 	sess.driver = driver
+	sess.lock.Unlock()
 	sess.Remote = in.Remote
 	if sess.handles == nil {
 		sess.handles = map[string]*elementHandle{}
@@ -330,9 +350,11 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	// Ensure session cleanup.
 	_ = ctx
 	out := &OpenSessionOutput{SessionID: sess.ID}
-	if sess.driver != nil {
+	sess.lock.Lock()
+	if !isNilWebDriver(sess.driver) {
 		out.WebDriverSessionID = sess.driver.SessionID()
 	}
+	sess.lock.Unlock()
 	if strings.TrimSpace(in.URL) != "" {
 		nav := navigationWithDefaults(in.Navigation)
 		if err := s.getWithGuard(sess, in.URL, nav); err != nil {
