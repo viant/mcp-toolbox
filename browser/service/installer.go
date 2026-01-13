@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,15 +42,28 @@ func ensureDriverAvailableWithOptions(ctx context.Context, installDir string, dr
 		return "", "", "", false, err
 	}
 	dest := filepath.Join(installDir, driver)
-	if !force {
-		if info, err := os.Stat(dest); err == nil && info.Mode().IsRegular() {
-			return dest, "", "", false, nil
-		}
+	log.Printf("webdriver: checking %s at %s", driver, dest)
+	info, statErr := os.Stat(dest)
+	exists := statErr == nil && info.Mode().IsRegular()
+	if !force && exists {
+		log.Printf("webdriver: using existing %s at %s", driver, dest)
+		return dest, "", "", false, nil
+	}
+	if force && exists {
+		log.Printf("webdriver: detected existing %s at %s; force reinstall enabled", driver, dest)
+	} else if !exists {
+		log.Printf("webdriver: detected missing %s; installing to %s", driver, dest)
 	}
 
 	artifactURL, innerPath, usedVersion, err := artifactForVersion(ctx, runtime.GOOS, runtime.GOARCH, driver, version, force)
 	if err != nil {
 		return "", "", "", false, err
+	}
+	if usedVersion != "" {
+		log.Printf("webdriver: resolved %s version %s", driver, usedVersion)
+	}
+	if artifactURL != "" {
+		log.Printf("webdriver: downloading %s from %s", driver, artifactURL)
 	}
 	tmp, err := os.CreateTemp("", "mcp-webdriver-*")
 	if err != nil {
@@ -77,6 +91,11 @@ func ensureDriverAvailableWithOptions(ctx context.Context, installDir string, dr
 	}
 
 	_ = os.Chmod(dest, 0o755)
+	if usedVersion != "" {
+		log.Printf("webdriver: installed %s %s to %s", driver, usedVersion, dest)
+	} else {
+		log.Printf("webdriver: installed %s to %s", driver, dest)
+	}
 	return dest, usedVersion, artifactURL, true, nil
 }
 
