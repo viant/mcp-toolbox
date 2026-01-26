@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -62,6 +63,8 @@ func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, 
 	if useRef == "" {
 		if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
 			useRef = def
+		} else if derr != nil {
+			return "", 0, false, "", derr
 		}
 	}
 
@@ -108,6 +111,7 @@ func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, doma
 	s.memSnapMu.RLock()
 	if m, ok := s.memSnapCache[memKey]; ok && time.Now().Before(m.expireAt) && m.size > 0 {
 		s.memSnapMu.RUnlock()
+		log.Printf("github snapshot: cache hit domain=%s repo=%s/%s sha=%s size=%d source=memory", domain, owner, name, resolvedSHA, m.size)
 		return "", m.size, true, resolvedSHA, nil
 	}
 	s.memSnapMu.RUnlock()
@@ -116,6 +120,7 @@ func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, doma
 	if fi, e := os.Stat(shared); e == nil && fi.Mode().IsRegular() {
 		if s.canUseSharedSnapshot(ctx, domain, owner, name, token) {
 			_ = os.Chtimes(shared, time.Now(), time.Now())
+			log.Printf("github snapshot: cache hit domain=%s repo=%s/%s sha=%s size=%d source=disk path=%s", domain, owner, name, resolvedSHA, fi.Size(), shared)
 			return shared, fi.Size(), true, resolvedSHA, nil
 		}
 	}
@@ -128,6 +133,7 @@ func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, doma
 	url := fmt.Sprintf("%s/repos/%s/%s/zipball/%s", apiBase, owner, name, neturl.PathEscape(resolvedSHA))
 	doFetch := func() (int64, error) {
 		var written int64
+		log.Printf("github snapshot: download start domain=%s repo=%s/%s ref=%s url=%s", domain, owner, name, resolvedSHA, url)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if strings.TrimSpace(token) != "" {
 			req.Header.Set("Authorization", s.authBasic(token))
@@ -142,6 +148,9 @@ func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, doma
 		}
 		if resp.StatusCode >= 300 {
 			return 0, fmt.Errorf("zipball fetch failed: %s", resp.Status)
+		}
+		if resp.ContentLength > 0 {
+			log.Printf("github snapshot: download size domain=%s repo=%s/%s ref=%s bytes=%d", domain, owner, name, resolvedSHA, resp.ContentLength)
 		}
 		if !looksLikeSHA(resolvedSHA) {
 			if cand := s.extractSHAFromHTTP(resp); cand != "" {
@@ -167,6 +176,7 @@ func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, doma
 		if err := os.Rename(tmp, shared); err != nil {
 			return 0, err
 		}
+		log.Printf("github snapshot: download done domain=%s repo=%s/%s sha=%s bytes=%d path=%s", domain, owner, name, resolvedSHA, written, shared)
 		return written, nil
 	}
 	n, err := doFetch()
@@ -394,6 +404,42 @@ func (s *Service) findExistingSharedZip(domain, owner, name string) string {
 	}
 	sort.Slice(found, func(i, j int) bool { return found[i].mod.After(found[j].mod) })
 	return found[0].name
+}
+
+// SnapshotCachedSize returns the size of the most recent cached snapshot, if any.
+// It does not fetch remote snapshots.
+func (s *Service) SnapshotCachedSize(domain, owner, name string) (int64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	// Check in-memory cache first.
+	prefix := strings.ToLower(strings.Join([]string{safePart(domain), safePart(owner), safePart(name), ""}, "|"))
+	s.memSnapMu.RLock()
+	var bestSize int64
+	var found bool
+	for key, entry := range s.memSnapCache {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if entry.size > bestSize {
+			bestSize = entry.size
+			found = true
+		}
+	}
+	s.memSnapMu.RUnlock()
+	if found && bestSize > 0 {
+		return bestSize, true
+	}
+	// Check shared snapshot file on disk.
+	sha := s.findExistingSharedZip(domain, owner, name)
+	if sha == "" {
+		return 0, false
+	}
+	shared := s.sharedSnapshotPath(domain, owner, name, sha)
+	if fi, err := os.Stat(shared); err == nil && fi.Mode().IsRegular() {
+		return fi.Size(), fi.Size() > 0
+	}
+	return 0, false
 }
 
 // read helpers and detectors

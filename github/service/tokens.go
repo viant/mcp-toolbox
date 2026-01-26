@@ -109,8 +109,14 @@ func (s *Service) saveTokenRepo(ns, alias, domain, owner, name, token string, oa
 	s.mu.Lock()
 	if oauthKey && s.clientID != "" {
 		s.tokens[s.tokenKeyRepoOAuth(ns, alias, domain, owner, name, s.clientID)] = token
+		if shouldMirrorAlias(alias) {
+			s.tokens[s.tokenKeyRepoOAuth(ns, "default", domain, owner, name, s.clientID)] = token
+		}
 	} else {
 		s.tokens[s.tokenKeyRepo(ns, alias, domain, owner, name)] = token
+		if shouldMirrorAlias(alias) {
+			s.tokens[s.tokenKeyRepo(ns, "default", domain, owner, name)] = token
+		}
 	}
 	s.mu.Unlock()
 }
@@ -118,8 +124,14 @@ func (s *Service) saveTokenDomain(ns, alias, domain, token string, oauthKey bool
 	s.mu.Lock()
 	if oauthKey && s.clientID != "" {
 		s.tokens[s.tokenKeyOAuth(ns, alias, domain, s.clientID)] = token
+		if shouldMirrorAlias(alias) {
+			s.tokens[s.tokenKeyOAuth(ns, "default", domain, s.clientID)] = token
+		}
 	} else {
 		s.tokens[s.tokenKey(ns, alias, domain)] = token
+		if shouldMirrorAlias(alias) {
+			s.tokens[s.tokenKey(ns, "default", domain)] = token
+		}
 	}
 	s.mu.Unlock()
 }
@@ -128,6 +140,11 @@ func (s *Service) clearToken(ns, alias, domain string) {
 	s.mu.Lock()
 	delete(s.tokens, key)
 	s.mu.Unlock()
+}
+
+func shouldMirrorAlias(alias string) bool {
+	a := strings.TrimSpace(alias)
+	return a != "" && a != "default" && strings.Contains(a, "/")
 }
 
 func (s *Service) tokenURL(ns, alias, domain, owner, repo string) string {

@@ -52,7 +52,7 @@ func Test_E2E_GHE_List_Download_And_Optional_Checkout(t *testing.T) {
 
 	fmt.Println("ListRepoPath ....")
 	// 1) List root path
-	lst, err := svc.ListRepoPath(ctx, &ListRepoInput{
+	lst, err := svc.ListRepoPath(ctx, &ListRepoPathInput{
 		GitTarget: GitTarget{Account: Account{Alias: alias, Domain: domain}, Repo: RepoRef{Owner: "adelphic", Name: "mediator"}, Ref: ""},
 		Path:      "/common/params",
 		Recursive: true,
@@ -64,7 +64,7 @@ func Test_E2E_GHE_List_Download_And_Optional_Checkout(t *testing.T) {
 	for _, p := range lst.Paths {
 		fmt.Println(p)
 	}
-	content, err := svc.DownloadRepoFile(ctx, &DownloadInput{GitTarget: GitTarget{
+	content, err := svc.ReadRepoFile(ctx, &ReadInput{GitTarget: GitTarget{
 		URL: "github.vianttech.com/adelphic/mediator",
 		Ref: "main",
 	},
@@ -91,7 +91,7 @@ func Test_E2E_GHE_List_Download_And_Optional_Checkout(t *testing.T) {
 	}
 
 	// 2) Download that file
-	got, err := svc.DownloadRepoFile(ctx, &DownloadInput{
+	got, err := svc.ReadRepoFile(ctx, &ReadInput{
 		GitTarget: GitTarget{Account: Account{Alias: alias, Domain: domain}, Repo: RepoRef{Owner: "adelphic", Name: "mediator"}},
 		Path:      filePath,
 	}, nil)
@@ -162,7 +162,7 @@ func Test_E2E_GHE_SearchPrice(t *testing.T) {
 	}
 
 	start := time.Now()
-	in := &ListRepoInput{
+	in := &ListRepoPathInput{
 		GitTarget: GitTarget{URL: domain + "/viant/mdp"},
 		Path:      "/",
 		Recursive: true,
@@ -224,7 +224,7 @@ func Test_E2E_GHE_ListRepoFiles_MDP(t *testing.T) {
 
 	// Use the exact request parameters supplied
 	start := time.Now()
-	in := &ListRepoInput{
+	in := &ListRepoPathInput{
 		GitTarget: GitTarget{URL: domain + "/viant/mdp"},
 		Path:      "/",
 		Recursive: true,
@@ -251,9 +251,9 @@ func Test_E2E_GHE_ListRepoFiles_MDP(t *testing.T) {
 	}
 }
 
-// Run only with: go test -tags local ./github/service -run Test_E2E_GHE_FindFilesPreview_Mediator -v
-// Mirrors the provided findFilesPreview request against GHE: github.vianttech.com/adelphic/mediator
-func Test_E2E_GHE_FindFilesPreview_Mediator(t *testing.T) {
+// Run only with: go test -tags local ./github/service -run Test_E2E_GHE_GrepFiles_Mediator -v
+// Mirrors the provided grepFiles request against GHE: github.vianttech.com/adelphic/mediator
+func Test_E2E_GHE_GrepFiles_Mediator(t *testing.T) {
 
 	os.Setenv("GITHUB_MCP_TEST_STORAGE", "/tmp/foo")
 	// Enable verbose logs and extend token wait to ease local troubleshooting
@@ -290,7 +290,7 @@ func Test_E2E_GHE_FindFilesPreview_Mediator(t *testing.T) {
 	}
 
 	// Build request mirrored from the user example (compact contract)
-	in := &FindFilesPreviewInput{
+	in := &GrepFilesInput{
 		GitTarget:       GitTarget{URL: domain + "/adelphic/mediator", Ref: "master", Account: Account{Alias: alias, Domain: domain}},
 		Path:            "/",
 		Recursive:       true,
@@ -298,7 +298,7 @@ func Test_E2E_GHE_FindFilesPreview_Mediator(t *testing.T) {
 		Exclude:         []string{"**/vendor/**", "**/*_test.go", ".git/**"},
 		Queries:         []string{"/floor/i", "/BidFloor/i", "/dealid/i", "/pmp/i"},
 		CaseInsensitive: true,
-		Mode:            "matches",
+		Mode:            "match",
 		Bytes:           800,
 		Lines:           1,
 		MaxFiles:        200,
@@ -308,10 +308,10 @@ func Test_E2E_GHE_FindFilesPreview_Mediator(t *testing.T) {
 		Concurrency:     8,
 	}
 
-	t.Logf("findFilesPreview with params: %+v", in)
-	out, err := svc.FindFilesPreview(ctx, in, func(msg string) { t.Logf("PROMPT: %s", msg) })
+	t.Logf("grepFiles with params: %+v", in)
+	out, err := svc.GrepFiles(ctx, in, func(msg string) { t.Logf("PROMPT: %s", msg) })
 	if err != nil {
-		t.Fatalf("FindFilesPreview error: %v", err)
+		t.Fatalf("GrepFiles error: %v", err)
 	}
 	dd, _ := json.Marshal(out)
 	fmt.Printf("Out: %s\n", dd)

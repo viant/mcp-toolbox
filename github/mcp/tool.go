@@ -46,11 +46,11 @@ var descCheckoutRepo string
 //go:embed tools/listRepoPath.md
 var descListRepoPath string
 
-//go:embed tools/downloadRepoFile.md
-var descDownloadRepoFile string
+//go:embed tools/readRepoFile.md
+var descReadRepoFile string
 
-//go:embed tools/searchRepoContent.md
-var descFindFilesPreview string
+//go:embed tools/grepFiles.md
+var descGrepFiles string
 
 // Types moved to types.go
 
@@ -399,54 +399,53 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		return err
 	}
 
-	// Download repo file (without clone)
-	if err := protoserver.RegisterTool[*ghservice.DownloadInput, *ghservice.DownloadOutput](base.Registry, "download", descDownloadRepoFile, func(ctx context.Context, in *ghservice.DownloadInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		start := logToolStart("download")
-		stop := startToolPending("download", in, start)
+	// Read repo file (without clone)
+	if err := protoserver.RegisterTool[*ghservice.ReadInput, *ghservice.ReadOutput](base.Registry, "read", descReadRepoFile, func(ctx context.Context, in *ghservice.ReadInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("read")
+		stop := startToolPending("read", in, start)
 		defer stop()
 		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
-			logToolEnd("download", start, fmt.Errorf("missing repo or url"))
+			logToolEnd("read", start, fmt.Errorf("missing repo or url"))
 			return buildErrorResult("repo.owner and repo.name or url are required")
 		}
 		if in.Path == "" {
-			logToolEnd("download", start, fmt.Errorf("missing path"))
+			logToolEnd("read", start, fmt.Errorf("missing path"))
 			return buildErrorResult("path is required")
 		}
 		ctxNS, svc, rerr := h.resolveService(ctx)
-		logToolNS(h, "download", ctxNS)
+		logToolNS(h, "read", ctxNS)
 		if rerr != nil {
 			return buildErrorResult("resolve namespace: " + rerr.Error())
 		}
 		cid := newUUID()
 		ctxNS = ghservice.WithCID(ctxNS, cid)
-		_ = cid
-		out, err := svc.DownloadRepoFile(ctxNS, in, msgPrompt(ctxNS))
+		out, err := svc.ReadRepoFile(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
-			logToolEnd("download", start, err)
+			logToolEnd("read", start, err)
 			return buildErrorResult(err.Error())
 		}
-		logToolEnd("download", start, nil)
+		logToolEnd("read", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err
 	}
 
-	// Find files with preview (no apply), supports sed-like preview on snapshot
-	if err := protoserver.RegisterTool[*ghservice.SearchRepoContentInput, *ghservice.SearchRepoContentOutput](base.Registry, "searchRepoContent", descFindFilesPreview, func(ctx context.Context, in *ghservice.SearchRepoContentInput) (*schema.CallToolResult, *jsonrpc.Error) {
-		start := logToolStart("searchRepoContent")
-		stop := startToolPending("searchRepoContent", in, start)
+	// Grep files with preview (no apply), supports sed-like preview on snapshot
+	if err := protoserver.RegisterTool[*ghservice.GrepFilesInput, *ghservice.GrepFilesOutput](base.Registry, "grepFiles", descGrepFiles, func(ctx context.Context, in *ghservice.GrepFilesInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("grepFiles")
+		stop := startToolPending("grepFiles", in, start)
 		defer stop()
 		ctxNS, svc, rerr := h.resolveService(ctx)
-		logToolNS(h, "searchRepoContent", ctxNS)
+		logToolNS(h, "grepFiles", ctxNS)
 		if rerr != nil {
 			return buildErrorResult("resolve namespace: " + rerr.Error())
 		}
-		out, err := svc.SearchRepoContent(ctxNS, in, msgPrompt(ctxNS))
+		out, err := svc.GrepFiles(ctxNS, in, msgPrompt(ctxNS))
 		if err != nil {
-			logToolEnd("searchRepoContent", start, err)
+			logToolEnd("grepFiles", start, err)
 			return buildErrorResult(err.Error())
 		}
-		logToolEnd("searchRepoContent", start, nil)
+		logToolEnd("grepFiles", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err

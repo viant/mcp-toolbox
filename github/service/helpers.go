@@ -154,7 +154,11 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			svc.saveTokenRepo(ns, aliasEff, domainEff, owner, name, repoTok, false)
 		}
 	}
-	token := domainTok
+	// Prefer least-privileged repo token when available.
+	token := repoTok
+	if token == "" {
+		token = domainTok
+	}
 	if token == "" {
 		// For public github.com, try unauthenticated call first; only elicit on permission errors.
 		if svc.normalizeDomain(domainEff) == "github.com" {
@@ -170,7 +174,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 				}
 				break
 			}
-			if !(errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrSSORequired)) {
+			if !(errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrSSORequired) || errors.Is(err, adapter.ErrNotFound)) {
 				return zero, err
 			}
 		}
@@ -188,29 +192,38 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			}
 			// debug logs removed
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, owner, name, wait) {
-				// After notify, prefer domain-level token
-				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
+				// After notify, prefer repo-level token for least privilege.
+				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
 				if token == "" {
-					// Fallback to repo-level if only that was provided
-					token = svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+					// Fallback to domain-level if only that was provided
+					token = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
 				}
 				// Only allow cross-namespace fallback when operating in the shared default namespace.
 				if token == "" && ns == "default" {
-					// Try domain-wide first across NS, then repo-level across NS
-					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
+					// Try repo-level first across NS, then domain-level across NS
+					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
 					if token == "" {
-						token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
+						token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
 					}
 				}
 				// debug logs removed
 			}
 			// debug logs removed
 		}
+		// If no token found, attempt alias inference after OOB to align with user-provided alias.
+		if token == "" {
+			if inf, _ := svc.inferAlias(ctx, domainEff, owner, name); inf != "" && inf != aliasEff {
+				token = svc.loadTokenPreferred(ns, inf, domainEff, owner, name)
+				if token == "" {
+					token = svc.loadTokenPreferred(ns, inf, domainEff, "", "")
+				}
+			}
+		}
 		if token == "" {
 			return zero, fmt.Errorf("no token for alias=%s domain=%s; provide token via OOB or /github/auth/token", aliasEff, domainEff)
 		}
 	}
-	// First try with domain-level token (retry on rate limiting)
+	// First try with repo-level token when present (retry on rate limiting).
 	var out T
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
@@ -223,10 +236,10 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 		}
 		break
 	}
-	// On insufficient access or bad creds with domain token, retry once with repo token if present
-	if token == domainTok && repoTok != "" && repoTok != domainTok && (errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrNotFound)) {
+	// On insufficient access or bad creds with repo token, retry with domain token if present.
+	if token == repoTok && domainTok != "" && domainTok != repoTok && (errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrNotFound)) {
 		for attempt := 0; attempt < 4; attempt++ {
-			out, err = call(repoTok)
+			out, err = call(domainTok)
 			if err == nil {
 				return out, nil
 			}

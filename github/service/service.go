@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	// afsurl used elsewhere in package; keep if needed
+	"github.com/viant/mcp-protocol/extension"
 	oa "github.com/viant/mcp-toolbox/auth"
 	"github.com/viant/mcp-toolbox/github/adapter"
 	nsprov "github.com/viant/mcp/server/namespace"
@@ -231,7 +233,7 @@ func (s *Service) effectiveRef(ctx context.Context, domain, owner, name, ref, to
 // caching to disk for 30 minutes if the size is >= 100MB.
 // It uses the GitHub zipball API and follows redirects.
 /* moved to snapshots.go */
-func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, prompt func(string)) (*DownloadOutput, error) {
+func (s *Service) ReadRepoFile(ctx context.Context, in *ReadInput, prompt func(string)) (*ReadOutput, error) {
 	if in == nil {
 		return nil, fmt.Errorf("input is nil")
 	}
@@ -432,9 +434,19 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 	if err != nil {
 		return nil, err
 	}
-	// Auto-detect text vs binary. Populate only one of Text or Content.
-	if isProbablyText(data) {
-		out := &DownloadOutput{Text: string(data)}
+	limitRequested := readLimitRequested(in)
+	selection := buildReadSelection(data, in, limitRequested)
+	out := &ReadOutput{
+		Size:        len(data),
+		Returned:    selection.Returned,
+		Remaining:   selection.Remaining,
+		ModeApplied: selection.Mode,
+		Binary:      selection.Binary,
+	}
+	if selection.Binary {
+		out.Content = selection.Content
+	} else {
+		out.Text = selection.Text
 		// Optional sed preview/transform using Go.Sed
 		if len(in.SedScripts) > 0 {
 			maxEdits := in.MaxEditsPerFile
@@ -456,9 +468,213 @@ func (s *Service) DownloadRepoFile(ctx context.Context, in *DownloadInput, promp
 				}
 			}
 		}
-		return out, nil
 	}
-	return &DownloadOutput{Content: data}, nil
+	if limitRequested {
+		if cont := buildReadContinuation(selection); cont != nil {
+			out.Continuation = cont
+		}
+	}
+	return out, nil
+}
+
+const defaultReadPreviewBytes = 8192
+
+type readSelection struct {
+	Text        string
+	Content     []byte
+	Returned    int
+	Remaining   int
+	Mode        string
+	Binary      bool
+	StartOffset int
+}
+
+func readLimitRequested(in *ReadInput) bool {
+	if in == nil {
+		return false
+	}
+	if strings.TrimSpace(in.Mode) != "" {
+		return true
+	}
+	if in.MaxBytes > 0 || in.OffsetBytes > 0 || in.LengthBytes > 0 {
+		return true
+	}
+	return false
+}
+
+func buildReadSelection(data []byte, in *ReadInput, limit bool) *readSelection {
+	total := len(data)
+	start := in.OffsetBytes
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	view := data[start:]
+	if length := in.LengthBytes; length > 0 && length < len(view) {
+		view = view[:length]
+	}
+	if len(view) == 0 {
+		mode := ""
+		if limit {
+			mode = strings.TrimSpace(strings.ToLower(in.Mode))
+			if mode == "" {
+				mode = "head"
+			}
+		}
+		remaining := total - start
+		if remaining < 0 {
+			remaining = 0
+		}
+		return &readSelection{
+			Text:        "",
+			Content:     nil,
+			Returned:    0,
+			Remaining:   remaining,
+			Mode:        mode,
+			Binary:      !isProbablyText(data),
+			StartOffset: start,
+		}
+	}
+	isText := isProbablyText(data)
+	maxBytes := in.MaxBytes
+	if maxBytes <= 0 {
+		switch {
+		case in.LengthBytes > 0:
+			maxBytes = len(view)
+		case limit:
+			maxBytes = defaultReadPreviewBytes
+		default:
+			maxBytes = len(view)
+		}
+	}
+	if maxBytes > len(view) || maxBytes <= 0 {
+		maxBytes = len(view)
+	}
+	if isText {
+		mode := ""
+		segment := string(view)
+		if limit {
+			mode = strings.TrimSpace(strings.ToLower(in.Mode))
+			if mode == "" {
+				mode = "head"
+			}
+			if maxBytes < len(segment) {
+				switch mode {
+				case "tail":
+					segment = clipTail(segment, maxBytes)
+				case "signatures":
+					if sig := extractSignatureLines(segment, maxBytes); sig != "" {
+						segment = sig
+					} else {
+						segment = clipHead(segment, maxBytes)
+					}
+				default:
+					segment = clipHead(segment, maxBytes)
+				}
+			}
+		}
+		ret := len(segment)
+		remaining := total - (start + ret)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return &readSelection{
+			Text:        segment,
+			Returned:    ret,
+			Remaining:   remaining,
+			Mode:        mode,
+			Binary:      false,
+			StartOffset: start,
+		}
+	}
+	segment := view[:maxBytes]
+	if maxBytes < len(view) || start > 0 {
+		buf := make([]byte, len(segment))
+		copy(buf, segment)
+		segment = buf
+	}
+	ret := len(segment)
+	remaining := total - (start + ret)
+	if remaining < 0 {
+		remaining = 0
+	}
+	mode := ""
+	if limit {
+		mode = "bytes"
+	}
+	return &readSelection{
+		Content:     segment,
+		Returned:    ret,
+		Remaining:   remaining,
+		Mode:        mode,
+		Binary:      true,
+		StartOffset: start,
+	}
+}
+
+func buildReadContinuation(sel *readSelection) *extension.Continuation {
+	if sel == nil || sel.Remaining <= 0 || sel.Returned <= 0 {
+		return nil
+	}
+	nextOffset := sel.StartOffset + sel.Returned
+	if nextOffset < 0 {
+		nextOffset = sel.Returned
+	}
+	return &extension.Continuation{
+		HasMore:   true,
+		Remaining: sel.Remaining,
+		Returned:  sel.Returned,
+		Mode:      sel.Mode,
+		Binary:    sel.Binary,
+		NextRange: &extension.RangeHint{
+			Bytes: &extension.ByteRange{
+				Offset: nextOffset,
+				Length: sel.Returned,
+			},
+		},
+	}
+}
+
+func clipHead(text string, maxBytes int) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	return text[:maxBytes]
+}
+
+func clipTail(text string, maxBytes int) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	return text[len(text)-maxBytes:]
+}
+
+var signatureLine = regexp.MustCompile(`^\s*(public|private|protected|class|interface|func|def|package|import|\w+\s+\w+\()`)
+
+func extractSignatureLines(text string, maxBytes int) string {
+	lines := strings.Split(text, "\n")
+	var out []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if signatureLine.MatchString(line) {
+			out = append(out, line)
+			if maxBytes > 0 && len(strings.Join(out, "\n")) >= maxBytes {
+				break
+			}
+		}
+	}
+	result := strings.Join(out, "\n")
+	if result == "" {
+		return ""
+	}
+	if maxBytes > 0 && len(result) > maxBytes {
+		return result[:maxBytes]
+	}
+	return result
 }
 
 func (s *Service) UseTextField() bool { return s.useText }

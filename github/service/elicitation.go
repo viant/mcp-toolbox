@@ -94,6 +94,32 @@ func (s *Service) notifyToken(ns, alias, domain string) {
 	s.credMu.Unlock()
 }
 
+// notifyTokenAll wakes any goroutines waiting for a token for (alias,domain) in any namespace.
+func (s *Service) notifyTokenAll(alias, domain string) {
+	alias = safePart(lockAlias(alias))
+	domain = safePart(domain)
+	s.credMu.Lock()
+	woken := 0
+	for key, lk := range s.credLocks {
+		if lk == nil {
+			continue
+		}
+		parts := strings.Split(key, "|")
+		if len(parts) < 4 || parts[0] != safePart("wait") {
+			continue
+		}
+		if parts[2] == alias && parts[3] == domain {
+			delete(s.credLocks, key)
+			close(lk.done)
+			woken++
+		}
+	}
+	s.credMu.Unlock()
+	if woken > 0 {
+		fmt.Printf("github auth: token waiters released alias=%q domain=%q count=%d\n", alias, domain, woken)
+	}
+}
+
 // clearElicitedAll clears dedupe entries for any session for this alias/domain.
 func (s *Service) clearElicitedAll(alias, domain string) {
 	s.elicitMu.Lock()
@@ -119,6 +145,7 @@ func (s *Service) clearElicitedAll(alias, domain string) {
 // maybeElicitOnce emits a single out-of-band prompt per (namespace,alias,domain) within a cooldown window.
 func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, name string, prompt func(string)) {
 	if prompt == nil {
+		fmt.Printf("github auth: elicit skipped (no prompt handler) alias=%q domain=%q owner=%q repo=%q\n", alias, domain, owner, name)
 		return
 	}
 	// derive correlation id if needed
@@ -174,12 +201,17 @@ func (s *Service) maybeElicitOnce(ctx context.Context, alias, domain, owner, nam
 				sep = "&"
 			}
 			url := fmt.Sprintf("%s%s%s", cb, sep, q.Encode())
+			fmt.Printf("github auth: elicit oob url=%q alias=%q domain=%q owner=%q repo=%q\n", url, alias, domain, owner, name)
 			prompt(fmt.Sprintf("Open %s to provide credentials", url))
 			return
+		}
+		if err != nil {
+			fmt.Printf("github auth: elicit oob create failed alias=%q domain=%q owner=%q repo=%q err=%v\n", alias, domain, owner, name, err)
 		}
 	}
 	// Fallback: plain OOB URL without uuid (less ideal; won’t bind namespace)
 	url := fmt.Sprintf("%s/github/auth/oob?%s", base, q.Encode())
+	fmt.Printf("github auth: elicit oob fallback url=%q alias=%q domain=%q owner=%q repo=%q\n", url, alias, domain, owner, name)
 	prompt(fmt.Sprintf("Open %s to provide credentials", url))
 }
 
@@ -192,17 +224,25 @@ func (s *Service) waitForToken(ctx context.Context, ns, alias, domain, owner, na
 	// If leader, do nothing special here (elicitation triggered upstream); just wait for done or timeout/cancel.
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	if timeout > 0 {
+		fmt.Printf("github auth: waiting for token ns=%q alias=%q domain=%q owner=%q repo=%q timeout=%s\n", ns, alias, domain, owner, name, timeout)
+	} else {
+		fmt.Printf("github auth: waiting for token ns=%q alias=%q domain=%q owner=%q repo=%q\n", ns, alias, domain, owner, name)
+	}
 	select {
 	case <-ctx.Done():
 		// Cancel: release without success to allow future attempts
 		release(false)
+		fmt.Printf("github auth: token wait canceled ns=%q alias=%q domain=%q owner=%q repo=%q err=%v\n", ns, alias, domain, owner, name, ctx.Err())
 		return false
 	case <-timer.C:
 		// Timeout: clean up gate without waking followers (they will also time out and re-attempt)
 		release(false)
 		has := s.loadTokenPreferred(ns, alias, domain, owner, name) != ""
+		fmt.Printf("github auth: token wait timeout ns=%q alias=%q domain=%q owner=%q repo=%q found=%v\n", ns, alias, domain, owner, name, has)
 		return has
 	case <-done:
+		fmt.Printf("github auth: token wait released ns=%q alias=%q domain=%q owner=%q repo=%q\n", ns, alias, domain, owner, name)
 		return true
 	}
 }

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/viant/mcp-toolbox/github/adapter"
@@ -72,7 +73,7 @@ func (s contentAPIShim) GetFileContent(ctx context.Context, token, owner, name, 
 
 var errUnauthorized = errors.New("unauthorized")
 
-func Test_ListRepoPath_and_Download_without_clone(t *testing.T) {
+func Test_ListRepoPath_and_Read_without_clone(t *testing.T) {
 	svc := newTestService(t)
 	svc.saveToken("default", "acc", "", "TKN")
 
@@ -100,12 +101,60 @@ func Test_ListRepoPath_and_Download_without_clone(t *testing.T) {
 		t.Fatalf("unexpected paths: %+v", lst.Paths)
 	}
 
-	// Download file
-	got, err := svc.DownloadRepoFile(context.Background(), &DownloadInput{GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}}, Path: "README.md"}, nil)
+	// Read file
+	got, err := svc.ReadRepoFile(context.Background(), &ReadInput{GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}}, Path: "README.md"}, nil)
 	if err != nil {
 		t.Fatalf("download error: %v", err)
 	}
-	if string(got.Content) != "hello world" {
-		t.Fatalf("unexpected content: %q", string(got.Content))
+	if got.Text != "hello world" {
+		t.Fatalf("unexpected content: %q", got.Text)
+	}
+}
+
+func Test_ReadRepoFile_WithLimitsAndContinuation(t *testing.T) {
+	svc := newTestService(t)
+	svc.saveToken("default", "acc", "", "TKN")
+
+	payload := strings.Repeat("abcdef", 10) // 60 bytes
+	fake := &fakeContentAPI{
+		items: []struct {
+			t, name, path, sha string
+			size               int
+		}{
+			{t: "file", name: "README.md", path: "README.md", sha: "sha1", size: len(payload)},
+		},
+		file: []byte(payload),
+	}
+	svc.makeContentAPI = func(domain string) contentAPI { return contentAPIShim{inner: fake} }
+
+	first, err := svc.ReadRepoFile(context.Background(), &ReadInput{
+		GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}},
+		Path:      "README.md",
+		MaxBytes:  10,
+	}, nil)
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+	if first.Text != payload[:10] {
+		t.Fatalf("unexpected head chunk: %q", first.Text)
+	}
+	if first.Continuation == nil || !first.Continuation.HasMore {
+		t.Fatalf("expected continuation for truncated response")
+	}
+	if got := first.Continuation.NextRange; got == nil || got.Bytes == nil || got.Bytes.Offset != 10 {
+		t.Fatalf("unexpected next range: %+v", first.Continuation.NextRange)
+	}
+
+	second, err := svc.ReadRepoFile(context.Background(), &ReadInput{
+		GitTarget:   GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}},
+		Path:        "README.md",
+		MaxBytes:    10,
+		OffsetBytes: first.Continuation.NextRange.Bytes.Offset,
+	}, nil)
+	if err != nil {
+		t.Fatalf("continuation read error: %v", err)
+	}
+	if second.Text != payload[10:20] {
+		t.Fatalf("unexpected continuation chunk: %q", second.Text)
 	}
 }

@@ -8,8 +8,8 @@ import (
 	"github.com/viant/mcp-toolbox/github/adapter"
 )
 
-// SearchRepoContent searches files and returns previews (with optional content-based matches), no apply.
-func (s *Service) SearchRepoContent(ctx context.Context, in *SearchRepoContentInput, prompt func(string)) (*SearchRepoContentOutput, error) {
+// GrepFiles searches files and returns previews (with optional content-based matches), no apply.
+func (s *Service) GrepFiles(ctx context.Context, in *GrepFilesInput, prompt func(string)) (*GrepFilesOutput, error) {
 	if in == nil {
 		return nil, fmt.Errorf("input is nil")
 	}
@@ -23,7 +23,7 @@ func (s *Service) SearchRepoContent(ctx context.Context, in *SearchRepoContentIn
 		return nil, aerr
 	}
 
-	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*SearchRepoContentOutput, error) {
+	return withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*GrepFilesOutput, error) {
 		includeQs := filterContentPatterns(in.Queries)
 		excludeQs := filterContentPatterns(in.ExcludeQueries)
 		ci := in.CaseInsensitive
@@ -54,7 +54,7 @@ func (s *Service) SearchRepoContent(ctx context.Context, in *SearchRepoContentIn
 			maxSnippetsPerFile = 5
 		}
 
-		out := &SearchRepoContentOutput{Stats: PreviewStats{}}
+		out := &GrepFilesOutput{Stats: PreviewStats{}}
 		// Resolve ref if empty to default branch
 		ref = s.effectiveRef(ctx, domain, owner, name, ref, token)
 

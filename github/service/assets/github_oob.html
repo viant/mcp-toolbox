@@ -146,7 +146,8 @@ async function onOK() {
   const flagBasicError = (msg)=>{ status.textContent = msg; status.classList.add('error'); ['user','pass'].forEach(id=>{ const n=document.getElementById(id); if(n) n.classList.add('error')}); };
   try {
     if (bearer) {
-      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Bearer ' + bearer } });
+      const repourl = document.getElementById('repourl').value.trim();
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}' + (repourl ? '&url=' + encodeURIComponent(repourl) : ''), { method:'POST', headers: { 'Authorization': 'Bearer ' + bearer } });
       if (!r.ok) { const txt = await r.text(); flagTokenError(r.status===401 ? 'Invalid token' : ('Save failed: ' + txt)); return }
       if (await pollCheck(alias, domain)) {
         const repourl = document.getElementById('repourl').value.trim();
@@ -178,7 +179,8 @@ async function onOK() {
     }
     if (user || pass) {
       const basic = btoa((user||'') + ':' + (pass||''));
-      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}', { method:'POST', headers: { 'Authorization': 'Basic ' + basic } });
+      const repourl = document.getElementById('repourl').value.trim();
+      const r = await fetch('{{BASE}}/github/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||'') + '&uuid={{UUID}}' + (repourl ? '&url=' + encodeURIComponent(repourl) : ''), { method:'POST', headers: { 'Authorization': 'Basic ' + basic } });
       if (!r.ok) { const txt = await r.text(); flagBasicError(r.status===401 ? 'Invalid username or token' : ('Save failed: ' + txt)); return }
       if (await pollCheck(alias, domain)) {
         const repourl = document.getElementById('repourl').value.trim();

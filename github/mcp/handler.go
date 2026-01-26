@@ -7,6 +7,7 @@ import (
 	"github.com/viant/jsonrpc/transport"
 	protoclient "github.com/viant/mcp-protocol/client"
 	"github.com/viant/mcp-protocol/logger"
+	"github.com/viant/mcp-protocol/schema"
 	protoserver "github.com/viant/mcp-protocol/server"
 	ghservice "github.com/viant/mcp-toolbox/github/service"
 	nsprov "github.com/viant/mcp/server/namespace"
@@ -14,8 +15,9 @@ import (
 
 type Handler struct {
 	*protoserver.DefaultHandler
-	service *ghservice.Service
-	ops     protoclient.Operations
+	service   *ghservice.Service
+	ops       protoclient.Operations
+	resources *ResourcesConfig
 
 	// Namespace provider used to resolve the caller namespace from context.
 	// This aligns with mcp/server/namespace README and enables per-namespace services.
@@ -28,7 +30,15 @@ type Handler struct {
 	svcMu      sync.RWMutex
 }
 
-func NewHandler(service *ghservice.Service) protoserver.NewHandler {
+type HandlerOption func(*Handler)
+
+func WithResourcesConfig(cfg *ResourcesConfig) HandlerOption {
+	return func(h *Handler) {
+		h.resources = cfg
+	}
+}
+
+func NewHandler(service *ghservice.Service, opts ...HandlerOption) protoserver.NewHandler {
 	return func(_ context.Context, notifier transport.Notifier, logger logger.Logger, clientOperation protoclient.Operations) (protoserver.Handler, error) {
 		base := protoserver.NewDefaultHandler(notifier, logger, clientOperation)
 		// Initialize a default namespace provider. Prefer identity and fall back to token-hash,
@@ -45,9 +55,16 @@ func NewHandler(service *ghservice.Service) protoserver.NewHandler {
 				return service.Bound(ns), nil
 			},
 		}
+		for _, opt := range opts {
+			opt(ret)
+		}
 		if err := registerTools(base, ret); err != nil {
 			return nil, err
 		}
+		// Ensure resources/list and resources/read are advertised even when resources
+		// are provided dynamically (no static registry entries).
+		base.Methods.Put(schema.MethodResourcesList, true)
+		base.Methods.Put(schema.MethodResourcesRead, true)
 		return ret, nil
 	}
 }

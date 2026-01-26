@@ -1,5 +1,7 @@
 package service
 
+import "github.com/viant/mcp-protocol/extension"
+
 type Account struct {
 	Alias  string `json:"alias" description:"account name"`
 	Domain string `json:"domain,omitempty" description:"GitHub host (default github.com)"`
@@ -138,15 +140,20 @@ type ListRepoPathOutput struct {
 	Warning string   `json:"warning,omitempty"`
 }
 
-type DownloadInput struct {
+type ReadInput struct {
 	GitTarget
 	Path string `json:"path"`
 	// Optional sed-like preview/transform (no repo changes)
 	SedScripts       []string `json:"sedScripts,omitempty" description:"sed scripts e.g. s/old/new/g; preview only"`
 	MaxEditsPerFile  int      `json:"maxEditsPerFile,omitempty"`
 	ApplySedToOutput bool     `json:"applySedToOutput,omitempty" description:"when true and file is text, return transformed text instead of original"`
+	// Preview controls and windowing for large files.
+	Mode        string `json:"mode,omitempty" description:"preview mode: head (default), tail, signatures"`
+	MaxBytes    int    `json:"maxBytes,omitempty" description:"maximum bytes to return when previewing large files"`
+	OffsetBytes int    `json:"offsetBytes,omitempty" description:"start offset when continuing a large file"`
+	LengthBytes int    `json:"lengthBytes,omitempty" description:"optional byte length window for the selection"`
 }
-type DownloadOutput struct {
+type ReadOutput struct {
 	// Content carries binary data when the file is not recognized as UTF-8 text.
 	Content []byte `json:"content,omitempty"`
 	// Text carries UTF-8 textual content when auto-detected; in this case, Content is omitted.
@@ -154,10 +161,22 @@ type DownloadOutput struct {
 	// TransformedText carries sed-transformed text when sedScripts are provided; original Text is preserved unless ApplySedToOutput=true.
 	TransformedText string     `json:"transformedText,omitempty"`
 	SedPreview      *SedResult `json:"sedPreview,omitempty"`
+	// Size is the original file size in bytes.
+	Size int `json:"size,omitempty"`
+	// Returned counts bytes emitted in Text/Content after clipping.
+	Returned int `json:"returned,omitempty"`
+	// Remaining estimates bytes still available past the returned slice.
+	Remaining int `json:"remaining,omitempty"`
+	// ModeApplied echoes the preview mode when a limit was requested.
+	ModeApplied string `json:"modeApplied,omitempty"`
+	// Binary indicates that the response content represents binary data.
+	Binary bool `json:"binary,omitempty"`
+	// Continuation shares pagination hints for follow-up reads.
+	Continuation *extension.Continuation `json:"continuation,omitempty"`
 }
 
-// SearchRepoContentInput defines a search + preview (no-apply) request on a repo snapshot.
-type SearchRepoContentInput struct {
+// GrepFilesInput defines a search + preview (no-apply) request on a repo snapshot.
+type GrepFilesInput struct {
 	GitTarget
 	// Scope
 	Path      string   `json:"path"`
@@ -180,7 +199,7 @@ type SearchRepoContentInput struct {
 	Concurrency int  `json:"concurrency,omitempty"`
 }
 
-type SearchRepoContentOutput struct {
+type GrepFilesOutput struct {
 	Ref   string        `json:"ref,omitempty"`
 	Sha   string        `json:"sha"`
 	Stats PreviewStats  `json:"stats"`
@@ -216,7 +235,7 @@ type SedResult struct {
 	Diff  string `json:"diff,omitempty"`
 }
 
-// SearchRepoContentInput requests finding files with optional sed-like preview (no apply).
+// GrepFilesInput requests finding files with optional sed-like preview (no apply).
 // (duplicate type removed)
 
 // (deprecated duplicate preview types removed)

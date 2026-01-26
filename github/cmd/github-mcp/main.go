@@ -27,18 +27,22 @@ import (
 
 // Options defines CLI flags for the GitHub MCP server.
 type Options struct {
-	HTTPAddr           string `short:"a" long:"addr"  description:"HTTP listen address (empty disables HTTP)"`
-	Storage            string `long:"storage" description:"Directory for auth tokens"`
-	SecretsBase        string `long:"secretsBase" description:"AFS/scy base URL for persisting tokens (e.g., mem://localhost/mcp-github)"`
-	ClientID           string `long:"client-id" description:"GitHub OAuth app client ID"`
-	Oauth2Config       string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
-	UseIdToken         bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
-	PublicBaseURL      string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-github.agently.svc.cluster.local:7789)"`
-	SnapshotCleanHours int    `long:"snapshot-clean-hours" description:"Remove shared snapshot zips older than this many hours before each new download (default 12)"`
-	SedDiffBytes       int    `long:"sed-diff-bytes" description:"Max unified diff bytes for sed previews (default uses previewBytes for findFilesPreview; 8192 for download)"`
-	SedMaxEditsPerFile int    `long:"sed-max-edits" description:"Default max sed edits per file when input omits it (0 = unlimited)"`
-	WaitSecs           int    `long:"wait-secs" description:"Max seconds to wait for credentials during calls (default 300)" default:"300"`
-	ElicitCooldownSecs int    `long:"elicit-cooldown-secs" description:"Cooldown seconds between repeated OOB prompts per ns+alias+domain (default 60)" default:"60"`
+	HTTPAddr           string   `short:"a" long:"addr"  description:"HTTP listen address (empty disables HTTP)"`
+	Storage            string   `long:"storage" description:"Directory for auth tokens"`
+	SecretsBase        string   `long:"secretsBase" description:"AFS/scy base URL for persisting tokens (e.g., mem://localhost/mcp-github)"`
+	ClientID           string   `long:"client-id" description:"GitHub OAuth app client ID"`
+	Oauth2Config       string   `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
+	UseIdToken         bool     `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	PublicBaseURL      string   `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-github.agently.svc.cluster.local:7789)"`
+	SnapshotCleanHours int      `long:"snapshot-clean-hours" description:"Remove shared snapshot zips older than this many hours before each new download (default 12)"`
+	SedDiffBytes       int      `long:"sed-diff-bytes" description:"Max unified diff bytes for sed previews (default uses previewBytes for findFilesPreview; 8192 for download)"`
+	SedMaxEditsPerFile int      `long:"sed-max-edits" description:"Default max sed edits per file when input omits it (0 = unlimited)"`
+	WaitSecs           int      `long:"wait-secs" description:"Max seconds to wait for credentials during calls (default 300)" default:"300"`
+	ElicitCooldownSecs int      `long:"elicit-cooldown-secs" description:"Cooldown seconds between repeated OOB prompts per ns+alias+domain (default 60)" default:"60"`
+	ResourcesConfig    string   `long:"resources-config" description:"YAML file that defines virtual GitHub resources"`
+	ResourcesInclude   []string `long:"resources-include" description:"Include owner/repo patterns (repeatable or comma-separated)"`
+	ResourcesExclude   []string `long:"resources-exclude" description:"Exclude owner/repo patterns (repeatable or comma-separated)"`
+	ResourcesDomain    string   `long:"resources-domain" description:"Default GitHub domain for resources (e.g. github.com or github.vianttech.com)"`
 }
 
 func main() {
@@ -75,6 +79,24 @@ func main() {
 		ElicitCooldownSeconds:      opts.ElicitCooldownSecs,
 	})
 
+	resCfg := &ghmcp.ResourcesConfig{}
+	if strings.TrimSpace(opts.ResourcesConfig) != "" {
+		cfg, err := ghmcp.LoadResourcesConfig(opts.ResourcesConfig)
+		if err != nil {
+			log.Fatalf("failed to load resources config: %v", err)
+		}
+		resCfg = cfg
+	}
+	if len(opts.ResourcesInclude) > 0 {
+		resCfg.Include = append(resCfg.Include, splitPatterns(opts.ResourcesInclude)...)
+	}
+	if len(opts.ResourcesExclude) > 0 {
+		resCfg.Exclude = append(resCfg.Exclude, splitPatterns(opts.ResourcesExclude)...)
+	}
+	if strings.TrimSpace(opts.ResourcesDomain) != "" && strings.TrimSpace(resCfg.Account.Domain) == "" {
+		resCfg.Account.Domain = strings.TrimSpace(opts.ResourcesDomain)
+	}
+
 	// Wire an OOB manager so prompts and pending UUIDs are consistently namespaced across tools.
 	provider := nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}})
 	store := oob.NewMemoryStore[ghservice.AuthOOBData]()
@@ -100,7 +122,7 @@ func main() {
 
 	options := []mcpsrv.Option{
 		mcpsrv.WithImplementation(schema.Implementation{Name: "github-mcp", Version: "0.1.0"}),
-		mcpsrv.WithNewHandler(ghmcp.NewHandler(svc)),
+		mcpsrv.WithNewHandler(ghmcp.NewHandler(svc, ghmcp.WithResourcesConfig(resCfg))),
 		mcpsrv.WithEndpointAddress(opts.HTTPAddr),
 		mcpsrv.WithRootRedirect(true),
 		mcpsrv.WithStreamableURI("/mcp"),
@@ -166,6 +188,21 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+}
+
+func splitPatterns(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	var out []string
+	for _, entry := range values {
+		for _, part := range strings.Split(entry, ",") {
+			if v := strings.TrimSpace(part); v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }
 
 func defaultStorageDir() string {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -17,6 +18,34 @@ import (
 	"github.com/viant/mcp-toolbox/github/adapter"
 	oob "github.com/viant/mcp/server/oob"
 )
+
+func (s *Service) resolveAliases(alias, pendingAlias string) []string {
+	alias = s.normalizeAlias(strings.TrimSpace(alias))
+	pendingAlias = s.normalizeAlias(strings.TrimSpace(pendingAlias))
+	aliases := make([]string, 0, 3)
+	add := func(a string) {
+		if a == "" {
+			return
+		}
+		for _, v := range aliases {
+			if v == a {
+				return
+			}
+		}
+		aliases = append(aliases, a)
+	}
+	if pendingAlias != "" {
+		add(pendingAlias)
+	}
+	if alias != "" {
+		add(alias)
+	}
+	// If alias is implicit (owner/repo or empty), also include default.
+	if alias == "" || strings.Contains(alias, "/") || pendingAlias == "" {
+		add("default")
+	}
+	return aliases
+}
 
 // RegisterHTTP registers GitHub auth-related HTTP handlers on the provided mux.
 // This file isolates HTTP wiring from the core service to simplify future refactors.
@@ -124,6 +153,7 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		Domain      string `json:"domain"`
 		Owner       string `json:"owner"`
 		Repo        string `json:"repo"`
+		URL         string `json:"url"`
 		AccessToken string `json:"access_token"`
 		OAuthKey    bool   `json:"oauthKey"`
 		UUID        string `json:"uuid,omitempty"`
@@ -137,6 +167,7 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		domain := r.URL.Query().Get("domain")
 		owner := r.URL.Query().Get("owner")
 		repo := r.URL.Query().Get("repo")
+		urlStr := r.URL.Query().Get("url")
 		oauthKey := r.URL.Query().Get("oauthKey") == "true"
 		uuidStr := r.URL.Query().Get("uuid")
 		var rb reqBody
@@ -158,15 +189,14 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		if repo == "" {
 			repo = rb.Repo
 		}
+		if urlStr == "" {
+			urlStr = rb.URL
+		}
 		if !oauthKey {
 			oauthKey = rb.OAuthKey
 		}
 		if uuidStr == "" {
 			uuidStr = rb.UUID
-		}
-		if alias == "" {
-			http.Error(w, "alias required", http.StatusBadRequest)
-			return
 		}
 		// Prefer JSON body token if provided; fall back to Authorization header
 		token := strings.TrimSpace(rb.AccessToken)
@@ -186,18 +216,58 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 			http.Error(w, "access token missing", http.StatusBadRequest)
 			return
 		}
+		// If owner/repo not provided, try parsing from a repo URL.
+		if (owner == "" || repo == "") && strings.TrimSpace(urlStr) != "" {
+			u := strings.TrimSpace(urlStr)
+			if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+				if p := strings.Index(u, "://"); p > 0 {
+					u = u[p+3:]
+				}
+			}
+			parts := strings.Split(strings.Trim(u, "/"), "/")
+			if len(parts) >= 3 {
+				if domain == "" {
+					domain = parts[0]
+				}
+				if owner == "" {
+					owner = parts[1]
+				}
+				if repo == "" {
+					repo = parts[2]
+				}
+			}
+		}
 		if domain == "" {
 			domain = "github.com"
 		}
+		log.Printf("github auth: validate token alias=%q domain=%q owner=%q repo=%q url=%q", alias, domain, owner, repo, urlStr)
 		// Validate credentials before saving
 		cli := adapter.New(domain)
 		if err := cli.ValidateToken(r.Context(), token); err != nil {
-			if errors.Is(err, adapter.ErrUnauthorized) {
-				http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			log.Printf("github auth: /user validation failed alias=%q domain=%q owner=%q repo=%q err=%v", alias, domain, owner, repo, err)
+			// Fine-grained tokens may not allow /user; try repo validation when repo is known.
+			if owner != "" && repo != "" {
+				if _, derr := cli.GetRepoDefaultBranch(r.Context(), token, owner, repo); derr == nil {
+					log.Printf("github auth: repo validation ok alias=%q domain=%q owner=%q repo=%q", alias, domain, owner, repo)
+					err = nil
+				} else {
+					log.Printf("github auth: repo validation failed alias=%q domain=%q owner=%q repo=%q err=%v", alias, domain, owner, repo, derr)
+					if errors.Is(derr, adapter.ErrUnauthorized) || errors.Is(derr, adapter.ErrBadCredentials) {
+						http.Error(w, "invalid credentials", http.StatusUnauthorized)
+						return
+					}
+					http.Error(w, "credential validation failed: "+derr.Error(), http.StatusBadGateway)
+					return
+				}
+			}
+			if err != nil {
+				if errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) {
+					http.Error(w, "invalid credentials", http.StatusUnauthorized)
+					return
+				}
+				http.Error(w, "credential validation failed: "+err.Error(), http.StatusBadGateway)
 				return
 			}
-			http.Error(w, "credential validation failed: "+err.Error(), http.StatusBadGateway)
-			return
 		}
 		dsc, _ := s.ns.Namespace(r.Context())
 		ns := dsc.Name
@@ -205,33 +275,49 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 			ns = "default"
 		}
 		// If uuid corresponds to a pending auth, prefer its namespace for binding
+		pendingAlias := ""
 		if u := strings.TrimSpace(uuidStr); u != "" {
 			if s.oobMgr != nil {
-				if p, ok, _ := s.oobMgr.Store.Get(r.Context(), u); ok && p.Namespace != "" {
-					ns = p.Namespace
+				if p, ok, _ := s.oobMgr.Store.Get(r.Context(), u); ok {
+					if p.Namespace != "" {
+						ns = p.Namespace
+					}
+					if strings.TrimSpace(p.Alias) != "" {
+						pendingAlias = s.normalizeAlias(p.Alias)
+					}
 				}
-			} else if pend, ok := s.pending.Get(u); ok && pend != nil && pend.Namespace != "" {
-				ns = pend.Namespace
+			} else if pend, ok := s.pending.Get(u); ok && pend != nil {
+				if pend.Namespace != "" {
+					ns = pend.Namespace
+				}
+				if strings.TrimSpace(pend.Alias) != "" {
+					pendingAlias = s.normalizeAlias(pend.Alias)
+				}
 			}
 		}
-		if owner != "" && repo != "" {
-			s.saveTokenRepo(ns, alias, domain, owner, repo, token, oauthKey)
-			s.persistToken(r.Context(), ns, alias, domain, owner, repo, token)
+		if alias == "" && pendingAlias != "" {
+			alias = pendingAlias
 		}
-		// Always save domain-level token for broad reuse across repos
-		s.saveTokenDomain(ns, alias, domain, token, oauthKey)
-		s.persistToken(r.Context(), ns, alias, domain, "", "", token)
-		// If alias looks implicit (owner/repo or empty), also persist under canonical alias 'default'
-		if a := strings.TrimSpace(alias); a == "" || strings.Contains(a, "/") {
-			s.saveTokenDomain(ns, "default", domain, token, oauthKey)
-			s.persistToken(r.Context(), ns, "default", domain, "", "", token)
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		aliases := s.resolveAliases(alias, pendingAlias)
+		if pendingAlias != "" && alias != "" && alias != pendingAlias {
+			log.Printf("github auth: alias mismatch provided=%q pending=%q ns=%q domain=%q", alias, pendingAlias, ns, domain)
+		}
+		for _, a := range aliases {
 			if owner != "" && repo != "" {
-				s.saveTokenRepo(ns, "default", domain, owner, repo, token, oauthKey)
-				s.persistToken(r.Context(), ns, "default", domain, owner, repo, token)
+				s.saveTokenRepo(ns, a, domain, owner, repo, token, oauthKey)
+				s.persistToken(r.Context(), ns, a, domain, owner, repo, token)
 			}
+			// Always save domain-level token for broad reuse across repos
+			s.saveTokenDomain(ns, a, domain, token, oauthKey)
+			s.persistToken(r.Context(), ns, a, domain, "", "", token)
+			s.clearElicitedAll(a, domain)
+			s.notifyToken(ns, a, domain)
+			s.notifyTokenAll(a, domain)
 		}
-		s.clearElicitedAll(alias, domain)
-		s.notifyToken(ns, alias, domain)
 		if uuidStr != "" {
 			s.pending.Remove(uuidStr)
 		}
@@ -353,16 +439,25 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 				if tr.AccessToken != "" {
 					ns2, _ := s.auth.Namespace(ctx)
 					if s.oobMgr != nil && pendingID != "" {
-						if p, ok, _ := s.oobMgr.Store.Get(ctx, pendingID); ok && p.Namespace != "" {
-							ns2 = p.Namespace
+						if p, ok, _ := s.oobMgr.Store.Get(ctx, pendingID); ok {
+							if p.Namespace != "" {
+								ns2 = p.Namespace
+							}
+							if strings.TrimSpace(p.Alias) != "" && strings.TrimSpace(alias) == "" {
+								alias = s.normalizeAlias(p.Alias)
+							}
 						}
 					}
 					if ns2 == "" {
 						ns2 = fallbackNS
 					}
-					s.saveToken(ns2, alias, domain, tr.AccessToken)
-					s.clearElicitedAll(alias, domain)
-					s.notifyToken(ns2, alias, domain)
+					aliases := s.resolveAliases(alias, "")
+					for _, a := range aliases {
+						s.saveToken(ns2, a, domain, tr.AccessToken)
+						s.clearElicitedAll(a, domain)
+						s.notifyToken(ns2, a, domain)
+						s.notifyTokenAll(a, domain)
+					}
 					return
 				}
 				if tr.Error == "authorization_pending" || tr.Error == "slow_down" {

@@ -274,39 +274,48 @@ func (c *Client) GetTreeRecursive(ctx context.Context, token, owner, name, treeS
 }
 
 func (c *Client) ListRepos(ctx context.Context, token, visibility, affiliation string, perPage int) ([]Repo, error) {
-	q := neturl.Values{}
-	if visibility != "" {
-		q.Set("visibility", visibility)
+	if perPage <= 0 {
+		perPage = 100
 	}
-	if affiliation != "" {
-		q.Set("affiliation", affiliation)
-	}
-	if perPage > 0 {
+	var out []Repo
+	for page := 1; ; page++ {
+		q := neturl.Values{}
+		if visibility != "" {
+			q.Set("visibility", visibility)
+		}
+		if affiliation != "" {
+			q.Set("affiliation", affiliation)
+		}
 		q.Set("per_page", fmt.Sprintf("%d", perPage))
-	}
-	url := c.apiBase + "/user/repos"
-	if enc := q.Encode(); enc != "" {
-		url += "?" + enc
-	}
-	resp, err := c.doGET(ctx, url, token, "application/vnd.github+json")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if err2 := classify(resp, "list repos"); err2 != nil {
-		return nil, err2
-	}
-	var items []struct {
-		ID       int64  `json:"id"`
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
-		return nil, err
-	}
-	out := make([]Repo, 0, len(items))
-	for _, v := range items {
-		out = append(out, Repo{ID: v.ID, Name: v.Name, FullName: v.FullName})
+		q.Set("page", fmt.Sprintf("%d", page))
+		url := c.apiBase + "/user/repos"
+		if enc := q.Encode(); enc != "" {
+			url += "?" + enc
+		}
+		resp, err := c.doGET(ctx, url, token, "application/vnd.github+json")
+		if err != nil {
+			return nil, err
+		}
+		if err2 := classify(resp, "list repos"); err2 != nil {
+			resp.Body.Close()
+			return nil, err2
+		}
+		var items []struct {
+			ID       int64  `json:"id"`
+			Name     string `json:"name"`
+			FullName string `json:"full_name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+		for _, v := range items {
+			out = append(out, Repo{ID: v.ID, Name: v.Name, FullName: v.FullName})
+		}
+		if len(items) < perPage {
+			break
+		}
 	}
 	return out, nil
 }
