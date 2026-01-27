@@ -320,6 +320,62 @@ func (c *Client) ListRepos(ctx context.Context, token, visibility, affiliation s
 	return out, nil
 }
 
+func (c *Client) ListOwnerRepos(ctx context.Context, token, owner string, perPage int) ([]Repo, error) {
+	if perPage <= 0 {
+		perPage = 100
+	}
+	if strings.TrimSpace(owner) == "" {
+		return nil, fmt.Errorf("owner required")
+	}
+	list := func(base string) ([]Repo, error) {
+		var out []Repo
+		for page := 1; ; page++ {
+			q := neturl.Values{}
+			q.Set("per_page", fmt.Sprintf("%d", perPage))
+			q.Set("page", fmt.Sprintf("%d", page))
+			url := base
+			if enc := q.Encode(); enc != "" {
+				url += "?" + enc
+			}
+			resp, err := c.doGET(ctx, url, token, "application/vnd.github+json")
+			if err != nil {
+				return nil, err
+			}
+			if err2 := classify(resp, "list owner repos"); err2 != nil {
+				resp.Body.Close()
+				return nil, err2
+			}
+			var items []struct {
+				ID       int64  `json:"id"`
+				Name     string `json:"name"`
+				FullName string `json:"full_name"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+				resp.Body.Close()
+				return nil, err
+			}
+			resp.Body.Close()
+			for _, v := range items {
+				out = append(out, Repo{ID: v.ID, Name: v.Name, FullName: v.FullName})
+			}
+			if len(items) < perPage {
+				break
+			}
+		}
+		return out, nil
+	}
+	orgURL := fmt.Sprintf("%s/orgs/%s/repos", c.apiBase, owner)
+	out, err := list(orgURL)
+	if err == nil {
+		return out, nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		userURL := fmt.Sprintf("%s/users/%s/repos", c.apiBase, owner)
+		return list(userURL)
+	}
+	return nil, err
+}
+
 // ValidateToken performs a lightweight call to verify that provided credentials are valid.
 // It calls the /user endpoint which requires an authenticated token.
 func (c *Client) ValidateToken(ctx context.Context, token string) error {

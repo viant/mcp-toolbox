@@ -27,6 +27,28 @@ func (s *Service) ListRepos(ctx context.Context, in *ListReposInput, prompt func
 	return out, nil
 }
 
+// ListOwnerRepos lists repositories for a specific owner (org or user).
+func (s *Service) ListOwnerRepos(ctx context.Context, in *ListOwnerReposInput, prompt func(string)) (*ListOwnerReposOutput, error) {
+	alias := s.normalizeAlias(in.Account.Alias)
+	if alias == "" {
+		if inf, _ := s.inferAlias(ctx, in.Account.Domain, "", ""); inf != "" {
+			alias = inf
+		}
+	}
+	cli := adapter.New(in.Account.Domain)
+	repos, err := withCredentialRetry(ctx, s, alias, in.Account.Domain, prompt, func(token string) ([]adapter.Repo, error) {
+		return cli.ListOwnerRepos(ctx, token, in.Owner, in.PerPage)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := &ListOwnerReposOutput{}
+	for _, v := range repos {
+		out.Repos = append(out.Repos, Repo{ID: v.ID, Name: v.Name, FullName: v.FullName})
+	}
+	return out, nil
+}
+
 // ListRepoIssues lists issues for a repository.
 func (s *Service) ListRepoIssues(ctx context.Context, in *ListRepoIssuesInput, prompt func(string)) (*ListRepoIssuesOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}

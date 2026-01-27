@@ -46,6 +46,15 @@ type ListReposOutput struct {
 	Repos []Repo `json:"repos,omitempty"`
 }
 
+type ListOwnerReposInput struct {
+	Account Account `json:"account"`
+	Owner   string  `json:"owner"`
+	PerPage int     `json:"perPage,omitempty" description:"page size (default 30)"`
+}
+type ListOwnerReposOutput struct {
+	Repos []Repo `json:"repos,omitempty"`
+}
+
 type ListRepoIssuesInput struct {
 	GitTarget
 	State string `json:"state,omitempty" description:"open|closed|all"`

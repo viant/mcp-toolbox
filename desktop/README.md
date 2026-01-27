@@ -7,7 +7,7 @@ It follows the same tool + service pattern as `browser/`:
 - Tool implementations live in `desktop/service`.
 
 ## Build / Run
-
+    
 ```bash
 go run ./desktop/cmd/desktop-mcp -a :5010
 ```

@@ -33,6 +33,14 @@ The goal of this project is to make it straightforward to expose common develope
   - Binary: `slack/cmd/slack-mcp`
   - Service + tools: `slack/mcp`, `slack/service`
 
+- Browser MCP
+  - Binary: `browser/cmd/browser-mcp`
+  - Service + tools: `browser/mcp`, `browser/service`
+
+- Desktop MCP
+  - Binary: `desktop/cmd/desktop-mcp`
+  - Service + tools: `desktop/mcp`, `desktop/service`
+
 - Shared
   - Auth helper: `auth` (derives caller namespace from JWT in context)
 
@@ -67,7 +75,7 @@ Endpoints (selected):
 - `GET  /github/auth/pending` – list pending device codes for the current namespace
 - `POST /github/auth/pending/clear` – clear pending device codes for the current namespace
 
-Common tools registered by the server include listing repositories, issues/PRs, creating issues/PRs, commenting, searching issues, checking out repos, listing repo paths, and downloading files.
+Common tools registered by the server include listing repositories, issues/PRs, creating issues/PRs, commenting, searching issues, checking out repos, listing repo paths, and reading files.
 
 ### Outlook MCP
 
