@@ -137,7 +137,7 @@ func buildErrorResult(message string) (*schema.CallToolResult, *jsonrpc.Error) {
 func buildSuccessResultOut(service *slservice.Service, payload any) (*schema.CallToolResult, *jsonrpc.Error) {
 	if service.UseTextField() {
 		b, _ := json.Marshal(payload)
-		return &schema.CallToolResult{Content: []schema.CallToolResultContentElem{{Type: "text", Text: string(b)}}}, nil
+		return &schema.CallToolResult{Content: []schema.CallToolResultContentElem{schema.TextContent{Type: "text", Text: string(b)}}}, nil
 	}
 	return &schema.CallToolResult{StructuredContent: map[string]any{"result": payload}}, nil
 }

@@ -15,6 +15,7 @@ import (
 )
 
 var chromeVersionMatcher = regexp.MustCompile(`(?i)(?:chrome|chromium)[^0-9]*([0-9]+)\.`)
+var chromeFullVersionMatcher = regexp.MustCompile(`(?i)(?:chrome|chromium)[^0-9]*([0-9]+(?:\.[0-9]+)+)`)
 var chromedriverVersionMatcher = regexp.MustCompile(`(?i)(?:chromedriver)[^0-9]*([0-9]+)\.`)
 var chromedriverFullVersionMatcher = regexp.MustCompile(`(?i)(?:chromedriver)[^0-9]*([0-9]+(?:\.[0-9]+)+)`)
 
@@ -130,6 +131,31 @@ func detectInstalledChromeMajor(ctx context.Context) (major int, raw string, err
 		}
 	}
 	return 0, "", fmt.Errorf("unable to detect installed Chrome/Chromium version")
+}
+
+func detectInstalledChromeVersion(ctx context.Context) (version string, raw string, err error) {
+	for _, candidate := range chromeCandidates() {
+		path := candidate
+		if !filepath.IsAbs(path) {
+			if resolved, lookErr := exec.LookPath(path); lookErr == nil {
+				path = resolved
+			} else {
+				continue
+			}
+		}
+		out, err := versionOutput(ctx, path)
+		if err != nil {
+			continue
+		}
+		m := chromeFullVersionMatcher.FindStringSubmatch(out)
+		if len(m) >= 2 {
+			v := strings.TrimSpace(m[1])
+			if v != "" {
+				return v, out, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("unable to detect installed Chrome/Chromium version")
 }
 
 func chromeCandidates() []string {

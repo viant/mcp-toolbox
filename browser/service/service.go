@@ -86,6 +86,58 @@ func NewService(cfg *Config) *Service {
 
 func (s *Service) UseTextField() bool { return s.useText }
 
+func hasUserAgentArg(args []string) bool {
+	for _, arg := range args {
+		lower := strings.ToLower(strings.TrimSpace(arg))
+		if strings.HasPrefix(lower, "--user-agent=") {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureChromeFlag(args []string, flag string) []string {
+	for _, arg := range args {
+		if strings.EqualFold(strings.TrimSpace(arg), flag) {
+			return args
+		}
+	}
+	return append(args, flag)
+}
+
+func ensureChromeFeatureFlag(args []string, prefix, feature string) []string {
+	for i, arg := range args {
+		trimmed := strings.TrimSpace(arg)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, strings.ToLower(prefix)) {
+			if !strings.Contains(strings.ToLower(trimmed), strings.ToLower(feature)) {
+				args[i] = trimmed + "," + feature
+			}
+			return args
+		}
+	}
+	return append(args, prefix+feature)
+}
+
+func (s *Service) applyChromeAntiDetectionArgs(ctx context.Context, browser string, args []string) []string {
+	if !strings.EqualFold(browser, ChromeBrowser) {
+		return args
+	}
+	// Add a regular Chrome user-agent when the caller didn't provide one.
+	if !hasUserAgentArg(args) {
+		if version, _, err := detectInstalledChromeVersion(ctx); err == nil && version != "" {
+			ua := fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", version)
+			args = append(args, "--user-agent="+ua)
+		}
+	}
+	// Reduce automation signals (best-effort).
+	args = ensureChromeFeatureFlag(args, "--disable-blink-features=", "AutomationControlled")
+	args = ensureChromeFeatureFlag(args, "--disable-features=", "AutomationControlled")
+	args = ensureChromeFlag(args, "--no-first-run")
+	args = ensureChromeFlag(args, "--no-default-browser-check")
+	return args
+}
+
 func (s *Service) Start(ctx context.Context, in *StartInput) (*StartOutput, error) {
 	if in == nil {
 		in = &StartInput{}
@@ -288,6 +340,7 @@ func (s *Service) OpenSession(ctx context.Context, in *OpenSessionInput) (*OpenS
 	if s.headful {
 		capArgs = enforceHeadfulCaps(capArgs)
 	}
+	capArgs = s.applyChromeAntiDetectionArgs(ctx, sess.Browser, capArgs)
 
 	if err := s.ensureLocalDriverService(ctx, sess, in); err != nil {
 		return nil, err

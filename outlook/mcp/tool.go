@@ -50,7 +50,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			_, _ = ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-				Params: schema.ElicitRequestParams{ElicitationId: newUUID(), Message: "Sign in to Outlook", Mode: string(schema.ElicitRequestParamsModeUrl), Url: url},
+				Params: schema.ElicitRequestParams{ElicitationId: newUUID(), Message: "Sign in to Outlook", Mode: schema.ElicitRequestParamsModeUrl, Url: url},
 			}})
 		}()
 	}
@@ -192,7 +192,7 @@ func buildErrorResult(message string) (*schema.CallToolResult, *jsonrpc.Error) {
 func buildSuccessResult(service *Service, payload any) (*schema.CallToolResult, *jsonrpc.Error) {
 	if service.UseTextField() {
 		b, _ := json.Marshal(payload)
-		return &schema.CallToolResult{Content: []schema.CallToolResultContentElem{{Type: "text", Text: string(b)}}}, nil
+		return &schema.CallToolResult{Content: []schema.CallToolResultContentElem{schema.TextContent{Type: "text", Text: string(b)}}}, nil
 	}
 	return &schema.CallToolResult{StructuredContent: map[string]any{"result": payload}}, nil
 }
@@ -202,7 +202,7 @@ func newUUID() string { return uuid.New().String() }
 func buildToolErrorResult(service *Service, message string) *schema.CallToolResult {
 	isErr := true
 	if service.UseTextField() {
-		return &schema.CallToolResult{IsError: &isErr, Content: []schema.CallToolResultContentElem{{Type: "text", Text: message}}}
+		return &schema.CallToolResult{IsError: &isErr, Content: []schema.CallToolResultContentElem{schema.TextContent{Type: "text", Text: message}}}
 	}
 	return &schema.CallToolResult{IsError: &isErr, StructuredContent: map[string]any{"error": message}}
 }

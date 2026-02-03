@@ -106,7 +106,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 				ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
 				_, _ = ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-					Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
+					Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: schema.ElicitRequestParamsModeUrl, Url: u},
 				}})
 			}()
 		}
@@ -461,7 +461,7 @@ func buildErrorResult(message string) (*schema.CallToolResult, *jsonrpc.Error) {
 func buildSuccessResultOut(service *ghservice.Service, payload any) (*schema.CallToolResult, *jsonrpc.Error) {
 	if service.UseTextField() {
 		b, _ := json.Marshal(payload)
-		return &schema.CallToolResult{Content: []schema.CallToolResultContentElem{{Type: "text", Text: string(b)}}}, nil
+		return &schema.CallToolResult{Content: []schema.CallToolResultContentElem{schema.TextContent{Type: "text", Text: string(b)}}}, nil
 	}
 	return &schema.CallToolResult{StructuredContent: map[string]any{"result": payload}}, nil
 }

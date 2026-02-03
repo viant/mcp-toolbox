@@ -62,7 +62,7 @@ func resourcePrompt(h *Handler) func(string) {
 			ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			_, _ = h.ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: string(schema.ElicitRequestParamsModeUrl), Url: u},
+				Params: schema.ElicitRequestParams{ElicitationId: elicitID, Message: text, Mode: schema.ElicitRequestParamsModeUrl, Url: u},
 			}})
 		}()
 	}
