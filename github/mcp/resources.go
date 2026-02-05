@@ -18,11 +18,17 @@ import (
 )
 
 const (
-	resourceScheme       = "github"
-	defaultSnapshotName  = "_snapshot.zip"
-	snapshotMimeType     = "application/zip"
-	rootResourceMimeType = "text/plain"
+	resourceScheme           = "github"
+	defaultSnapshotName      = "_snapshot.zip"
+	snapshotMimeType         = "application/zip"
+	rootResourceMimeType     = "text/plain"
+	defaultResourcesCacheTTL = 60 * time.Second
 )
+
+type resCacheEntry struct {
+	at        time.Time
+	resources []schema.Resource
+}
 
 type ResourcesConfig struct {
 	Auto        *bool             `json:"auto,omitempty" yaml:"auto,omitempty"`
@@ -167,6 +173,10 @@ func (h *Handler) dynamicResources(ctx context.Context) ([]schema.Resource, erro
 		affiliation = strings.TrimSpace(cfg.Affiliation)
 		perPage = cfg.PerPage
 	}
+	cacheKey := h.resourcesCacheKey(h.cacheNamespace(ctx), account, visibility, affiliation, perPage, cfg, auto)
+	if cached, ok := h.resourcesCacheGet(cacheKey); ok {
+		return cached, nil
+	}
 	var repos []ghservice.Repo
 	if cfg != nil && len(cfg.Include) > 0 {
 		owners, needUserList := includeOwnersForListing(cfg.Include)
@@ -223,6 +233,7 @@ func (h *Handler) dynamicResources(ctx context.Context) ([]schema.Resource, erro
 		resources = append(resources, snapshotResourceEntry(account.Domain, owner, name))
 	}
 	populateSnapshotSizes(resources, svc)
+	h.resourcesCachePut(cacheKey, resources)
 	return resources, nil
 }
 
@@ -675,4 +686,73 @@ func ptrOrNil(s string) *string {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+func (h *Handler) cacheNamespace(ctx context.Context) string {
+	if h == nil || h.nsProvider == nil {
+		return "default"
+	}
+	desc, _ := h.nsProvider.Namespace(ctx)
+	if desc.Name == "" {
+		return "default"
+	}
+	return desc.Name
+}
+
+func (h *Handler) resourcesCacheKey(ns string, account ghservice.Account, visibility, affiliation string, perPage int, cfg *ResourcesConfig, auto bool) string {
+	var include []string
+	var exclude []string
+	if cfg != nil {
+		include = cfg.Include
+		exclude = cfg.Exclude
+	}
+	return fmt.Sprintf(
+		"ns=%s|alias=%s|domain=%s|vis=%s|aff=%s|perPage=%d|auto=%t|include=%s|exclude=%s",
+		ns,
+		strings.TrimSpace(account.Alias),
+		strings.TrimSpace(account.Domain),
+		strings.TrimSpace(visibility),
+		strings.TrimSpace(affiliation),
+		perPage,
+		auto,
+		strings.Join(include, ","),
+		strings.Join(exclude, ","),
+	)
+}
+
+func (h *Handler) resourcesCacheGet(key string) ([]schema.Resource, bool) {
+	if h == nil || h.resTTL <= 0 {
+		return nil, false
+	}
+	h.resMu.RLock()
+	entry, ok := h.resCache[key]
+	h.resMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if time.Since(entry.at) > h.resTTL {
+		h.resMu.Lock()
+		delete(h.resCache, key)
+		h.resMu.Unlock()
+		return nil, false
+	}
+	return copyResources(entry.resources), true
+}
+
+func (h *Handler) resourcesCachePut(key string, resources []schema.Resource) {
+	if h == nil || h.resTTL <= 0 {
+		return
+	}
+	h.resMu.Lock()
+	h.resCache[key] = resCacheEntry{at: time.Now(), resources: copyResources(resources)}
+	h.resMu.Unlock()
+}
+
+func copyResources(in []schema.Resource) []schema.Resource {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]schema.Resource, len(in))
+	copy(out, in)
+	return out
 }

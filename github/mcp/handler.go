@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/viant/jsonrpc/transport"
 	protoclient "github.com/viant/mcp-protocol/client"
@@ -28,6 +29,11 @@ type Handler struct {
 	svcFactory func(namespace string) (*ghservice.Service, error)
 	svcByNS    map[string]*ghservice.Service
 	svcMu      sync.RWMutex
+
+	// Resource listing cache to avoid repeated repo enumeration on wildcard includes.
+	resMu    sync.RWMutex
+	resCache map[string]resCacheEntry
+	resTTL   time.Duration
 }
 
 type HandlerOption func(*Handler)
@@ -50,6 +56,8 @@ func NewHandler(service *ghservice.Service, opts ...HandlerOption) protoserver.N
 			ops:            clientOperation,
 			nsProvider:     provider,
 			svcByNS:        map[string]*ghservice.Service{},
+			resCache:       map[string]resCacheEntry{},
+			resTTL:         defaultResourcesCacheTTL,
 			// Factory that binds the base service to the resolved namespace.
 			svcFactory: func(ns string) (*ghservice.Service, error) {
 				return service.Bound(ns), nil
