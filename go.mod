@@ -13,8 +13,8 @@ require (
 	github.com/tebeka/selenium v0.9.10-0.20211105214847-e9100b7f5ac1
 	github.com/viant/afs v1.26.2
 	github.com/viant/jsonrpc v0.17.0
-	github.com/viant/mcp v0.10.0
-	github.com/viant/mcp-protocol v0.10.0
+	github.com/viant/mcp v0.11.0
+	github.com/viant/mcp-protocol v0.11.0
 	github.com/viant/scy v0.25.4-0.20251010021037-5a0b62e88695
 	golang.org/x/net v0.46.0
 )
