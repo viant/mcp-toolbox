@@ -25,6 +25,9 @@ var descListIssues string
 //go:embed tools/listRepoPRs.md
 var descListPRs string
 
+//go:embed tools/getRepoDefaultBranch.md
+var descGetRepoDefaultBranch string
+
 //go:embed tools/createIssue.md
 var descCreateIssue string
 
@@ -178,6 +181,31 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			return buildErrorResult(err.Error())
 		}
 		logToolEnd("listRepoPRs", start, nil)
+		return buildSuccessResultOut(svc, out)
+	}); err != nil {
+		return err
+	}
+
+	// Get repo default branch
+	if err := protoserver.RegisterTool[*ghservice.GetRepoDefaultBranchInput, *ghservice.GetRepoDefaultBranchOutput](base.Registry, "getRepoDefaultBranch", descGetRepoDefaultBranch, func(ctx context.Context, in *ghservice.GetRepoDefaultBranchInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := logToolStart("getRepoDefaultBranch")
+		stop := startToolPending("getRepoDefaultBranch", in, start)
+		defer stop()
+		if (in.Repo.Owner == "" || in.Repo.Name == "") && strings.TrimSpace(in.URL) == "" {
+			logToolEnd("getRepoDefaultBranch", start, fmt.Errorf("missing repo or url"))
+			return buildErrorResult("repo.owner and repo.name or url are required")
+		}
+		ctxNS, svc, rerr := h.resolveService(ctx)
+		logToolNS(h, "getRepoDefaultBranch", ctxNS)
+		if rerr != nil {
+			return buildErrorResult("resolve namespace: " + rerr.Error())
+		}
+		out, err := svc.GetRepoDefaultBranch(ctxNS, in, msgPrompt(ctxNS))
+		if err != nil {
+			logToolEnd("getRepoDefaultBranch", start, err)
+			return buildErrorResult(err.Error())
+		}
+		logToolEnd("getRepoDefaultBranch", start, nil)
 		return buildSuccessResultOut(svc, out)
 	}); err != nil {
 		return err

@@ -99,6 +99,27 @@ func (s *Service) ListRepoPRs(ctx context.Context, in *ListRepoPRsInput, prompt 
 	return out, nil
 }
 
+// GetRepoDefaultBranch returns the default branch for a repository.
+func (s *Service) GetRepoDefaultBranch(ctx context.Context, in *GetRepoDefaultBranchInput, prompt func(string)) (*GetRepoDefaultBranchOutput, error) {
+	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}
+	domain, owner, name, _, _, err := t.Init(s)
+	if err != nil {
+		return nil, err
+	}
+	alias, aerr := t.GetAlias(ctx, s)
+	if aerr != nil {
+		return nil, aerr
+	}
+	cli := adapter.New(domain)
+	def, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (string, error) {
+		return cli.GetRepoDefaultBranch(ctx, token, owner, name)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &GetRepoDefaultBranchOutput{DefaultBranch: def}, nil
+}
+
 // CreateIssue creates a new issue in a repository.
 func (s *Service) CreateIssue(ctx context.Context, in *CreateIssueInput, prompt func(string)) (*CreateIssueOutput, error) {
 	t := GitTarget{URL: in.URL, Account: in.Account, Repo: in.Repo}

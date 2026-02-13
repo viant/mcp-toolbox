@@ -4,9 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/viant/mcp-toolbox/github/adapter"
+	"log"
 	"time"
+
+	"github.com/viant/mcp-toolbox/github/adapter"
 )
+
+func logCredReuse(ctx context.Context, ns, alias, domain, owner, repo, scope, source string) {
+	log.Printf("github auth: reuse credentials ns=%q alias=%q domain=%q owner=%q repo=%q scope=%s source=%s cid=%q", ns, alias, domain, owner, repo, scope, source, CID(ctx))
+}
+
+func logCredPrompt(ctx context.Context, ns, alias, domain, owner, repo, reason string) {
+	log.Printf("github auth: prompt for credentials ns=%q alias=%q domain=%q owner=%q repo=%q reason=%s cid=%q", ns, alias, domain, owner, repo, reason, CID(ctx))
+}
 
 func sleepWithCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
@@ -53,12 +63,20 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 	}
 
 	token := svc.loadToken(ns, aliasEff, domainEff)
+	tokenSrc := ""
+	if token != "" {
+		tokenSrc = "memory"
+	}
 	if token == "" {
 		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
 			token = t
+			tokenSrc = "secrets"
 			// hydrate memory for future calls
 			svc.saveToken(ns, aliasEff, domainEff, token)
 		}
+	}
+	if token != "" {
+		logCredReuse(ctx, ns, aliasEff, domainEff, "", "", "domain", tokenSrc)
 	}
 	if token == "" {
 		// For public github.com, attempt unauthenticated call first; only elicit on permission errors.
@@ -81,7 +99,7 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 		}
 		if prompt != nil {
 			// Elicit once and wait briefly for token to arrive
-			// debug logs removed
+			logCredPrompt(ctx, ns, aliasEff, domainEff, "", "", "missing_token")
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, "", "", prompt)
 			// Bound wait by context deadline when present
 			wait := svc.WaitTimeout()
@@ -94,9 +112,15 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 			}
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, "", "", wait) {
 				token = svc.loadToken(ns, aliasEff, domainEff)
-				// Only allow cross-namespace fallback when operating in the shared default namespace.
-				if token == "" && ns == "default" {
-					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
+				tokenSrc = "memory"
+				if token == "" {
+					if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
+						token = t
+						tokenSrc = "secrets"
+					}
+				}
+				if token != "" {
+					logCredReuse(ctx, ns, aliasEff, domainEff, "", "", "domain", tokenSrc)
 				}
 			}
 			// debug logs removed
@@ -119,6 +143,41 @@ func withCredentialRetry[T any](ctx context.Context, svc *Service, alias, domain
 		break
 	}
 	if errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) {
+		if prompt != nil {
+			logCredPrompt(ctx, ns, aliasEff, domainEff, "", "", "unauthorized")
+			svc.maybeElicitOnce(ctx, aliasEff, domainEff, "", "", prompt)
+			wait := svc.WaitTimeout()
+			if dl, ok := ctx.Deadline(); ok {
+				if d := time.Until(dl) - 500*time.Millisecond; d > 0 && d < wait {
+					wait = d
+				} else if d <= 0 {
+					wait = 0
+				}
+			}
+			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, "", "", wait) {
+				newToken := svc.loadToken(ns, aliasEff, domainEff)
+				newSrc := "memory"
+				if newToken == "" {
+					if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
+						newToken = t
+						newSrc = "secrets"
+					}
+				}
+				if newToken != "" && newToken != token {
+					logCredReuse(ctx, ns, aliasEff, domainEff, "", "", "domain", newSrc)
+					for attempt := 0; attempt < 4; attempt++ {
+						out, err = call(newToken)
+						if err == nil {
+							return out, nil
+						}
+						if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+							continue
+						}
+						break
+					}
+				}
+			}
+		}
 		return zero, fmt.Errorf("unauthorized for alias=%s domain=%s; token invalid or insufficient scope", alias, domain)
 	}
 	return zero, err
@@ -141,16 +200,26 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	// debug logs removed
 	// Load domain-level first (including canonical alias fallback), then repo-level
 	domainTok := svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
+	domainSrc := ""
+	if domainTok != "" {
+		domainSrc = "memory"
+	}
 	if domainTok == "" {
 		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
 			domainTok = t
+			domainSrc = "secrets"
 			svc.saveTokenDomain(ns, aliasEff, domainEff, domainTok, false)
 		}
 	}
 	repoTok := svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+	repoSrc := ""
+	if repoTok != "" {
+		repoSrc = "memory"
+	}
 	if repoTok == "" {
 		if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, owner, name); t != "" {
 			repoTok = t
+			repoSrc = "secrets"
 			svc.saveTokenRepo(ns, aliasEff, domainEff, owner, name, repoTok, false)
 		}
 	}
@@ -158,6 +227,13 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	token := repoTok
 	if token == "" {
 		token = domainTok
+	}
+	if token != "" {
+		if token == repoTok {
+			logCredReuse(ctx, ns, aliasEff, domainEff, owner, name, "repo", repoSrc)
+		} else {
+			logCredReuse(ctx, ns, aliasEff, domainEff, owner, name, "domain", domainSrc)
+		}
 	}
 	if token == "" {
 		// For public github.com, try unauthenticated call first; only elicit on permission errors.
@@ -179,7 +255,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			}
 		}
 		if prompt != nil {
-			// debug logs removed
+			logCredPrompt(ctx, ns, aliasEff, domainEff, owner, name, "missing_token")
 			svc.maybeElicitOnce(ctx, aliasEff, domainEff, owner, name, prompt)
 			// Bound wait by context deadline when present
 			wait := svc.WaitTimeout()
@@ -193,20 +269,32 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 			// debug logs removed
 			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, owner, name, wait) {
 				// After notify, prefer repo-level token for least privilege.
+				tokenScope := "repo"
 				token = svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+				tokenSrc := "memory"
 				if token == "" {
-					// Fallback to domain-level if only that was provided
-					token = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
-				}
-				// Only allow cross-namespace fallback when operating in the shared default namespace.
-				if token == "" && ns == "default" {
-					// Try repo-level first across NS, then domain-level across NS
-					token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, owner, name)
-					if token == "" {
-						token = svc.loadTokenPreferredAnyNS(aliasEff, domainEff, "", "")
+					if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, owner, name); t != "" {
+						token = t
+						tokenSrc = "secrets"
 					}
 				}
-				// debug logs removed
+				if token == "" {
+					// Fallback to domain-level if only that was provided
+					tokenScope = "domain"
+					token = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
+					if token != "" {
+						tokenSrc = "memory"
+					}
+					if token == "" {
+						if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
+							token = t
+							tokenSrc = "secrets"
+						}
+					}
+				}
+				if token != "" {
+					logCredReuse(ctx, ns, aliasEff, domainEff, owner, name, tokenScope, tokenSrc)
+				}
 			}
 			// debug logs removed
 		}
@@ -238,6 +326,7 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 	}
 	// On insufficient access or bad creds with repo token, retry with domain token if present.
 	if token == repoTok && domainTok != "" && domainTok != repoTok && (errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) || errors.Is(err, adapter.ErrForbidden) || errors.Is(err, adapter.ErrNotFound)) {
+		logCredReuse(ctx, ns, aliasEff, domainEff, owner, name, "domain", domainSrc)
 		for attempt := 0; attempt < 4; attempt++ {
 			out, err = call(domainTok)
 			if err == nil {
@@ -250,6 +339,55 @@ func withRepoCredentialRetry[T any](ctx context.Context, svc *Service, alias, do
 		}
 	}
 	if errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) {
+		if prompt != nil {
+			logCredPrompt(ctx, ns, aliasEff, domainEff, owner, name, "unauthorized")
+			svc.maybeElicitOnce(ctx, aliasEff, domainEff, owner, name, prompt)
+			wait := svc.WaitTimeout()
+			if dl, ok := ctx.Deadline(); ok {
+				if d := time.Until(dl) - 500*time.Millisecond; d > 0 && d < wait {
+					wait = d
+				} else if d <= 0 {
+					wait = 0
+				}
+			}
+			if wait > 0 && svc.waitForToken(ctx, ns, aliasEff, domainEff, owner, name, wait) {
+				newScope := "repo"
+				newToken := svc.loadTokenPreferred(ns, aliasEff, domainEff, owner, name)
+				newSrc := "memory"
+				if newToken == "" {
+					if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, owner, name); t != "" {
+						newToken = t
+						newSrc = "secrets"
+					}
+				}
+				if newToken == "" {
+					newScope = "domain"
+					newToken = svc.loadTokenPreferred(ns, aliasEff, domainEff, "", "")
+					if newToken != "" {
+						newSrc = "memory"
+					}
+					if newToken == "" {
+						if t := svc.loadTokenFromSecrets(ctx, ns, aliasEff, domainEff, "", ""); t != "" {
+							newToken = t
+							newSrc = "secrets"
+						}
+					}
+				}
+				if newToken != "" && newToken != token {
+					logCredReuse(ctx, ns, aliasEff, domainEff, owner, name, newScope, newSrc)
+					for attempt := 0; attempt < 4; attempt++ {
+						out, err = call(newToken)
+						if err == nil {
+							return out, nil
+						}
+						if errors.Is(err, adapter.ErrRateLimited) && sleepWithCtx(ctx, backoff(attempt)) {
+							continue
+						}
+						break
+					}
+				}
+			}
+		}
 		return zero, fmt.Errorf("unauthorized for alias=%s domain=%s owner=%s repo=%s; token invalid or insufficient scope", alias, domain, owner, name)
 	}
 	return zero, err

@@ -503,13 +503,6 @@ func (s *Service) TokenCheckHandler() http.HandlerFunc {
 			}
 		}
 		has := s.loadTokenPreferred(ns, alias, domain, owner, repo) != ""
-		if !has {
-			if u := strings.TrimSpace(r.URL.Query().Get("uuid")); u != "" {
-				if s.loadTokenPreferredAnyNS(alias, domain, owner, repo) != "" {
-					has = true
-				}
-			}
-		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"hasToken": has})
 	}

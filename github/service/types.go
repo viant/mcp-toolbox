@@ -71,6 +71,13 @@ type ListRepoPRsOutput struct {
 	Pulls []PullRequest `json:"pulls,omitempty"`
 }
 
+type GetRepoDefaultBranchInput struct {
+	GitTarget
+}
+type GetRepoDefaultBranchOutput struct {
+	DefaultBranch string `json:"defaultBranch"`
+}
+
 type CreateIssueInput struct {
 	GitTarget
 	Title     string   `json:"title"`
