@@ -56,7 +56,13 @@ var snapshotTTL = 30 * time.Minute
 
 // GetOrFetchSnapshotZip fetches or returns a cached snapshot zip path for owner/name@ref.
 // It will fall back to the repository's default branch if fetching a specific ref fails.
+// Default behavior allows stale snapshot reuse while refreshing in background.
 func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, owner, name, ref, token string) (string, int64, bool, string, error) {
+	return s.GetOrFetchSnapshotZipWithOptions(ctx, ns, alias, domain, owner, name, ref, token, SnapshotFetchOptions{AllowStale: true})
+}
+
+// GetOrFetchSnapshotZipWithOptions is a variant of GetOrFetchSnapshotZip with behavior controls.
+func (s *Service) GetOrFetchSnapshotZipWithOptions(ctx context.Context, ns, alias, domain, owner, name, ref, token string, opts SnapshotFetchOptions) (string, int64, bool, string, error) {
 	origRef := strings.TrimSpace(ref)
 	useRef := origRef
 	// If no ref was provided, prefer the default branch when available.
@@ -68,7 +74,7 @@ func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, 
 		}
 	}
 
-	path, size, fromCache, sha, err := s.getOrFetchSnapshotZipOnce(ctx, ns, alias, domain, owner, name, useRef, token)
+	path, size, fromCache, sha, err := s.getOrFetchSnapshotZipOnce(ctx, ns, alias, domain, owner, name, useRef, token, opts)
 	if err == nil {
 		return path, size, fromCache, sha, nil
 	}
@@ -80,14 +86,14 @@ func (s *Service) GetOrFetchSnapshotZip(ctx context.Context, ns, alias, domain, 
 
 	// Fallback: resolve and use the default branch when a specific ref fails.
 	if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && !strings.EqualFold(def, useRef) {
-		return s.getOrFetchSnapshotZipOnce(ctx, ns, alias, domain, owner, name, def, token)
+		return s.getOrFetchSnapshotZipOnce(ctx, ns, alias, domain, owner, name, def, token, opts)
 	}
 	return path, size, fromCache, sha, err
 }
 
 // getOrFetchSnapshotZipOnce performs a single snapshot fetch attempt for the given ref
 // without any additional default-branch fallback.
-func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, domain, owner, name, ref, token string) (string, int64, bool, string, error) {
+func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, domain, owner, name, ref, token string, opts SnapshotFetchOptions) (string, int64, bool, string, error) {
 	// Resolve ref to a SHA if needed
 	resolvedSHA := ref
 	if !looksLikeSHA(ref) {
@@ -115,6 +121,24 @@ func (s *Service) getOrFetchSnapshotZipOnce(ctx context.Context, ns, alias, doma
 		return "", m.size, true, resolvedSHA, nil
 	}
 	s.memSnapMu.RUnlock()
+
+	// If stale is allowed and we already have a cached snapshot for this repo, serve it immediately
+	// while refreshing the new SHA in the background.
+	if opts.AllowStale && prevSHA != "" && !strings.EqualFold(prevSHA, resolvedSHA) {
+		prevPath := s.sharedSnapshotPath(domain, owner, name, prevSHA)
+		if fi, e := os.Stat(prevPath); e == nil && fi.Mode().IsRegular() {
+			if s.canUseSharedSnapshot(ctx, domain, owner, name, token) {
+				log.Printf("github snapshot: stale-serve domain=%s repo=%s/%s stale_sha=%s new_sha=%s size=%d path=%s", domain, owner, name, prevSHA, resolvedSHA, fi.Size(), prevPath)
+				// Refresh in background with a detached context.
+				go func() {
+					ctx2, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+					defer cancel()
+					_, _, _, _, _ = s.getOrFetchSnapshotZipOnce(ctx2, ns, alias, domain, owner, name, resolvedSHA, token, SnapshotFetchOptions{})
+				}()
+				return prevPath, fi.Size(), true, prevSHA, nil
+			}
+		}
+	}
 
 	// Shared file if accessible
 	if fi, e := os.Stat(shared); e == nil && fi.Mode().IsRegular() {

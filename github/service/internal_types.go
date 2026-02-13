@@ -32,3 +32,8 @@ type visEntry struct {
 	public   bool
 	expireAt time.Time
 }
+
+// SnapshotFetchOptions controls snapshot cache behavior.
+type SnapshotFetchOptions struct {
+	AllowStale bool
+}
