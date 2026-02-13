@@ -5,6 +5,7 @@ import (
 	"context"
 	"github.com/viant/afs"
 	"io"
+	"log"
 	"strings"
 )
 
@@ -48,25 +49,30 @@ func (s *Service) loadTokenPreferred(ns, alias, domain, owner, name string) stri
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out string
+	var outKey string
 	// Try exact alias first
 	if owner != "" && name != "" && s.clientID != "" {
 		if t := s.tokens[s.tokenKeyRepoOAuth(ns, alias, domain, owner, name, s.clientID)]; t != "" {
 			out = t
+			outKey = s.tokenKeyRepoOAuth(ns, alias, domain, owner, name, s.clientID)
 		}
 	}
 	if out == "" && owner != "" && name != "" {
 		if t := s.tokens[s.tokenKeyRepo(ns, alias, domain, owner, name)]; t != "" {
 			out = t
+			outKey = s.tokenKeyRepo(ns, alias, domain, owner, name)
 		}
 	}
 	if out == "" && s.clientID != "" {
 		if t := s.tokens[s.tokenKeyOAuth(ns, alias, domain, s.clientID)]; t != "" {
 			out = t
+			outKey = s.tokenKeyOAuth(ns, alias, domain, s.clientID)
 		}
 	}
 	if out == "" {
 		if t := s.tokens[s.tokenKey(ns, alias, domain)]; t != "" {
 			out = t
+			outKey = s.tokenKey(ns, alias, domain)
 		}
 	}
 	// Fallback to canonical alias for domain-wide reuse when alias looks implicit (owner/repo or empty)
@@ -77,23 +83,90 @@ func (s *Service) loadTokenPreferred(ns, alias, domain, owner, name string) stri
 			if owner != "" && name != "" && s.clientID != "" {
 				if t := s.tokens[s.tokenKeyRepoOAuth(ns, ca, domain, owner, name, s.clientID)]; t != "" {
 					out = t
+					outKey = s.tokenKeyRepoOAuth(ns, ca, domain, owner, name, s.clientID)
 				}
 			}
 			if out == "" && owner != "" && name != "" {
 				if t := s.tokens[s.tokenKeyRepo(ns, ca, domain, owner, name)]; t != "" {
 					out = t
+					outKey = s.tokenKeyRepo(ns, ca, domain, owner, name)
 				}
 			}
 			if out == "" && s.clientID != "" {
 				if t := s.tokens[s.tokenKeyOAuth(ns, ca, domain, s.clientID)]; t != "" {
 					out = t
+					outKey = s.tokenKeyOAuth(ns, ca, domain, s.clientID)
 				}
 			}
 			if out == "" {
 				if t := s.tokens[s.tokenKey(ns, ca, domain)]; t != "" {
 					out = t
+					outKey = s.tokenKey(ns, ca, domain)
 				}
 			}
+		}
+	}
+	// Fallback to any alias for same namespace+domain when exact alias not found.
+	if out == "" {
+		safeNS := safePart(ns)
+		safeDomain := safePart(domain)
+		// Prefer repo-scoped tokens first.
+		if owner != "" && name != "" && s.clientID != "" {
+			for k, v := range s.tokens {
+				parts := strings.Split(k, "|")
+				if len(parts) == 6 && parts[0] == safeNS && parts[2] == safeDomain &&
+					parts[3] == safePart(owner) && parts[4] == safePart(name) && strings.HasPrefix(parts[5], "oauth:") {
+					if v != "" {
+						out = v
+						outKey = k
+						break
+					}
+				}
+			}
+		}
+		if out == "" && owner != "" && name != "" {
+			for k, v := range s.tokens {
+				parts := strings.Split(k, "|")
+				if len(parts) == 5 && parts[0] == safeNS && parts[2] == safeDomain &&
+					parts[3] == safePart(owner) && parts[4] == safePart(name) {
+					if v != "" {
+						out = v
+						outKey = k
+						break
+					}
+				}
+			}
+		}
+		if out == "" && s.clientID != "" {
+			for k, v := range s.tokens {
+				parts := strings.Split(k, "|")
+				if len(parts) == 4 && parts[0] == safeNS && parts[2] == safeDomain && strings.HasPrefix(parts[3], "oauth:") {
+					if v != "" {
+						out = v
+						outKey = k
+						break
+					}
+				}
+			}
+		}
+		if out == "" {
+			for k, v := range s.tokens {
+				parts := strings.Split(k, "|")
+				if len(parts) == 3 && parts[0] == safeNS && parts[2] == safeDomain {
+					if v != "" {
+						out = v
+						outKey = k
+						break
+					}
+				}
+			}
+		}
+	}
+	if out != "" && outKey != "" {
+		// Notify in logs when alias fallback is used.
+		parts := strings.Split(outKey, "|")
+		if len(parts) >= 2 && parts[1] != safePart(alias) {
+			log.Printf("github token: alias fallback ns=%s domain=%s requested_alias=%s used_alias=%s", ns, domain, alias, parts[1])
 		}
 	}
 	return out

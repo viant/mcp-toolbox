@@ -38,26 +38,15 @@ func (s *Service) ElicitCooldown() time.Duration {
 	return s.tunCooldown
 }
 
-func (s *Service) tokenWaitKey(ns, alias, domain string) string {
-	return joinKey("wait", ns, alias, domain)
+func (s *Service) tokenWaitKey(ns, domain string) string {
+	return joinKey("wait", ns, domain)
 }
 
-func lockAlias(alias string) string {
-	a := strings.TrimSpace(alias)
-	if a == "" {
-		return "default"
-	}
-	if strings.Contains(a, "/") {
-		return "default"
-	}
-	return a
-}
-
-// acquireCredLock provides a singleflight-style gate per (ns,alias,domain).
+// acquireCredLock provides a singleflight-style gate per (ns,domain).
 // Returns: leader flag, done channel (closed on success), and a release func(success) to cleanup.
 func (s *Service) acquireCredLock(ns, alias, domain string) (bool, <-chan struct{}, func(success bool)) {
-	alias = lockAlias(alias)
-	key := s.tokenWaitKey(ns, alias, domain)
+	_ = alias
+	key := s.tokenWaitKey(ns, domain)
 	s.credMu.Lock()
 	if lk, ok := s.credLocks[key]; ok {
 		ch := lk.done
@@ -81,43 +70,24 @@ func (s *Service) acquireCredLock(ns, alias, domain string) (bool, <-chan struct
 	return true, lk.done, release
 }
 
-// notifyToken wakes any goroutines waiting for a token for (alias,domain).
+// notifyToken wakes any goroutines waiting for a token for (ns,domain).
 func (s *Service) notifyToken(ns, alias, domain string) {
 	// Close by canonical gate key
-	key := s.tokenWaitKey(ns, lockAlias(alias), domain)
+	key := s.tokenWaitKey(ns, domain)
 	// Close singleflight lock if present
 	s.credMu.Lock()
 	if lk, ok := s.credLocks[key]; ok {
 		delete(s.credLocks, key)
 		close(lk.done)
+		fmt.Printf("github auth: token waiters released ns=%q domain=%q\n", ns, domain)
 	}
 	s.credMu.Unlock()
 }
 
-// notifyTokenAll wakes any goroutines waiting for a token for (alias,domain) in any namespace.
+// notifyTokenAll is deprecated; namespace isolation is enforced for waiters.
 func (s *Service) notifyTokenAll(alias, domain string) {
-	alias = safePart(lockAlias(alias))
-	domain = safePart(domain)
-	s.credMu.Lock()
-	woken := 0
-	for key, lk := range s.credLocks {
-		if lk == nil {
-			continue
-		}
-		parts := strings.Split(key, "|")
-		if len(parts) < 4 || parts[0] != safePart("wait") {
-			continue
-		}
-		if parts[2] == alias && parts[3] == domain {
-			delete(s.credLocks, key)
-			close(lk.done)
-			woken++
-		}
-	}
-	s.credMu.Unlock()
-	if woken > 0 {
-		fmt.Printf("github auth: token waiters released alias=%q domain=%q count=%d\n", alias, domain, woken)
-	}
+	_ = alias
+	_ = domain
 }
 
 // clearElicitedAll clears dedupe entries for any session for this alias/domain.

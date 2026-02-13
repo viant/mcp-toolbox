@@ -316,7 +316,6 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 			s.persistToken(r.Context(), ns, a, domain, "", "", token)
 			s.clearElicitedAll(a, domain)
 			s.notifyToken(ns, a, domain)
-			s.notifyTokenAll(a, domain)
 		}
 		if uuidStr != "" {
 			s.pending.Remove(uuidStr)
@@ -456,7 +455,6 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 						s.saveToken(ns2, a, domain, tr.AccessToken)
 						s.clearElicitedAll(a, domain)
 						s.notifyToken(ns2, a, domain)
-						s.notifyTokenAll(a, domain)
 					}
 					return
 				}
