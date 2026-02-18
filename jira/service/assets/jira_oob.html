@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+  <body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;">
+    <h3>Authorize Jira Access</h3>
+    <p>Provide credentials for alias <b>{{ALIAS}}</b> on <b>{{DOMAIN}}</b>.</p>
+    <div>
+      <label>Email</label><br>
+      <input id="email" style="width:360px" placeholder="you@example.com">
+    </div>
+    <div style="margin-top:8px">
+      <label>API Token</label><br>
+      <input id="token" type="password" style="width:360px" placeholder="Jira API token">
+    </div>
+    <div style="margin-top:12px">
+      <button onclick="onSave()">Save</button>
+      <span id="status"></span>
+    </div>
+    <script>
+async function onSave(){
+  const alias='{{ALIAS}}';
+  const domain='{{DOMAIN}}';
+  const email=document.getElementById('email').value.trim();
+  const token=document.getElementById('token').value.trim();
+  const status=document.getElementById('status');
+  status.textContent='Saving...';
+  const basic = btoa(email + ':' + token);
+  const r = await fetch('{{BASE}}/jira/auth/token?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||''), {
+    method:'POST',
+    headers: { 'Authorization': 'Basic ' + basic }
+  });
+  if (!r.ok) { status.textContent = 'Save failed: ' + (await r.text()); return }
+  const chk = await fetch('{{BASE}}/jira/auth/check?alias=' + encodeURIComponent(alias) + '&domain=' + encodeURIComponent(domain||''));
+  const j = await chk.json();
+  status.textContent = j.hasToken ? 'OK' : 'Saved';
+  if (j.hasToken) { try { window.close() } catch(e){} }
+}
+    </script>
+  </body>
+</html>
