@@ -83,6 +83,15 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
 			return
 		}
+		ns := svc.Namespace(ctx)
+		if ns == "" {
+			ns = "default"
+		}
+		leader, _, release := svc.AcquireCredLock(ns, alias, domain)
+		if !leader {
+			return
+		}
+		time.AfterFunc(2*time.Minute, func() { release(false) })
 		text := fmt.Sprintf("Authorize Jira access for %s/%s", domain, alias)
 		url := fmt.Sprintf("%s/jira/auth/oob?alias=%s&domain=%s", strings.TrimRight(svc.CallbackBaseURL(), "/"), urlQuery(alias), urlQuery(domain))
 		go func() {

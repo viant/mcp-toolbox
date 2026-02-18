@@ -65,6 +65,14 @@ func NewService(cfg *Config) *Service {
 
 func (s *Service) UseTextField() bool      { return s.useText }
 func (s *Service) CallbackBaseURL() string { return s.cfg.CallbackBaseURL }
+
+// Namespace returns the effective authorization namespace for this request context.
+func (s *Service) Namespace(ctx context.Context) string {
+	if d, err := s.auth.Namespace(ctx); err == nil && d != "" {
+		return d
+	}
+	return "default"
+}
 func (s *Service) BaseDomain() string {
 	base := s.cfg.Accounts["default"].BaseURL
 	if base == "" {
@@ -84,10 +92,7 @@ func (s *Service) account(ctx context.Context, alias string) (Account, error) {
 	if alias == "" {
 		alias = "default"
 	}
-	ns, _ := s.auth.Namespace(ctx)
-	if ns == "" {
-		ns = "default"
-	}
+	ns := s.Namespace(ctx)
 	key := ns + "|" + alias
 	// cached account
 	s.mu.RLock()
@@ -144,10 +149,7 @@ func (s *Service) client(ctx context.Context, alias string) (*jira.Client, Accou
 	if alias == "" {
 		alias = "default"
 	}
-	ns, _ := s.auth.Namespace(ctx)
-	if ns == "" {
-		ns = "default"
-	}
+	ns := s.Namespace(ctx)
 	key := ns + "|" + alias
 	s.mu.RLock()
 	if c := s.clients[key]; c != nil {
@@ -167,10 +169,7 @@ func (s *Service) client(ctx context.Context, alias string) (*jira.Client, Accou
 		if u, e := url.Parse(host); e == nil && u.Host != "" {
 			host = u.Host
 		}
-		ns, _ := s.auth.Namespace(ctx)
-		if ns == "" {
-			ns = "default"
-		}
+		ns := s.Namespace(ctx)
 		key := ns + "|" + alias + "|" + host
 		s.mu.RLock()
 		tok := s.tokens[key]
@@ -191,6 +190,43 @@ func (s *Service) client(ctx context.Context, alias string) (*jira.Client, Accou
 	s.accts[key] = acct
 	s.mu.Unlock()
 	return cli, acct, nil
+}
+
+// acquireCredLock provides a singleflight-style gate per (ns,alias,domain).
+// Returns: leader flag, done channel (closed on success), and release func(success) to cleanup.
+func (s *Service) AcquireCredLock(ns, alias, domain string) (bool, <-chan struct{}, func(success bool)) {
+	key := ns + "|" + alias + "|" + domain
+	s.credMu.Lock()
+	if ch, ok := s.credLocks[key]; ok {
+		s.credMu.Unlock()
+		return false, ch, func(bool) {}
+	}
+	ch := make(chan struct{})
+	s.credLocks[key] = ch
+	s.credMu.Unlock()
+	release := func(success bool) {
+		s.credMu.Lock()
+		cur, ok := s.credLocks[key]
+		if ok {
+			delete(s.credLocks, key)
+			if success {
+				close(cur)
+			}
+		}
+		s.credMu.Unlock()
+	}
+	return true, ch, release
+}
+
+// notifyToken wakes any goroutines waiting for a token for (ns,alias,domain).
+func (s *Service) notifyToken(ns, alias, domain string) {
+	key := ns + "|" + alias + "|" + domain
+	s.credMu.Lock()
+	if ch, ok := s.credLocks[key]; ok {
+		delete(s.credLocks, key)
+		close(ch)
+	}
+	s.credMu.Unlock()
 }
 
 // ListProjects lists accessible projects.

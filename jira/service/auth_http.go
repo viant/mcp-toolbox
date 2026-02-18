@@ -91,15 +91,13 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 			http.Error(w, "missing email or token", http.StatusBadRequest)
 			return
 		}
-		ns, _ := s.auth.Namespace(r.Context())
-		if ns == "" {
-			ns = "default"
-		}
+		ns := s.Namespace(r.Context())
 		key := ns + "|" + alias + "|" + domain
 		s.mu.Lock()
 		s.tokens[key] = token
 		s.emails[key] = email
 		s.mu.Unlock()
+		s.notifyToken(ns, alias, domain)
 		// Clear any cached client
 		s.mu.Lock()
 		delete(s.clients, ns+"|"+alias)
@@ -120,10 +118,7 @@ func (s *Service) TokenCheckHandler() http.HandlerFunc {
 			domain = s.defaultDomain()
 		}
 		domain = normalizeDomain(domain)
-		ns, _ := s.auth.Namespace(r.Context())
-		if ns == "" {
-			ns = "default"
-		}
+		ns := s.Namespace(r.Context())
 		key := ns + "|" + alias + "|" + domain
 		s.mu.RLock()
 		_, okTok := s.tokens[key]
@@ -146,10 +141,7 @@ func (s *Service) VerifyHandler() http.HandlerFunc {
 			domain = s.defaultDomain()
 		}
 		domain = normalizeDomain(domain)
-		ns, _ := s.auth.Namespace(r.Context())
-		if ns == "" {
-			ns = "default"
-		}
+		ns := s.Namespace(r.Context())
 		key := ns + "|" + alias + "|" + domain
 		s.mu.RLock()
 		token := s.tokens[key]
