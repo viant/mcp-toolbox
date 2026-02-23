@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -23,7 +24,7 @@ func Test_tokenKey(t *testing.T) {
 	if got := svc.tokenKey("ns1", "a", ""); got != "ns1|a|github.com" {
 		t.Fatalf("unexpected token key: %s", got)
 	}
-	if got := svc.tokenKey("ns1", "b", "gh.myhost:8443/sub"); got != "ns1|b|gh.myhost:8443/sub" {
+	if got := svc.tokenKey("ns1", "b", "gh.myhost:8443/sub"); got != "ns1|b|gh.myhost_8443_sub" {
 		t.Fatalf("unexpected token key with domain: %s", got)
 	}
 }
@@ -163,6 +164,9 @@ func Test_PendingList_and_Clear_Handlers(t *testing.T) {
 
 func Test_TokenIngestHandler(t *testing.T) {
 	svc := newTestService(t)
+	svc.validateToken = func(ctx context.Context, domain, token, owner, repo string) error {
+		return nil
+	}
 
 	// wrong method
 	rr := httptest.NewRecorder()

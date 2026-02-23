@@ -18,6 +18,8 @@ import (
 // It runs only with: go test -tags local ./github/service -run Test_E2E_GHE
 // Repo under test: https://github.vianttech.com/adelphic/mediator
 func Test_E2E_GHE_List_Download_And_Optional_Checkout(t *testing.T) {
+	requireLocalTests(t)
+
 	storage := t.TempDir()
 	if v := os.Getenv("GITHUB_MCP_TEST_STORAGE"); strings.TrimSpace(v) != "" {
 		storage = strings.TrimSpace(v)
@@ -125,6 +127,8 @@ func Test_E2E_GHE_List_Download_And_Optional_Checkout(t *testing.T) {
 }
 
 func Test_E2E_GHE_SearchPrice(t *testing.T) {
+	requireLocalTests(t)
+
 	// Enable verbose service logs and cap token wait to ease troubleshooting
 	_ = os.Setenv("GITHUB_MCP_WAIT_SECS", "300")
 
@@ -189,6 +193,8 @@ func Test_E2E_GHE_SearchPrice(t *testing.T) {
 // Run only with: go test -tags local ./github/service -run Test_E2E_GHE_ListRepoFiles_MDP -v
 // Mirrors the provided listRepoFiles request against GHE: github.vianttech.com/viant/mdp
 func Test_E2E_GHE_ListRepoFiles_MDP(t *testing.T) {
+	requireLocalTests(t)
+
 	// Optional: turn on verbose logs and extend wait
 	_ = os.Setenv("GITHUB_MCP_WAIT_SECS", "300")
 
@@ -254,6 +260,7 @@ func Test_E2E_GHE_ListRepoFiles_MDP(t *testing.T) {
 // Run only with: go test -tags local ./github/service -run Test_E2E_GHE_GrepFiles_Mediator -v
 // Mirrors the provided grepFiles request against GHE: github.vianttech.com/adelphic/mediator
 func Test_E2E_GHE_GrepFiles_Mediator(t *testing.T) {
+	requireLocalTests(t)
 
 	os.Setenv("GITHUB_MCP_TEST_STORAGE", "/tmp/foo")
 	// Enable verbose logs and extend token wait to ease local troubleshooting
@@ -318,5 +325,12 @@ func Test_E2E_GHE_GrepFiles_Mediator(t *testing.T) {
 	t.Logf("sha=%s stats=%+v files=%d", out.Sha, out.Stats, len(out.Files))
 	if out.Stats.Matched == 0 {
 		t.Fatalf("expected at least one matched file, got 0 (filesScanned=%d)", out.Stats.Scanned)
+	}
+}
+
+func requireLocalTests(t *testing.T) {
+	t.Helper()
+	if os.Getenv("MCP_LOCAL_TESTS") == "" {
+		t.Skip("set MCP_LOCAL_TESTS=1 to run local tests")
 	}
 }

@@ -52,6 +52,7 @@ type Service struct {
 	tokens         map[string]string // key(ns|alias|domain[|owner|repo[|oauth:clientID]]) -> access token
 	runner         cmdRunner
 	makeContentAPI func(domain string) contentAPI
+	validateToken  func(ctx context.Context, domain, token, owner, repo string) error
 	// no alias forcing/defaulting; rely on explicit alias or inference
 
 	// treeCache stores full repo tree entries fetched via the Trees API
@@ -136,6 +137,7 @@ func NewService(cfg *Config) *Service {
 		permCache:      map[string]time.Time{},
 		visCache:       map[string]visEntry{},
 	}
+	s.validateToken = s.defaultValidateToken
 	// Initialize shared namespace provider: prefer identity (email/sub), fallback to token-hash with tkn- prefix
 	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
 	ttlSecs := 900 // 15m
@@ -200,6 +202,22 @@ func (s *Service) Bound(namespace string) *Service {
 type contentAPI interface {
 	ListContents(ctx context.Context, token, owner, name, path, ref string) ([]adapter.ContentItem, error)
 	GetFileContent(ctx context.Context, token, owner, name, path, ref string) ([]byte, error)
+}
+
+func (s *Service) defaultValidateToken(ctx context.Context, domain, token, owner, repo string) error {
+	cli := adapter.New(domain)
+	if err := cli.ValidateToken(ctx, token); err != nil {
+		// Fine-grained tokens may not allow /user; try repo validation when repo is known.
+		if owner != "" && repo != "" {
+			if _, derr := cli.GetRepoDefaultBranch(ctx, token, owner, repo); derr == nil {
+				return nil
+			} else {
+				return derr
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // RegisterHTTP moved to auth_http.go

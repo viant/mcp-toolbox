@@ -242,25 +242,9 @@ func (s *Service) TokenIngestHandler() http.HandlerFunc {
 		}
 		log.Printf("github auth: validate token alias=%q domain=%q owner=%q repo=%q url=%q", alias, domain, owner, repo, urlStr)
 		// Validate credentials before saving
-		cli := adapter.New(domain)
-		if err := cli.ValidateToken(r.Context(), token); err != nil {
-			log.Printf("github auth: /user validation failed alias=%q domain=%q owner=%q repo=%q err=%v", alias, domain, owner, repo, err)
-			// Fine-grained tokens may not allow /user; try repo validation when repo is known.
-			if owner != "" && repo != "" {
-				if _, derr := cli.GetRepoDefaultBranch(r.Context(), token, owner, repo); derr == nil {
-					log.Printf("github auth: repo validation ok alias=%q domain=%q owner=%q repo=%q", alias, domain, owner, repo)
-					err = nil
-				} else {
-					log.Printf("github auth: repo validation failed alias=%q domain=%q owner=%q repo=%q err=%v", alias, domain, owner, repo, derr)
-					if errors.Is(derr, adapter.ErrUnauthorized) || errors.Is(derr, adapter.ErrBadCredentials) {
-						http.Error(w, "invalid credentials", http.StatusUnauthorized)
-						return
-					}
-					http.Error(w, "credential validation failed: "+derr.Error(), http.StatusBadGateway)
-					return
-				}
-			}
-			if err != nil {
+		if s.validateToken != nil {
+			if err := s.validateToken(r.Context(), domain, token, owner, repo); err != nil {
+				log.Printf("github auth: credential validation failed alias=%q domain=%q owner=%q repo=%q err=%v", alias, domain, owner, repo, err)
 				if errors.Is(err, adapter.ErrUnauthorized) || errors.Is(err, adapter.ErrBadCredentials) {
 					http.Error(w, "invalid credentials", http.StatusUnauthorized)
 					return
