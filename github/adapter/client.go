@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 )
 
@@ -109,6 +110,13 @@ type ContentItem struct {
 	Sha         string `json:"sha"`
 	Size        int    `json:"size"`
 	DownloadURL string `json:"download_url"`
+}
+
+// FileContentResult describes a file-content fetch and whether an HTTP range was honored.
+type FileContentResult struct {
+	Data         []byte
+	TotalSize    int
+	RangeApplied bool
 }
 
 // ValidateRef checks whether a ref (branch/tag/sha) is usable with the Contents API
@@ -720,6 +728,85 @@ func (c *Client) GetFileContent(ctx context.Context, token, owner, name, path, r
 	}
 	return data, nil
 }
+
+// GetFileContentRange fetches file bytes via the contents API using HTTP Range when supported.
+// When the server ignores the range and returns the full file, RangeApplied is false.
+func (c *Client) GetFileContentRange(ctx context.Context, token, owner, name, path, ref string, offset, length int) (*FileContentResult, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	var url string
+	if strings.TrimSpace(path) == "" {
+		url = fmt.Sprintf("%s/repos/%s/%s/contents", c.apiBase, owner, name)
+	} else {
+		url = fmt.Sprintf("%s/repos/%s/%s/contents/%s", c.apiBase, owner, name, path)
+	}
+	if ref != "" {
+		url += "?ref=" + neturl.QueryEscape(ref)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("Authorization", authBasic(token))
+	req.Header.Set("Accept", "application/vnd.github.raw")
+	if offset > 0 || length > 0 {
+		switch {
+		case length > 0:
+			end := offset + length - 1
+			if end < offset {
+				end = offset
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, end))
+		default:
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		}
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if err2 := classify(resp, "get content range"); err2 != nil {
+		return nil, err2
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	rangeApplied := req.Header.Get("Range") == "" || resp.StatusCode == http.StatusPartialContent || strings.TrimSpace(resp.Header.Get("Content-Range")) != ""
+	totalSize := len(data)
+	if parsed := parseContentRangeTotal(resp.Header.Get("Content-Range")); parsed > 0 {
+		totalSize = parsed
+	} else if resp.ContentLength >= 0 {
+		totalSize = int(resp.ContentLength)
+	}
+	if totalSize < len(data) {
+		totalSize = len(data)
+	}
+	return &FileContentResult{
+		Data:         data,
+		TotalSize:    totalSize,
+		RangeApplied: rangeApplied,
+	}, nil
+}
+
+func parseContentRangeTotal(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	slash := strings.LastIndex(value, "/")
+	if slash == -1 || slash == len(value)-1 {
+		return 0
+	}
+	total, err := strconv.Atoi(value[slash+1:])
+	if err != nil || total < 0 {
+		return 0
+	}
+	return total
+}
+
 func authBasic(token string) string {
 	// If token looks like "username:password", use it directly; else treat as PAT.
 	if strings.Contains(token, ":") {

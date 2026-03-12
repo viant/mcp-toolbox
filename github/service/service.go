@@ -52,6 +52,7 @@ type Service struct {
 	tokens         map[string]string // key(ns|alias|domain[|owner|repo[|oauth:clientID]]) -> access token
 	runner         cmdRunner
 	makeContentAPI func(domain string) contentAPI
+	rangeReader    func(ctx context.Context, domain, token, owner, name, path, ref string, offset, length int) (*adapter.FileContentResult, error)
 	validateToken  func(ctx context.Context, domain, token, owner, repo string) error
 	// no alias forcing/defaulting; rely on explicit alias or inference
 
@@ -127,6 +128,9 @@ func NewService(cfg *Config) *Service {
 		tokens:         map[string]string{},
 		runner:         defaultCmdRunner{},
 		makeContentAPI: func(domain string) contentAPI { return adapter.New(domain) },
+		rangeReader: func(ctx context.Context, domain, token, owner, name, path, ref string, offset, length int) (*adapter.FileContentResult, error) {
+			return adapter.New(domain).GetFileContentRange(ctx, token, owner, name, path, ref, offset, length)
+		},
 		treeCache:      map[string]treeCacheEntry{},
 		elicited:       map[string]time.Time{},
 		elicitedGlobal: map[string]time.Time{},
@@ -264,198 +268,221 @@ func (s *Service) ReadRepoFile(ctx context.Context, in *ReadInput, prompt func(s
 	if aerr != nil {
 		return nil, aerr
 	}
-	cli := s.makeContentAPI(domain)
-	data, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) ([]byte, error) {
-		// Resolve ref to default if empty using authenticated call
-		useRef := s.effectiveRef(ctx, domain, owner, name, ref, token)
-		// If a specific ref was provided and appears invalid/inaccessible, fall back to the default branch.
-		if strings.TrimSpace(ref) != "" {
-			cliRef := adapter.New(domain)
-			if vErr := cliRef.ValidateRef(ctx, token, owner, name, useRef); vErr != nil {
-				if def, derr := cliRef.GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
-					// debug logs removed
-					useRef = def
-				}
-			}
-		}
-		// removed log.Printf diagnostics
-		p := strings.TrimPrefix(in.Path, "/")
-		// First try contents API
-		if data, err := cli.GetFileContent(ctx, token, owner, name, p, useRef); err == nil {
-			return data, nil
-		}
-		// Fallback: list parent directory via contents on the same ref to obtain file SHA, then fetch blob by SHA.
-		parent := p
-		if idx := strings.LastIndex(parent, "/"); idx >= 0 {
-			parent = parent[:idx]
-		} else {
-			parent = ""
-		}
-		// Try listing on the effective ref first; if that fails, fall back to default branch.
-		items, err := cli.ListContents(ctx, token, owner, name, parent, useRef)
-		if err != nil {
-			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" {
-				items, err = cli.ListContents(ctx, token, owner, name, parent, def)
-			}
-			if err != nil {
-				return nil, err
-			}
-		}
-		var sha string
-		for _, it := range items {
-			if it.Path == p && it.Sha != "" {
-				sha = it.Sha
-				break
-			}
-		}
-		// If listing on useRef succeeded but did not include the file, try default branch listing too
-		if sha == "" {
-			if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
-				if defItems, lerr := cli.ListContents(ctx, token, owner, name, parent, def); lerr == nil {
-					for _, it := range defItems {
-						if it.Path == p && it.Sha != "" {
-							sha = it.Sha
-							break
-						}
-					}
-				}
-			}
-		}
-		if sha == "" {
-			// Fallback 2: Trees API traversal to resolve blob SHA at commit-ish
-			// Attempt on the effective ref first
-			var treeErr error
-			var entries []adapter.TreeEntry
-			if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, useRef); terr == nil && strings.TrimSpace(treeSHA) != "" {
-				if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
-					entries, _ = ents, trunc
-				} else {
-					treeErr = terr2
-				}
-			} else if terr != nil {
-				treeErr = terr
-			}
-			// If not found and effective ref differs from default, try default branch as a last resort
-			if len(entries) == 0 {
-				if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
-					if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, def); terr == nil && strings.TrimSpace(treeSHA) != "" {
-						if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
-							entries, _ = ents, trunc
-						} else {
-							treeErr = terr2
-						}
-					} else if terr != nil {
-						treeErr = terr
-					}
-				}
-			}
-			if len(entries) > 0 {
-				for _, e := range entries {
-					if e.Path == p && e.Type == "blob" && e.Sha != "" {
-						sha = e.Sha
-						break
-					}
-				}
-			}
-			// If still not found, attempt default branch tree traversal as a last resort
-			if sha == "" {
-				if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
-					if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, def); terr == nil && strings.TrimSpace(treeSHA) != "" {
-						if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
-							_ = trunc
-							for _, e := range ents {
-								if e.Path == p && e.Type == "blob" && e.Sha != "" {
-									sha = e.Sha
-									break
-								}
-							}
-						} else {
-							treeErr = terr2
-						}
-					} else if terr != nil {
-						treeErr = terr
-					}
-				}
-			}
-			if sha == "" {
-				// Prepare actionable suggestions based on nearby files and tree scan.
-				// 1) Prefer suggestions from parent directory listing
-				var suggestions []string
-				// build base token without extension for fuzzy contains match
-				baseName := p
-				if idx := strings.LastIndex(baseName, "/"); idx >= 0 {
-					baseName = baseName[idx+1:]
-				}
-				baseStem := strings.TrimSuffix(baseName, path.Ext(baseName))
-				// parent directory items
-				for _, it := range items {
-					if it.Type != "file" {
-						continue
-					}
-					name := it.Name
-					if name == "" {
-						// fallback to basename from path if name empty
-						name = path.Base(it.Path)
-					}
-					if strings.Contains(strings.ToLower(name), strings.ToLower(baseStem)) {
-						suggestions = append(suggestions, it.Path)
-						if len(suggestions) >= 5 {
-							break
-						}
-					}
-				}
-				// 2) If none found in parent, look across tree entries (same dir first, then anywhere)
-				if len(suggestions) == 0 && len(entries) > 0 {
-					// same directory first
-					parentPrefix := parent
-					if parentPrefix != "" {
-						parentPrefix = strings.TrimSuffix(parentPrefix, "/") + "/"
-					}
-					for _, e := range entries {
-						if e.Type != "blob" {
-							continue
-						}
-						if parentPrefix != "" && !strings.HasPrefix(e.Path, parentPrefix) {
-							continue
-						}
-						if strings.Contains(strings.ToLower(path.Base(e.Path)), strings.ToLower(baseStem)) {
-							suggestions = append(suggestions, e.Path)
-							if len(suggestions) >= 5 {
-								break
-							}
-						}
-					}
-					// anywhere in the tree if still empty
-					if len(suggestions) == 0 {
-						for _, e := range entries {
-							if e.Type != "blob" {
-								continue
-							}
-							if strings.Contains(strings.ToLower(path.Base(e.Path)), strings.ToLower(baseStem)) {
-								suggestions = append(suggestions, e.Path)
-								if len(suggestions) >= 5 {
-									break
-								}
-							}
-						}
-					}
-				}
-				// Provide a more actionable error with context and suggestions if any
-				if len(suggestions) > 0 {
-					return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q; did you mean one of: %s (trees fallback err=%v)", p, useRef, strings.Join(suggestions, ", "), treeErr)
-				}
-				return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q (trees fallback err=%v)", p, useRef, treeErr)
-			}
-		}
-		return adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
+	fetch, err := withRepoCredentialRetry(ctx, s, alias, domain, owner, name, prompt, func(token string) (*readFetchResult, error) {
+		return s.fetchReadResult(ctx, token, domain, owner, name, ref, strings.TrimPrefix(in.Path, "/"), in)
 	})
 	if err != nil {
 		return nil, err
 	}
 	limitRequested := readLimitRequested(in)
-	selection := buildReadSelection(data, in, limitRequested)
+	var selection *readSelection
+	if fetch.RangeApplied {
+		selection = buildReadSelectionWindow(fetch.Data, fetch.TotalSize, fetch.BaseOffset, in)
+	} else {
+		selection = buildReadSelection(fetch.Data, in, limitRequested)
+	}
+	return s.buildReadOutput(in, selection, fetch.TotalSize, limitRequested), nil
+}
+
+const defaultReadPreviewBytes = 8192
+
+type readSelection struct {
+	Text        string
+	Content     []byte
+	Returned    int
+	Remaining   int
+	Mode        string
+	Binary      bool
+	StartOffset int
+}
+
+type readFetchResult struct {
+	Data         []byte
+	TotalSize    int
+	BaseOffset   int
+	RangeApplied bool
+}
+
+func (s *Service) fetchReadResult(ctx context.Context, token, domain, owner, name, ref, path string, in *ReadInput) (*readFetchResult, error) {
+	useRef := strings.TrimSpace(ref)
+	if useRef == "" {
+		useRef = s.effectiveRef(ctx, domain, owner, name, ref, token)
+	}
+	if canUseRemoteRangeRead(in) {
+		if ranged, err := s.tryReadRange(ctx, token, domain, owner, name, useRef, path, in); err == nil {
+			return ranged, nil
+		}
+	}
+	data, err := s.readRepoFileDirect(ctx, token, domain, owner, name, useRef, path)
+	if err == nil {
+		return &readFetchResult{Data: data, TotalSize: len(data)}, nil
+	}
+	if strings.TrimSpace(ref) != "" {
+		if def, derr := adapter.New(domain).GetRepoDefaultBranch(ctx, token, owner, name); derr == nil && def != "" && def != useRef {
+			if canUseRemoteRangeRead(in) {
+				if ranged, rerr := s.tryReadRange(ctx, token, domain, owner, name, def, path, in); rerr == nil {
+					return ranged, nil
+				}
+			}
+			if data, derr := s.readRepoFileDirect(ctx, token, domain, owner, name, def, path); derr == nil {
+				return &readFetchResult{Data: data, TotalSize: len(data)}, nil
+			}
+		}
+	}
+	return nil, err
+}
+
+func canUseRemoteRangeRead(in *ReadInput) bool {
+	if in == nil {
+		return false
+	}
+	if in.OffsetBytes <= 0 && in.LengthBytes <= 0 {
+		return false
+	}
+	mode := strings.TrimSpace(strings.ToLower(in.Mode))
+	return mode == "" || mode == "head"
+}
+
+func remoteReadLength(in *ReadInput) int {
+	if in == nil {
+		return defaultReadPreviewBytes
+	}
+	if in.LengthBytes > 0 {
+		return in.LengthBytes
+	}
+	if in.MaxBytes > 0 {
+		return in.MaxBytes
+	}
+	return defaultReadPreviewBytes
+}
+
+func (s *Service) tryReadRange(ctx context.Context, token, domain, owner, name, ref, path string, in *ReadInput) (*readFetchResult, error) {
+	result, err := s.rangeReader(ctx, domain, token, owner, name, path, ref, in.OffsetBytes, remoteReadLength(in))
+	if err != nil {
+		return nil, err
+	}
+	if result.RangeApplied {
+		return &readFetchResult{
+			Data:         result.Data,
+			TotalSize:    result.TotalSize,
+			BaseOffset:   maxInt(0, in.OffsetBytes),
+			RangeApplied: true,
+		}, nil
+	}
+	return &readFetchResult{Data: result.Data, TotalSize: result.TotalSize}, nil
+}
+
+// readRepoFileDirect always reads from GitHub APIs directly: contents first, then blob/tree fallbacks.
+func (s *Service) readRepoFileDirect(ctx context.Context, token, domain, owner, name, ref, filePath string) ([]byte, error) {
+	cli := s.makeContentAPI(domain)
+	if data, err := cli.GetFileContent(ctx, token, owner, name, filePath, ref); err == nil {
+		return data, nil
+	}
+	parent := filePath
+	if idx := strings.LastIndex(parent, "/"); idx >= 0 {
+		parent = parent[:idx]
+	} else {
+		parent = ""
+	}
+	items, err := cli.ListContents(ctx, token, owner, name, parent, ref)
+	if err != nil {
+		return nil, err
+	}
+	var sha string
+	for _, it := range items {
+		if it.Path == filePath && it.Sha != "" {
+			sha = it.Sha
+			break
+		}
+	}
+	var treeErr error
+	var entries []adapter.TreeEntry
+	if sha == "" {
+		if treeSHA, terr := adapter.New(domain).GetCommitTreeSHA(ctx, token, owner, name, ref); terr == nil && strings.TrimSpace(treeSHA) != "" {
+			if ents, trunc, terr2 := adapter.New(domain).GetTreeRecursive(ctx, token, owner, name, treeSHA); terr2 == nil {
+				entries, _ = ents, trunc
+			} else {
+				treeErr = terr2
+			}
+		} else if terr != nil {
+			treeErr = terr
+		}
+		for _, e := range entries {
+			if e.Path == filePath && e.Type == "blob" && e.Sha != "" {
+				sha = e.Sha
+				break
+			}
+		}
+	}
+	if sha == "" {
+		var suggestions []string
+		baseName := filePath
+		if idx := strings.LastIndex(baseName, "/"); idx >= 0 {
+			baseName = baseName[idx+1:]
+		}
+		baseStem := strings.TrimSuffix(baseName, path.Ext(baseName))
+		for _, it := range items {
+			if it.Type != "file" {
+				continue
+			}
+			itemName := it.Name
+			if itemName == "" {
+				itemName = path.Base(it.Path)
+			}
+			if strings.Contains(strings.ToLower(itemName), strings.ToLower(baseStem)) {
+				suggestions = append(suggestions, it.Path)
+				if len(suggestions) >= 5 {
+					break
+				}
+			}
+		}
+		if len(suggestions) == 0 && len(entries) > 0 {
+			parentPrefix := parent
+			if parentPrefix != "" {
+				parentPrefix = strings.TrimSuffix(parentPrefix, "/") + "/"
+			}
+			for _, e := range entries {
+				if e.Type != "blob" {
+					continue
+				}
+				if parentPrefix != "" && !strings.HasPrefix(e.Path, parentPrefix) {
+					continue
+				}
+				if strings.Contains(strings.ToLower(path.Base(e.Path)), strings.ToLower(baseStem)) {
+					suggestions = append(suggestions, e.Path)
+					if len(suggestions) >= 5 {
+						break
+					}
+				}
+			}
+			if len(suggestions) == 0 {
+				for _, e := range entries {
+					if e.Type != "blob" {
+						continue
+					}
+					if strings.Contains(strings.ToLower(path.Base(e.Path)), strings.ToLower(baseStem)) {
+						suggestions = append(suggestions, e.Path)
+						if len(suggestions) >= 5 {
+							break
+						}
+					}
+				}
+			}
+		}
+		if len(suggestions) > 0 {
+			return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q; did you mean one of: %s (trees fallback err=%v)", filePath, ref, strings.Join(suggestions, ", "), treeErr)
+		}
+		return nil, fmt.Errorf("get content failed: sha not found for path %q on ref %q (trees fallback err=%v)", filePath, ref, treeErr)
+	}
+	return adapter.New(domain).GetBlob(ctx, token, owner, name, sha)
+}
+
+func (s *Service) buildReadOutput(in *ReadInput, selection *readSelection, totalSize int, limitRequested bool) *ReadOutput {
+	if totalSize < 0 {
+		totalSize = 0
+	}
 	out := &ReadOutput{
-		Size:        len(data),
+		Size:        totalSize,
 		Returned:    selection.Returned,
 		Remaining:   selection.Remaining,
 		ModeApplied: selection.Mode,
@@ -465,7 +492,6 @@ func (s *Service) ReadRepoFile(ctx context.Context, in *ReadInput, prompt func(s
 		out.Content = selection.Content
 	} else {
 		out.Text = selection.Text
-		// Optional sed preview/transform using Go.Sed
 		if len(in.SedScripts) > 0 {
 			maxEdits := in.MaxEditsPerFile
 			if maxEdits <= 0 && s.sedMaxEdits > 0 {
@@ -492,19 +518,7 @@ func (s *Service) ReadRepoFile(ctx context.Context, in *ReadInput, prompt func(s
 			out.Continuation = cont
 		}
 	}
-	return out, nil
-}
-
-const defaultReadPreviewBytes = 8192
-
-type readSelection struct {
-	Text        string
-	Content     []byte
-	Returned    int
-	Remaining   int
-	Mode        string
-	Binary      bool
-	StartOffset int
+	return out
 }
 
 func readLimitRequested(in *ReadInput) bool {
@@ -518,6 +532,46 @@ func readLimitRequested(in *ReadInput) bool {
 		return true
 	}
 	return false
+}
+
+func buildReadSelectionWindow(data []byte, totalSize, start int, in *ReadInput) *readSelection {
+	if start < 0 {
+		start = 0
+	}
+	if totalSize < start+len(data) {
+		totalSize = start + len(data)
+	}
+	mode := strings.TrimSpace(strings.ToLower(in.Mode))
+	if mode == "" {
+		mode = "head"
+	}
+	if !isProbablyText(data) {
+		buf := append([]byte(nil), data...)
+		remaining := totalSize - (start + len(buf))
+		if remaining < 0 {
+			remaining = 0
+		}
+		return &readSelection{
+			Content:     buf,
+			Returned:    len(buf),
+			Remaining:   remaining,
+			Mode:        "bytes",
+			Binary:      true,
+			StartOffset: start,
+		}
+	}
+	remaining := totalSize - (start + len(data))
+	if remaining < 0 {
+		remaining = 0
+	}
+	return &readSelection{
+		Text:        string(data),
+		Returned:    len(data),
+		Remaining:   remaining,
+		Mode:        mode,
+		Binary:      false,
+		StartOffset: start,
+	}
 }
 
 func buildReadSelection(data []byte, in *ReadInput, limit bool) *readSelection {

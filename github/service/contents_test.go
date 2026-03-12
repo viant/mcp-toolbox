@@ -88,6 +88,9 @@ func Test_ListRepoPath_and_Read_without_clone(t *testing.T) {
 		file: []byte("hello world"),
 	}
 	svc.makeContentAPI = func(domain string) contentAPI { return contentAPIShim{inner: fake} }
+	svc.rangeReader = func(ctx context.Context, domain, token, owner, name, path, ref string, offset, length int) (*adapter.FileContentResult, error) {
+		return nil, errors.New("disabled in unit test")
+	}
 
 	// List path
 	lst, err := svc.ListRepoPath(context.Background(), &ListRepoPathInput{GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}}, Path: "/"}, nil)
@@ -126,6 +129,9 @@ func Test_ReadRepoFile_WithLimitsAndContinuation(t *testing.T) {
 		file: []byte(payload),
 	}
 	svc.makeContentAPI = func(domain string) contentAPI { return contentAPIShim{inner: fake} }
+	svc.rangeReader = func(ctx context.Context, domain, token, owner, name, path, ref string, offset, length int) (*adapter.FileContentResult, error) {
+		return nil, errors.New("disabled in unit test")
+	}
 
 	first, err := svc.ReadRepoFile(context.Background(), &ReadInput{
 		GitTarget: GitTarget{Account: Account{Alias: "acc"}, Repo: RepoRef{Owner: "viant", Name: "mcp-toolbox"}},
