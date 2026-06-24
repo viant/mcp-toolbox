@@ -42,6 +42,8 @@ type Manager struct {
 
 type pendingAuth struct{ message string }
 
+const silentTokenTimeout = 500 * time.Millisecond
+
 func NewManager(clientID, storageDir string) *Manager {
 	return &Manager{
 		clientID:   clientID,
@@ -143,7 +145,7 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 	if err != nil {
 		return true
 	}
-	ctx2, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	ctx2, cancel := context.WithTimeout(ctx, silentTokenTimeout)
 	defer cancel()
 	_, err = cred.GetToken(ctx2, policy.TokenRequestOptions{Scopes: scopes})
 	need := err != nil
@@ -221,7 +223,7 @@ func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
 
 // StartDeviceLogin launches the device code authentication in background.
 // It stores the prompt message to be retrievable via DevicePrompt.
-func (m *Manager) StartDeviceLogin(ctx context.Context, alias, tenantID string, scopes []string, onComplete func()) {
+func (m *Manager) StartDeviceLogin(ctx context.Context, alias, tenantID string, scopes []string, onComplete func(error)) {
 	m.mu.Lock()
 	if _, ok := m.pending[alias]; ok {
 		m.mu.Unlock()
@@ -236,10 +238,9 @@ func (m *Manager) StartDeviceLogin(ctx context.Context, alias, tenantID string, 
 			holder.message = msg
 			m.mu.Unlock()
 		}
-		if _, err := m.Credential(ctx, alias, tenantID, scopes, prompt); err == nil {
-			if onComplete != nil {
-				onComplete()
-			}
+		_, err := m.Credential(ctx, alias, tenantID, scopes, prompt)
+		if onComplete != nil {
+			onComplete(err)
 		}
 		m.mu.Lock()
 		delete(m.pending, alias)
@@ -293,7 +294,7 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 	if haveRec {
 		// Try a quick silent token preflight. If it fails, fall back to interactive flow
 		// (this will invoke the prompt with a device code), then persist a fresh record.
-		tctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		tctx, cancel := context.WithTimeout(ctx, silentTokenTimeout)
 		_, preErr := cred.GetToken(tctx, policy.TokenRequestOptions{Scopes: scopes})
 		cancel()
 		if preErr != nil {

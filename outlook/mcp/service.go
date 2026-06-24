@@ -119,12 +119,19 @@ func (s *Service) DeviceHandler() http.HandlerFunc {
 			return
 		}
 		msg := s.graphMgr.DevicePrompt(pend.Alias)
+		authErr := s.pending.Error(uuid)
 		if msg == "" {
 			deadline := time.Now().Add(8 * time.Second)
-			for msg == "" && time.Now().Before(deadline) {
+			for msg == "" && authErr == "" && time.Now().Before(deadline) {
 				time.Sleep(200 * time.Millisecond)
 				msg = s.graphMgr.DevicePrompt(pend.Alias)
+				authErr = s.pending.Error(uuid)
 			}
+		}
+		if authErr != "" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML(authErr))
+			return
 		}
 		if msg == "" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -170,6 +177,21 @@ func buildDeviceLoginHTML(msg string) string {
 </body></html>`, escURL, escCode, escCode)
 }
 
+func buildDeviceLoginErrorHTML(message string) string {
+	escMessage := html.EscapeString(message)
+	return fmt.Sprintf(`<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Outlook sign-in failed</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;line-height:1.45}pre{white-space:pre-wrap;background:#f6f8fa;padding:12px;border-radius:6px}</style>
+</head><body>
+<h3>Outlook sign-in failed</h3>
+<p>The device login did not start successfully.</p>
+<pre>%[1]s</pre>
+<p>Check the Azure app registration settings, then start sign-in again.</p>
+</body></html>`, escMessage)
+}
+
 func buildWaitingForDeviceHTML() string {
 	url := html.EscapeString("https://microsoft.com/devicelogin")
 	return fmt.Sprintf(`<!doctype html>
@@ -190,7 +212,7 @@ func buildWaitingForDeviceHTML() string {
 func (s *Service) DeviceStartHandler() http.HandlerFunc {
 	type out struct{ UUID, OOBUrl string }
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
@@ -208,9 +230,21 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 		id := newUUID()
 		s.pending.Put(&PendingAuth{UUID: id, Alias: alias, TenantID: tenant, Namespace: ns, done: make(chan struct{}, 1)})
 		// Start device flow in background; when token acquired, PendingAuth will be removed by Manager.
-		s.graphMgr.StartDeviceLogin(r.Context(), alias, tenant, graph.DefaultScopes(), func() { s.pending.Complete(id) })
+		authCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Minute)
+		s.graphMgr.StartDeviceLogin(authCtx, alias, tenant, graph.DefaultScopes(), func(err error) {
+			defer cancel()
+			if err != nil {
+				s.pending.SetError(id, err.Error())
+				return
+			}
+			s.pending.Complete(id)
+		})
 		base := strings.TrimRight(s.baseURL, "/")
 		oob := fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, id, alias)
+		if r.Method == http.MethodGet {
+			http.Redirect(w, r, oob, http.StatusTemporaryRedirect)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out{UUID: id, OOBUrl: oob})
 	}

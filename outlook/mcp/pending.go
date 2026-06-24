@@ -14,6 +14,7 @@ type PendingAuth struct {
 	Namespace string
 	done      chan struct{}
 	Message   *azidentity.DeviceCodeMessage
+	Error     string
 }
 
 type PendingAuths struct {
@@ -46,6 +47,23 @@ func (p *PendingAuths) Get(uuid string) (*PendingAuth, bool) {
 	defer p.mu.RUnlock()
 	x, ok := p.byID[uuid]
 	return x, ok
+}
+
+func (p *PendingAuths) Error(uuid string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if x, ok := p.byID[uuid]; ok && x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (p *PendingAuths) SetError(uuid, message string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if x, ok := p.byID[uuid]; ok && x != nil {
+		x.Error = message
+	}
 }
 
 func (p *PendingAuths) Complete(uuid string) {
