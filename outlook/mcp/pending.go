@@ -128,3 +128,29 @@ func (p *PendingAuths) ClearNamespace(ns string) []string {
 	p.mu.Unlock()
 	return ids
 }
+
+// ClearAlias removes all pending auths for an alias in a namespace and returns cleared UUIDs.
+func (p *PendingAuths) ClearAlias(ns, alias string) []string {
+	p.mu.Lock()
+	ids := make([]string, 0)
+	if m, ok := p.byNS[ns]; ok {
+		for id, x := range m {
+			if x == nil || x.Alias != alias {
+				continue
+			}
+			delete(p.byID, id)
+			delete(m, id)
+			ids = append(ids, id)
+			select {
+			case x.done <- struct{}{}:
+			default:
+			}
+			close(x.done)
+		}
+		if len(m) == 0 {
+			delete(p.byNS, ns)
+		}
+	}
+	p.mu.Unlock()
+	return ids
+}

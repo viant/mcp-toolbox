@@ -100,6 +100,7 @@ func (s *Service) RegisterHTTP(mux *http.ServeMux) {
 	// Start/check endpoints to align with GitHub-style OOB
 	mux.HandleFunc("/outlook/auth/start", s.DeviceStartHandler())
 	mux.HandleFunc("/outlook/auth/check", s.DeviceCheckHandler())
+	mux.HandleFunc("/outlook/auth/reset", s.DeviceResetHandler())
 }
 
 // DeviceHandler serves the device login page for a pending auth UUID.
@@ -267,6 +268,55 @@ func (s *Service) DeviceCheckHandler() http.HandlerFunc {
 		has := !s.graphMgr.NeedsInteractive(r.Context(), alias, tenant, graph.DefaultScopes())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out{HasToken: has})
+	}
+}
+
+// DeviceResetHandler clears local auth state for an account alias.
+func (s *Service) DeviceResetHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		alias := r.URL.Query().Get("alias")
+		tenant := r.URL.Query().Get("tenant")
+		if alias == "" {
+			http.Error(w, "alias required", http.StatusBadRequest)
+			return
+		}
+		d, _ := s.ns.Namespace(r.Context())
+		ns := d.Name
+		if ns == "" {
+			ns = "default"
+		}
+		purge := parseBool(r.URL.Query().Get("purge"))
+		result, err := s.graphMgr.ResetAuth(r.Context(), alias, tenant, graph.DefaultScopes(), purge)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.credMu.Lock()
+		if _, ok := s.creds[ns+"|"+alias]; ok {
+			result.ClearedMemory = true
+		}
+		delete(s.creds, ns+"|"+alias)
+		s.credMu.Unlock()
+		clearedPending := s.pending.ClearAlias(ns, alias)
+		out := struct {
+			graph.ResetResult
+			ClearedPending []string `json:"clearedPending,omitempty"`
+		}{ResetResult: result, ClearedPending: clearedPending}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	}
+}
+
+func parseBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	azcache "github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/viant/afs"
 	oaauth "github.com/viant/mcp-toolbox/auth"
@@ -38,11 +39,15 @@ type Manager struct {
 	creds map[string]*azidentity.DeviceCodeCredential
 	// inflight credential acquisitions per ns|alias to serialize device flows
 	waiters map[string][]chan struct{}
+	// persistentCache is the optional cross-process MSAL token cache.
+	cacheOnce       sync.Once
+	persistentCache azidentity.Cache
+	cacheErr        error
 }
 
 type pendingAuth struct{ message string }
 
-const silentTokenTimeout = 500 * time.Millisecond
+const silentTokenTimeout = 10 * time.Second
 
 func NewManager(clientID, storageDir string) *Manager {
 	return &Manager{
@@ -76,6 +81,27 @@ func safePart(s string) string {
 	// Replace characters unsafe for filenames or caches
 	repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "|", "_", " ", "_", "@", "_")
 	return repl.Replace(s)
+}
+
+func (m *Manager) persistentCacheName() string {
+	clientID := safePart(m.clientID)
+	if clientID == "" {
+		clientID = "default"
+	}
+	return "mcp-toolbox-outlook-" + clientID
+}
+
+func (m *Manager) tokenCache() (azidentity.Cache, bool) {
+	m.cacheOnce.Do(func() {
+		m.persistentCache, m.cacheErr = azcache.New(&azcache.Options{Name: m.persistentCacheName()})
+	})
+	return m.persistentCache, m.cacheErr == nil
+}
+
+func (m *Manager) applyTokenCache(opts *azidentity.DeviceCodeCredentialOptions) {
+	if c, ok := m.tokenCache(); ok {
+		opts.Cache = c
+	}
 }
 
 func (m *Manager) ensureDirs() error {
@@ -127,10 +153,12 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 	haveRec := false
 	if rc, err := afs.New().OpenURL(ctx, recURL); err == nil && rc != nil {
 		if data, rerr := io.ReadAll(rc); rerr == nil {
-			_ = json.Unmarshal(data, &rec)
-			haveRec = true
+			haveRec = json.Unmarshal(data, &rec) == nil
 		}
 		_ = rc.Close()
+	}
+	if !haveRec {
+		return true
 	}
 	// removed log.Printf diagnostics
 	opts := &azidentity.DeviceCodeCredentialOptions{
@@ -138,9 +166,8 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 		ClientID:   m.clientID,
 		UserPrompt: func(context.Context, azidentity.DeviceCodeMessage) error { return nil },
 	}
-	if haveRec {
-		opts.AuthenticationRecord = rec
-	}
+	opts.AuthenticationRecord = rec
+	m.applyTokenCache(opts)
 	cred, err := azidentity.NewDeviceCodeCredential(opts)
 	if err != nil {
 		return true
@@ -221,6 +248,60 @@ func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
 	return ok
 }
 
+// ResetAuth clears local authentication state for an alias in the current namespace.
+func (m *Manager) ResetAuth(ctx context.Context, alias, tenantID string, scopes []string, purgePersistent bool) (ResetResult, error) {
+	if err := m.ensureDirs(); err != nil {
+		return ResetResult{}, err
+	}
+	dsc, _ := m.ns.Namespace(ctx)
+	ns := dsc.Name
+	if ns == "" {
+		ns = "default"
+	}
+	result := ResetResult{PersistentCacheName: m.persistentCacheName()}
+
+	m.mu.Lock()
+	credKey := ns + "|" + alias
+	if _, ok := m.creds[credKey]; ok {
+		result.ClearedMemory = true
+	}
+	delete(m.creds, credKey)
+	for key := range m.clients {
+		parts := strings.SplitN(key, "|", 4)
+		if len(parts) >= 2 && parts[0] == ns && parts[1] == alias {
+			delete(m.clients, key)
+			result.ClearedMemory = true
+		}
+	}
+	for key, waiters := range m.waiters {
+		parts := strings.SplitN(key, "|", 3)
+		if len(parts) >= 2 && parts[0] == ns && parts[1] == alias {
+			delete(m.waiters, key)
+			for _, ch := range waiters {
+				close(ch)
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	recURL := m.authRecordURL(ns, alias)
+	exists, _ := afs.New().Exists(ctx, recURL)
+	if exists {
+		if err := afs.New().Delete(ctx, recURL); err != nil {
+			return result, err
+		}
+		result.ClearedAuthRecord = true
+	}
+	if purgePersistent {
+		if err := purgePersistentTokenCache(ctx, result.PersistentCacheName); err != nil {
+			result.Warnings = append(result.Warnings, err.Error())
+		} else {
+			result.PurgedPersistentCache = true
+		}
+	}
+	return result, nil
+}
+
 // StartDeviceLogin launches the device code authentication in background.
 // It stores the prompt message to be retrievable via DevicePrompt.
 func (m *Manager) StartDeviceLogin(ctx context.Context, alias, tenantID string, scopes []string, onComplete func(error)) {
@@ -286,6 +367,7 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 	if haveRec {
 		opts.AuthenticationRecord = rec
 	}
+	m.applyTokenCache(opts)
 	cred, err := azidentity.NewDeviceCodeCredential(opts)
 	if err != nil {
 		return nil, azidentity.AuthenticationRecord{}, err

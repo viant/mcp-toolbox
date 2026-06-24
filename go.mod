@@ -5,10 +5,12 @@ go 1.25.1
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.19.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.12.0
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache v0.3.2
 	github.com/go-git/go-git/v6 v6.0.0-20251016081807-d8e52ff5acd7
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/uuid v1.6.0
 	github.com/jessevdk/go-flags v1.5.0
+	github.com/keybase/go-keychain v0.0.1
 	github.com/microsoftgraph/msgraph-sdk-go v1.86.0
 	github.com/tebeka/selenium v0.9.10-0.20211105214847-e9100b7f5ac1
 	github.com/viant/afs v1.26.2
@@ -32,6 +34,7 @@ require (
 require (
 	cloud.google.com/go/compute/metadata v0.5.2 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
+	github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.3.0 // indirect
@@ -112,4 +115,3 @@ require (
 	google.golang.org/protobuf v1.35.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
