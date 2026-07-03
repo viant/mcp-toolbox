@@ -85,6 +85,20 @@ func TestBuildSendMailPayloadWithSourceURLAttachment(t *testing.T) {
 	}
 }
 
+func TestReadAttachmentSourceGCS(t *testing.T) {
+	sourceURL := strings.TrimSpace(os.Getenv("OUTLOOK_GCS_ATTACHMENT_TEST_URL"))
+	if sourceURL == "" {
+		t.Skip("set OUTLOOK_GCS_ATTACHMENT_TEST_URL to enable GCS attachment read verification")
+	}
+	data, err := readAttachmentSource(context.Background(), sourceURL)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", sourceURL, err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("expected non-empty data from %s", sourceURL)
+	}
+}
+
 func TestBuildSendMailPayloadAttachmentContentTypeFallback(t *testing.T) {
 	payload := mustPayload(t, &SendEmailInput{
 		To:       []string{"alice@example.com"},

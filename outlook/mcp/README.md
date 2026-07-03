@@ -74,6 +74,21 @@ export OUTLOOK_AZURE_REF='gcp://secretmanager/projects/myproj/secrets/azure-cred
 go run ./outlook/cmd/outlook-mcp -addr :7788 -storage "$HOME/.config/mcp-outlook"
 ```
 
+### GCS attachment source URLs
+
+`outlookSendMail` can read attachments from `gs://...` source URLs. The Outlook
+MCP process must have Google credentials in its environment before it starts:
+
+```
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/google-service-account.json
+go run ./outlook/cmd/outlook-mcp -addr :7788 ...
+```
+
+If `GOOGLE_APPLICATION_CREDENTIALS` is set after the server is already running,
+restart the Outlook MCP process. `echo $GOOGLE_APPLICATION_CREDENTIALS` in a
+shell is not enough unless the variable was exported or provided inline to
+`go run`.
+
 ## Behavior
 
 - On startup, if `azureRef` is set, the service loads the secret via scy and applies `ClientID` from the secret. If absent, it uses `clientID` from config.
