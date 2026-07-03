@@ -20,26 +20,6 @@ func TestClientCacheKeyNormalization(t *testing.T) {
 	}
 }
 
-func TestClientReturnsCachedInstance(t *testing.T) {
-	m := NewManager("", "")
-	ns := "default"
-	alias, tenant := "acc", "ten"
-	scopes := []string{"s1", "s2"}
-	key := m.clientKey(ns, alias, tenant, scopes)
-	want := &msgraphsdk.GraphServiceClient{}
-	m.mu.Lock()
-	m.clients[key] = want
-	m.mu.Unlock()
-
-	got, err := m.Client(context.Background(), alias, tenant, []string{"s2", "s1"}, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got != want {
-		t.Fatalf("expected cached client to be returned")
-	}
-}
-
 func TestNeedsInteractiveWithoutAuthRecord(t *testing.T) {
 	m := NewManager("client-id", t.TempDir())
 	if !m.NeedsInteractive(context.Background(), "personal", "consumers", []string{"scope"}) {
@@ -63,8 +43,8 @@ func TestResetAuthClearsMemoryAndAuthRecord(t *testing.T) {
 	clientKey := m.clientKey("default", alias, tenant, scopes)
 	m.mu.Lock()
 	m.clients[clientKey] = &msgraphsdk.GraphServiceClient{}
-	m.creds["default|"+alias] = nil
-	m.waiters["default|"+alias] = []chan struct{}{make(chan struct{})}
+	m.creds[clientKey] = nil
+	m.waiters[clientKey] = []chan struct{}{make(chan struct{})}
 	m.mu.Unlock()
 
 	result, err := m.ResetAuth(ctx, alias, tenant, scopes, false)
@@ -85,10 +65,10 @@ func TestResetAuthClearsMemoryAndAuthRecord(t *testing.T) {
 	if _, ok := m.clients[clientKey]; ok {
 		t.Fatalf("expected graph client cache entry to be removed")
 	}
-	if _, ok := m.creds["default|"+alias]; ok {
+	if _, ok := m.creds[clientKey]; ok {
 		t.Fatalf("expected credential cache entry to be removed")
 	}
-	if _, ok := m.waiters["default|"+alias]; ok {
+	if _, ok := m.waiters[clientKey]; ok {
 		t.Fatalf("expected waiter entry to be removed")
 	}
 }

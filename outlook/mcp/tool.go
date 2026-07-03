@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/viant/jsonrpc"
@@ -39,20 +37,28 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	svc := h.service
 	ops := h.ops
 
-	// Non-blocking OOB launch aligned with GitHub flow, using server-side /outlook/auth/start
-	startOOB := func(ctx context.Context, alias, tenant string) {
-		if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
-			return
+	ensureAuthorized := func(ctx context.Context, alias, tenant string) error {
+		scopes := graph.DefaultScopes()
+		if !svc.GraphManager().NeedsInteractive(ctx, alias, tenant, scopes) {
+			return nil
 		}
-		base := strings.TrimRight(svc.BaseURL(), "/")
-		url := fmt.Sprintf("%s/outlook/auth/start?alias=%s&tenant=%s", base, alias, tenant)
-		go func() {
-			ctx2, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_, _ = ops.Elicit(ctx2, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
-				Params: schema.ElicitRequestParams{ElicitationId: newUUID(), Message: "Sign in to Outlook", Mode: schema.ElicitRequestParamsModeUrl, Url: url},
-			}})
-		}()
+		session := svc.startAuthSession(ctx, alias, tenant, scopes)
+		if session == nil {
+			return fmt.Errorf("Outlook sign-in session could not be started")
+		}
+		if session.Status == AuthStatusAuthenticated {
+			return nil
+		}
+		url := svc.authSessionURL(session)
+		if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
+			return fmt.Errorf("Outlook sign-in required: %s", url)
+		}
+		if _, err := ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
+			Params: schema.ElicitRequestParams{ElicitationId: newUUID(), Message: "Sign in to Outlook", Mode: schema.ElicitRequestParamsModeUrl, Url: url},
+		}}); err != nil {
+			return fmt.Errorf("Outlook sign-in prompt failed: %w", err)
+		}
+		return svc.waitForAuthSession(ctx, session)
 	}
 
 	mailSvc := graph.NewMailService(svc.GraphManager())
@@ -67,9 +73,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		// Start server-side OOB if needed before invoking the call
-		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
-			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			return buildErrorResult(err.Error())
 		}
 		out, err := mailSvc.List(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
@@ -88,8 +93,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
-			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			return buildErrorResult(err.Error())
 		}
 		if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), nil); err != nil {
 			return buildErrorResult(err.Error())
@@ -107,8 +112,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
-			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			return buildErrorResult(err.Error())
 		}
 		out, err := calSvc.List(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
@@ -127,8 +132,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
-			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			return buildErrorResult(err.Error())
 		}
 		out, err := calSvc.Create(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
@@ -147,8 +152,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
-			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			return buildErrorResult(err.Error())
 		}
 		out, err := taskSvc.List(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {
@@ -167,8 +172,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
-		if svc.GraphManager().NeedsInteractive(ctx, in.Account.Alias, in.Account.TenantID, graph.DefaultScopes()) {
-			startOOB(ctx, in.Account.Alias, in.Account.TenantID)
+		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			return buildErrorResult(err.Error())
 		}
 		out, err := taskSvc.Create(ctx, in, graph.DefaultScopes(), nil)
 		if err != nil {

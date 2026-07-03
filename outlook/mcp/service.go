@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
@@ -48,6 +49,8 @@ type Service struct {
 	tunCoolOnce    sync.Once
 	tunCooldown    time.Duration
 }
+
+const authSessionTTL = 15 * time.Minute
 
 func NewService(cfg *Config) *Service {
 	if cfg == nil {
@@ -116,32 +119,46 @@ func (s *Service) DeviceHandler() http.HandlerFunc {
 		uuid := parts[3]
 		pend, ok := s.pending.Get(uuid)
 		if !ok {
-			http.Error(w, "no pending auth", http.StatusNotFound)
+			http.Error(w, "unknown Outlook sign-in session", http.StatusNotFound)
 			return
 		}
-		msg := s.graphMgr.DevicePrompt(pend.Alias)
-		authErr := s.pending.Error(uuid)
-		if msg == "" {
+		if pend.Status == AuthStatusWaitingForCode && pend.Message == "" {
 			deadline := time.Now().Add(8 * time.Second)
-			for msg == "" && authErr == "" && time.Now().Before(deadline) {
+			for pend.Message == "" && pend.Error == "" && pend.Status == AuthStatusWaitingForCode && time.Now().Before(deadline) {
 				time.Sleep(200 * time.Millisecond)
-				msg = s.graphMgr.DevicePrompt(pend.Alias)
-				authErr = s.pending.Error(uuid)
+				if next, ok := s.pending.Get(uuid); ok {
+					pend = next
+				}
 			}
 		}
-		if authErr != "" {
+		if pend.Status == AuthStatusAuthenticated {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML(authErr))
+			_, _ = fmt.Fprint(w, buildDeviceLoginSuccessHTML())
 			return
 		}
-		if msg == "" {
+		if pend.Status == AuthStatusExpired {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML("The Outlook sign-in session expired. Start sign-in again."))
+			return
+		}
+		if pend.Status == AuthStatusCanceled {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML("The Outlook sign-in session was canceled."))
+			return
+		}
+		if pend.Status == AuthStatusFailed || pend.Error != "" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML(pend.Error))
+			return
+		}
+		if pend.Message == "" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = fmt.Fprint(w, buildWaitingForDeviceHTML())
 			return
 		}
 		// Render a clickable link and highlight the code for easier UX.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = fmt.Fprint(w, buildDeviceLoginHTML(msg))
+		_, _ = fmt.Fprint(w, buildDeviceLoginHTML(pend.Message))
 	}
 }
 
@@ -179,6 +196,9 @@ func buildDeviceLoginHTML(msg string) string {
 }
 
 func buildDeviceLoginErrorHTML(message string) string {
+	if strings.TrimSpace(message) == "" {
+		message = "Outlook sign-in failed."
+	}
 	escMessage := html.EscapeString(message)
 	return fmt.Sprintf(`<!doctype html>
 <html><head>
@@ -191,6 +211,18 @@ func buildDeviceLoginErrorHTML(message string) string {
 <pre>%[1]s</pre>
 <p>Check the Azure app registration settings, then start sign-in again.</p>
 </body></html>`, escMessage)
+}
+
+func buildDeviceLoginSuccessHTML() string {
+	return `<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Outlook sign-in complete</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;line-height:1.45}</style>
+</head><body>
+<h3>Outlook sign-in complete</h3>
+<p>You can return to your assistant.</p>
+</body></html>`
 }
 
 func buildWaitingForDeviceHTML() string {
@@ -211,43 +243,40 @@ func buildWaitingForDeviceHTML() string {
 
 // DeviceStartHandler starts device login for alias and returns a uuid and OOB URL.
 func (s *Service) DeviceStartHandler() http.HandlerFunc {
-	type out struct{ UUID, OOBUrl string }
+	type out struct {
+		UUID      string     `json:"uuid"`
+		OOBUrl    string     `json:"oobUrl"`
+		Status    AuthStatus `json:"status"`
+		HasToken  bool       `json:"hasToken"`
+		ExpiresAt time.Time  `json:"expiresAt,omitempty"`
+		Error     string     `json:"error,omitempty"`
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 		alias := r.URL.Query().Get("alias")
-		tenant := r.URL.Query().Get("tenant")
+		tenant := s.normalizeTenant(r.URL.Query().Get("tenant"))
 		if alias == "" {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
 		}
-		d, _ := s.ns.Namespace(r.Context())
-		ns := d.Name
-		if ns == "" {
-			ns = "default"
-		}
-		id := newUUID()
-		s.pending.Put(&PendingAuth{UUID: id, Alias: alias, TenantID: tenant, Namespace: ns, done: make(chan struct{}, 1)})
-		// Start device flow in background; when token acquired, PendingAuth will be removed by Manager.
-		authCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Minute)
-		s.graphMgr.StartDeviceLogin(authCtx, alias, tenant, graph.DefaultScopes(), func(err error) {
-			defer cancel()
-			if err != nil {
-				s.pending.SetError(id, err.Error())
-				return
-			}
-			s.pending.Complete(id)
-		})
-		base := strings.TrimRight(s.baseURL, "/")
-		oob := fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, id, alias)
+		session := s.startAuthSession(r.Context(), alias, tenant, graph.DefaultScopes())
+		oob := s.authSessionURL(session)
 		if r.Method == http.MethodGet {
 			http.Redirect(w, r, oob, http.StatusTemporaryRedirect)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out{UUID: id, OOBUrl: oob})
+		_ = json.NewEncoder(w).Encode(out{
+			UUID:      session.UUID,
+			OOBUrl:    oob,
+			Status:    session.Status,
+			HasToken:  session.Status == AuthStatusAuthenticated,
+			ExpiresAt: session.ExpiresAt,
+			Error:     session.Error,
+		})
 	}
 }
 
@@ -260,7 +289,7 @@ func (s *Service) DeviceCheckHandler() http.HandlerFunc {
 			return
 		}
 		alias := r.URL.Query().Get("alias")
-		tenant := r.URL.Query().Get("tenant")
+		tenant := s.normalizeTenant(r.URL.Query().Get("tenant"))
 		if alias == "" {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
@@ -279,7 +308,7 @@ func (s *Service) DeviceResetHandler() http.HandlerFunc {
 			return
 		}
 		alias := r.URL.Query().Get("alias")
-		tenant := r.URL.Query().Get("tenant")
+		tenant := s.normalizeTenant(r.URL.Query().Get("tenant"))
 		if alias == "" {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
@@ -296,10 +325,13 @@ func (s *Service) DeviceResetHandler() http.HandlerFunc {
 			return
 		}
 		s.credMu.Lock()
-		if _, ok := s.creds[ns+"|"+alias]; ok {
-			result.ClearedMemory = true
+		prefix := ns + "|" + alias + "|" + tenant + "|"
+		for key := range s.creds {
+			if strings.HasPrefix(key, prefix) {
+				result.ClearedMemory = true
+				delete(s.creds, key)
+			}
 		}
-		delete(s.creds, ns+"|"+alias)
 		s.credMu.Unlock()
 		clearedPending := s.pending.ClearAlias(ns, alias)
 		out := struct {
@@ -386,12 +418,13 @@ func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
 // Credential returns an azidentity.DeviceCodeCredential cached per account alias.
 // It delegates acquisition to the graph manager on cache miss and stores it until process restart.
 func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
+	tenantID = s.normalizeTenant(tenantID)
 	dsc, _ := s.ns.Namespace(ctx)
 	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
-	key := ns + "|" + alias
+	key := authSessionKey(ns, alias, tenantID, scopes)
 	s.credMu.RLock()
 	if c := s.creds[key]; c != nil {
 		s.credMu.RUnlock()
@@ -417,6 +450,93 @@ func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes
 	// Clear dedupe marks after successful acquisition
 	s.clearElicitedAll(alias, tenantID)
 	return cred, nil
+}
+
+func (s *Service) namespace(ctx context.Context) string {
+	d, _ := s.ns.Namespace(ctx)
+	if d.Name != "" {
+		return d.Name
+	}
+	return "default"
+}
+
+func (s *Service) normalizeTenant(tenant string) string {
+	if strings.TrimSpace(tenant) != "" {
+		return tenant
+	}
+	return s.tenantID
+}
+
+func (s *Service) authSessionURL(session *PendingAuth) string {
+	if session == nil {
+		return ""
+	}
+	base := strings.TrimRight(s.baseURL, "/")
+	return fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, session.UUID, session.Alias)
+}
+
+func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+	tenant = s.normalizeTenant(tenant)
+	ns := s.namespace(ctx)
+	if !s.graphMgr.NeedsInteractive(ctx, alias, tenant, scopes) {
+		session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, time.Minute, newUUID)
+		if created {
+			s.pending.Complete(session.UUID)
+			session, _ = s.pending.Get(session.UUID)
+		}
+		return session
+	}
+	session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, authSessionTTL, newUUID)
+	if !created {
+		return session
+	}
+	authCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authSessionTTL)
+	go func(uuid string) {
+		defer cancel()
+		_, err := s.graphMgr.Credential(authCtx, alias, tenant, scopes, func(msg string) {
+			s.pending.SetMessage(uuid, msg)
+		})
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				s.pending.Expire(uuid)
+				return
+			}
+			s.pending.Fail(uuid, err.Error())
+			return
+		}
+		s.pending.Complete(uuid)
+	}(session.UUID)
+	return session
+}
+
+func (s *Service) waitForAuthSession(ctx context.Context, session *PendingAuth) error {
+	if session == nil {
+		return fmt.Errorf("missing Outlook sign-in session")
+	}
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("Outlook sign-in was not completed: %w", ctx.Err())
+	case <-session.Done():
+	}
+	current, ok := s.pending.Get(session.UUID)
+	if !ok {
+		return fmt.Errorf("Outlook sign-in session disappeared")
+	}
+	switch current.Status {
+	case AuthStatusAuthenticated:
+		return nil
+	case AuthStatusExpired:
+		return fmt.Errorf("Outlook sign-in session expired")
+	case AuthStatusCanceled:
+		return fmt.Errorf("Outlook sign-in session was canceled")
+	case AuthStatusFailed:
+		if current.Error != "" {
+			return fmt.Errorf("Outlook sign-in failed: %s", current.Error)
+		}
+		return fmt.Errorf("Outlook sign-in failed")
+	default:
+		return fmt.Errorf("Outlook sign-in was not completed")
+	}
 }
 
 // sessionOrNamespace prefers transport session id else auth namespace

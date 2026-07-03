@@ -20,7 +20,6 @@ import (
 	azcache "github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache"
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/viant/afs"
-	oaauth "github.com/viant/mcp-toolbox/auth"
 	nsprov "github.com/viant/mcp/server/namespace"
 )
 
@@ -28,16 +27,13 @@ import (
 type Manager struct {
 	clientID   string
 	storageDir string
-	auth       *oaauth.Service
 	ns         *nsprov.DefaultProvider
-	// pending holds device-code prompts keyed by account alias.
-	pending map[string]*pendingAuth
 	// clients caches GraphServiceClient instances per alias+tenant+scopes.
 	mu      sync.RWMutex
 	clients map[string]*msgraphsdk.GraphServiceClient
-	// creds caches device code credentials per alias, kept in memory until process restarts.
+	// creds caches device code credentials per namespace+alias+tenant+scopes.
 	creds map[string]*azidentity.DeviceCodeCredential
-	// inflight credential acquisitions per ns|alias to serialize device flows
+	// inflight credential acquisitions per namespace+alias+tenant+scopes to serialize device flows.
 	waiters map[string][]chan struct{}
 	// persistentCache is the optional cross-process MSAL token cache.
 	cacheOnce       sync.Once
@@ -45,17 +41,13 @@ type Manager struct {
 	cacheErr        error
 }
 
-type pendingAuth struct{ message string }
-
 const silentTokenTimeout = 10 * time.Second
 
 func NewManager(clientID, storageDir string) *Manager {
 	return &Manager{
 		clientID:   clientID,
 		storageDir: storageDir,
-		auth:       oaauth.New(),
 		ns:         nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
-		pending:    map[string]*pendingAuth{},
 		clients:    map[string]*msgraphsdk.GraphServiceClient{},
 		creds:      map[string]*azidentity.DeviceCodeCredential{},
 		waiters:    map[string][]chan struct{}{},
@@ -188,32 +180,18 @@ func (m *Manager) Client(ctx context.Context, alias, tenantID string, scopes []s
 		ns = "default"
 	}
 	key := m.clientKey(ns, alias, tenantID, scopes)
-	// removed log.Printf diagnostics
+	cred, err := m.Credential(ctx, alias, tenantID, scopes, prompt)
+	if err != nil {
+		return nil, err
+	}
+
 	m.mu.RLock()
 	if cli, ok := m.clients[key]; ok {
 		m.mu.RUnlock()
-		// removed log.Printf diagnostics
 		return cli, nil
 	}
 	m.mu.RUnlock()
 
-	// Reuse in-memory credential per alias; acquire and cache if absent.
-	m.mu.RLock()
-	cred := m.creds[ns+"|"+alias]
-	m.mu.RUnlock()
-	if cred == nil {
-		var rec azidentity.AuthenticationRecord
-		var err error
-		cred, rec, err = m.acquireCredential(ctx, alias, tenantID, scopes, prompt)
-		if err != nil {
-			return nil, err
-		}
-		_ = rec // reserved, if needed later
-		m.mu.Lock()
-		m.creds[ns+"|"+alias] = cred
-		m.mu.Unlock()
-		// removed log.Printf diagnostics
-	}
 	client, err := msgraphsdk.NewGraphServiceClientWithCredentials(cred, scopes)
 	if err != nil {
 		return nil, err
@@ -261,21 +239,21 @@ func (m *Manager) ResetAuth(ctx context.Context, alias, tenantID string, scopes 
 	result := ResetResult{PersistentCacheName: m.persistentCacheName()}
 
 	m.mu.Lock()
-	credKey := ns + "|" + alias
-	if _, ok := m.creds[credKey]; ok {
-		result.ClearedMemory = true
+	credPrefix := m.cacheKeyPrefix(ns, alias, tenantID)
+	for key := range m.creds {
+		if strings.HasPrefix(key, credPrefix) {
+			delete(m.creds, key)
+			result.ClearedMemory = true
+		}
 	}
-	delete(m.creds, credKey)
 	for key := range m.clients {
-		parts := strings.SplitN(key, "|", 4)
-		if len(parts) >= 2 && parts[0] == ns && parts[1] == alias {
+		if strings.HasPrefix(key, credPrefix) {
 			delete(m.clients, key)
 			result.ClearedMemory = true
 		}
 	}
 	for key, waiters := range m.waiters {
-		parts := strings.SplitN(key, "|", 3)
-		if len(parts) >= 2 && parts[0] == ns && parts[1] == alias {
+		if strings.HasPrefix(key, credPrefix) {
 			delete(m.waiters, key)
 			for _, ch := range waiters {
 				close(ch)
@@ -300,33 +278,6 @@ func (m *Manager) ResetAuth(ctx context.Context, alias, tenantID string, scopes 
 		}
 	}
 	return result, nil
-}
-
-// StartDeviceLogin launches the device code authentication in background.
-// It stores the prompt message to be retrievable via DevicePrompt.
-func (m *Manager) StartDeviceLogin(ctx context.Context, alias, tenantID string, scopes []string, onComplete func(error)) {
-	m.mu.Lock()
-	if _, ok := m.pending[alias]; ok {
-		m.mu.Unlock()
-		return
-	}
-	holder := &pendingAuth{}
-	m.pending[alias] = holder
-	m.mu.Unlock()
-	go func() {
-		prompt := func(msg string) {
-			m.mu.Lock()
-			holder.message = msg
-			m.mu.Unlock()
-		}
-		_, err := m.Credential(ctx, alias, tenantID, scopes, prompt)
-		if onComplete != nil {
-			onComplete(err)
-		}
-		m.mu.Lock()
-		delete(m.pending, alias)
-		m.mu.Unlock()
-	}()
 }
 
 // acquireCredential performs Device Code flow. If an auth record exists, use it for silent login.
@@ -410,18 +361,6 @@ func outlookDebug() bool {
 	return v != "" && v != "0" && v != "false"
 }
 
-// DevicePrompt returns the last device-code prompt message for alias.
-func (m *Manager) DevicePrompt(alias string) string {
-	m.mu.RLock()
-	p, ok := m.pending[alias]
-	msg := ""
-	if ok && p != nil {
-		msg = p.message
-	}
-	m.mu.RUnlock()
-	return msg
-}
-
 // DefaultScopes returns the minimal set for email, calendar, tasks with offline access.
 func DefaultScopes() []string {
 	return []string{
@@ -457,25 +396,66 @@ func (m *Manager) clientKey(ns, alias, tenantID string, scopes []string) string 
 	return ns + "|" + alias + "|" + tenantID + "|" + strings.Join(scopes, ",")
 }
 
-// Credential returns a cached DeviceCodeCredential for alias, acquiring and caching if needed.
-func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
-	ns, _ := m.auth.Namespace(ctx)
+func (m *Manager) cacheKeyPrefix(ns, alias, tenantID string) string {
 	if ns == "" {
 		ns = "default"
 	}
-	key := ns + "|" + alias
-	// Fast path: cached
+	return ns + "|" + alias + "|" + tenantID + "|"
+}
+
+func (m *Manager) cachedCredential(ctx context.Context, key string, scopes []string) (*azidentity.DeviceCodeCredential, bool) {
 	m.mu.RLock()
-	if c := m.creds[key]; c != nil {
-		m.mu.RUnlock()
+	cred := m.creds[key]
+	m.mu.RUnlock()
+	if cred == nil {
+		return nil, false
+	}
+	if m.credentialUsable(ctx, cred, scopes) {
+		return cred, true
+	}
+	m.dropCredential(key, cred)
+	return nil, false
+}
+
+func (m *Manager) credentialUsable(ctx context.Context, cred *azidentity.DeviceCodeCredential, scopes []string) bool {
+	if cred == nil {
+		return false
+	}
+	tctx, cancel := context.WithTimeout(ctx, silentTokenTimeout)
+	defer cancel()
+	_, err := cred.GetToken(tctx, policy.TokenRequestOptions{Scopes: scopes})
+	return err == nil
+}
+
+func (m *Manager) dropCredential(key string, cred *azidentity.DeviceCodeCredential) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.creds[key] == cred {
+		delete(m.creds, key)
+		delete(m.clients, key)
+	}
+}
+
+// Credential returns a cached DeviceCodeCredential for alias, acquiring and caching if needed.
+func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
+	dsc, _ := m.ns.Namespace(ctx)
+	ns := dsc.Name
+	if ns == "" {
+		ns = "default"
+	}
+	key := m.clientKey(ns, alias, tenantID, scopes)
+	if c, ok := m.cachedCredential(ctx, key, scopes); ok {
 		return c, nil
 	}
-	m.mu.RUnlock()
 	// Inflight coordination
 	m.mu.Lock()
 	if c := m.creds[key]; c != nil {
 		m.mu.Unlock()
-		return c, nil
+		if m.credentialUsable(ctx, c, scopes) {
+			return c, nil
+		}
+		m.dropCredential(key, c)
+		m.mu.Lock()
 	}
 	if lst, ok := m.waiters[key]; ok {
 		ch := make(chan struct{})
@@ -490,6 +470,10 @@ func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes
 		c := m.creds[key]
 		m.mu.RUnlock()
 		if c == nil {
+			return nil, errors.New("credential acquisition failed")
+		}
+		if !m.credentialUsable(ctx, c, scopes) {
+			m.dropCredential(key, c)
 			return nil, errors.New("credential acquisition failed")
 		}
 		return c, nil

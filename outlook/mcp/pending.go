@@ -1,38 +1,111 @@
 package mcp
 
 import (
+	"sort"
+	"strings"
 	"sync"
+	"time"
+)
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+type AuthStatus string
+
+const (
+	AuthStatusWaitingForCode AuthStatus = "waiting_for_code"
+	AuthStatusWaitingForUser AuthStatus = "waiting_for_user"
+	AuthStatusAuthenticated  AuthStatus = "authenticated"
+	AuthStatusFailed         AuthStatus = "failed"
+	AuthStatusExpired        AuthStatus = "expired"
+	AuthStatusCanceled       AuthStatus = "canceled"
 )
 
 type PendingAuth struct {
-	UUID      string
-	Alias     string
-	TenantID  string
-	ElicitID  string
-	Namespace string
-	done      chan struct{}
-	Message   *azidentity.DeviceCodeMessage
-	Error     string
+	UUID       string
+	Alias      string
+	TenantID   string
+	ElicitID   string
+	Namespace  string
+	Scopes     []string
+	Key        string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	Status     AuthStatus
+	Message    string
+	done       chan struct{}
+	doneClosed bool
+	Error      string
+}
+
+func (p *PendingAuth) active(now time.Time) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Status {
+	case AuthStatusAuthenticated, AuthStatusFailed, AuthStatusExpired, AuthStatusCanceled:
+		return false
+	}
+	return p.ExpiresAt.IsZero() || now.Before(p.ExpiresAt)
+}
+
+func (p *PendingAuth) Done() <-chan struct{} {
+	if p == nil || p.done == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return p.done
 }
 
 type PendingAuths struct {
-	mu   sync.RWMutex
-	byID map[string]*PendingAuth
-	byNS map[string]map[string]*PendingAuth // ns -> uuid -> pending
+	mu    sync.RWMutex
+	byID  map[string]*PendingAuth
+	byNS  map[string]map[string]*PendingAuth // ns -> uuid -> pending
+	byKey map[string]*PendingAuth
 }
 
 func NewPendingAuths() *PendingAuths {
-	return &PendingAuths{byID: make(map[string]*PendingAuth), byNS: make(map[string]map[string]*PendingAuth)}
+	return &PendingAuths{
+		byID:  make(map[string]*PendingAuth),
+		byNS:  make(map[string]map[string]*PendingAuth),
+		byKey: make(map[string]*PendingAuth),
+	}
+}
+
+func authSessionKey(ns, alias, tenantID string, scopes []string) string {
+	ns = strings.TrimSpace(ns)
+	if ns == "" {
+		ns = "default"
+	}
+	alias = strings.TrimSpace(alias)
+	tenantID = strings.TrimSpace(tenantID)
+	normScopes := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.ToLower(strings.TrimSpace(scope))
+		if scope != "" {
+			normScopes = append(normScopes, scope)
+		}
+	}
+	sort.Strings(normScopes)
+	return ns + "|" + alias + "|" + tenantID + "|" + strings.Join(normScopes, ",")
 }
 
 func (p *PendingAuths) Put(x *PendingAuth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if x.CreatedAt.IsZero() {
+		x.CreatedAt = time.Now()
+	}
+	if x.Status == "" {
+		x.Status = AuthStatusWaitingForCode
+	}
 	p.byID[x.UUID] = x
 	if x.Namespace == "" {
 		x.Namespace = "default"
+	}
+	if x.Key == "" {
+		x.Key = authSessionKey(x.Namespace, x.Alias, x.TenantID, x.Scopes)
+	}
+	if x.done == nil {
+		x.done = make(chan struct{}, 1)
 	}
 	m, ok := p.byNS[x.Namespace]
 	if !ok {
@@ -40,58 +113,101 @@ func (p *PendingAuths) Put(x *PendingAuth) {
 		p.byNS[x.Namespace] = m
 	}
 	m[x.UUID] = x
+	p.byKey[x.Key] = x
 }
 
-func (p *PendingAuths) Get(uuid string) (*PendingAuth, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	x, ok := p.byID[uuid]
-	return x, ok
-}
-
-func (p *PendingAuths) Error(uuid string) string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if x, ok := p.byID[uuid]; ok && x != nil {
-		return x.Error
-	}
-	return ""
-}
-
-func (p *PendingAuths) SetError(uuid, message string) {
+func (p *PendingAuths) GetOrCreate(ns, alias, tenantID string, scopes []string, ttl time.Duration, newID func() string) (*PendingAuth, bool) {
+	now := time.Now()
+	key := authSessionKey(ns, alias, tenantID, scopes)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if x, ok := p.byID[uuid]; ok && x != nil {
-		x.Error = message
+	if existing := p.byKey[key]; existing != nil {
+		if existing.active(now) {
+			return clonePendingAuth(existing), false
+		}
+		p.removeLocked(existing, true)
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	id := newID()
+	session := &PendingAuth{
+		UUID:      id,
+		Alias:     alias,
+		TenantID:  tenantID,
+		Namespace: ns,
+		Scopes:    append([]string(nil), scopes...),
+		Key:       key,
+		CreatedAt: now,
+		ExpiresAt: now.Add(ttl),
+		Status:    AuthStatusWaitingForCode,
+		done:      make(chan struct{}, 1),
+	}
+	p.byID[id] = session
+	if p.byNS[ns] == nil {
+		p.byNS[ns] = map[string]*PendingAuth{}
+	}
+	p.byNS[ns][id] = session
+	p.byKey[key] = session
+	return clonePendingAuth(session), true
+}
+
+func (p *PendingAuths) SetMessage(uuid, message string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if x := p.byID[uuid]; x != nil {
+		x.Message = message
+		if x.Status == AuthStatusWaitingForCode {
+			x.Status = AuthStatusWaitingForUser
+		}
 	}
 }
 
 func (p *PendingAuths) Complete(uuid string) {
-	p.mu.Lock()
-	x, ok := p.byID[uuid]
-	if ok {
-		delete(p.byID, uuid)
-	}
-	if ok && x != nil {
-		if m, ok2 := p.byNS[x.Namespace]; ok2 {
-			delete(m, uuid)
-			if len(m) == 0 {
-				delete(p.byNS, x.Namespace)
-			}
-		}
-	}
-	p.mu.Unlock()
-	if ok {
-		select {
-		case x.done <- struct{}{}:
-		default:
-		}
-		close(x.done)
-	}
+	p.finish(uuid, AuthStatusAuthenticated, "")
+}
+
+func (p *PendingAuths) Fail(uuid, message string) {
+	p.finish(uuid, AuthStatusFailed, message)
+}
+
+func (p *PendingAuths) Expire(uuid string) {
+	p.finish(uuid, AuthStatusExpired, "")
 }
 
 func (p *PendingAuths) Cancel(uuid string) {
-	p.Complete(uuid)
+	p.finish(uuid, AuthStatusCanceled, "")
+}
+
+func (p *PendingAuths) finish(uuid string, status AuthStatus, message string) {
+	p.mu.Lock()
+	x := p.byID[uuid]
+	if x != nil {
+		x.Status = status
+		if message != "" {
+			x.Error = message
+		}
+		p.signalLocked(x)
+	}
+	p.mu.Unlock()
+}
+
+func (p *PendingAuths) Get(uuid string) (*PendingAuth, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	x, ok := p.byID[uuid]
+	if !ok {
+		return nil, false
+	}
+	if !x.ExpiresAt.IsZero() && time.Now().After(x.ExpiresAt) {
+		switch x.Status {
+		case AuthStatusAuthenticated, AuthStatusFailed, AuthStatusExpired, AuthStatusCanceled:
+		default:
+			x.Status = AuthStatusExpired
+			p.signalLocked(x)
+		}
+	}
+	return clonePendingAuth(x), true
 }
 
 // ListNamespace returns a snapshot of pending auths for a namespace.
@@ -101,7 +217,7 @@ func (p *PendingAuths) ListNamespace(ns string) []*PendingAuth {
 	m := p.byNS[ns]
 	out := make([]*PendingAuth, 0, len(m))
 	for _, v := range m {
-		out = append(out, v)
+		out = append(out, clonePendingAuth(v))
 	}
 	return out
 }
@@ -112,18 +228,9 @@ func (p *PendingAuths) ClearNamespace(ns string) []string {
 	ids := make([]string, 0)
 	if m, ok := p.byNS[ns]; ok {
 		for id, x := range m {
-			delete(p.byID, id)
 			ids = append(ids, id)
-			// signal completion/cancel
-			if x != nil {
-				select {
-				case x.done <- struct{}{}:
-				default:
-				}
-				close(x.done)
-			}
+			p.removeLocked(x, true)
 		}
-		delete(p.byNS, ns)
 	}
 	p.mu.Unlock()
 	return ids
@@ -138,19 +245,45 @@ func (p *PendingAuths) ClearAlias(ns, alias string) []string {
 			if x == nil || x.Alias != alias {
 				continue
 			}
-			delete(p.byID, id)
-			delete(m, id)
 			ids = append(ids, id)
-			select {
-			case x.done <- struct{}{}:
-			default:
-			}
-			close(x.done)
-		}
-		if len(m) == 0 {
-			delete(p.byNS, ns)
+			p.removeLocked(x, true)
 		}
 	}
 	p.mu.Unlock()
 	return ids
+}
+
+func (p *PendingAuths) removeLocked(x *PendingAuth, canceled bool) {
+	if x == nil {
+		return
+	}
+	if canceled {
+		x.Status = AuthStatusCanceled
+	}
+	delete(p.byID, x.UUID)
+	delete(p.byKey, x.Key)
+	if m := p.byNS[x.Namespace]; m != nil {
+		delete(m, x.UUID)
+		if len(m) == 0 {
+			delete(p.byNS, x.Namespace)
+		}
+	}
+	p.signalLocked(x)
+}
+
+func (p *PendingAuths) signalLocked(x *PendingAuth) {
+	if x == nil || x.done == nil || x.doneClosed {
+		return
+	}
+	close(x.done)
+	x.doneClosed = true
+}
+
+func clonePendingAuth(x *PendingAuth) *PendingAuth {
+	if x == nil {
+		return nil
+	}
+	cp := *x
+	cp.Scopes = append([]string(nil), x.Scopes...)
+	return &cp
 }
