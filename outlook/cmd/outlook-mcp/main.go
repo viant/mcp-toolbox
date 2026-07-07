@@ -23,15 +23,19 @@ import (
 
 // Options defines CLI flags for the Outlook MCP server.
 type Options struct {
-	HTTPAddr       string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
-	ClientID       string `long:"client-id" description:"Azure AD application (client) ID"`
-	TenantID       string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
-	SecretsBase    string `long:"secretsBase" description:"AFS/scy base URL for persisting auth records (e.g., mem://localhost/mcp-outlook)"`
-	AzureRef       string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
-	Oauth2Config   string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
-	BFFRedirectURI string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
-	UseIdToken     bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
-	PublicBaseURL  string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-outlook.agently.svc.cluster.local:7788)"`
+	HTTPAddr                string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
+	ClientID                string `long:"client-id" description:"Azure AD application (client) ID"`
+	TenantID                string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
+	SecretsBase             string `long:"secretsBase" description:"AFS/scy base URL for persisting auth records (e.g., mem://localhost/mcp-outlook)"`
+	AzureRef                string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
+	Oauth2Config            string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
+	BFFRedirectURI          string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
+	UseIdToken              bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	PublicBaseURL           string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-outlook.agently.svc.cluster.local:7788)"`
+	ScratchpadRootURI       string `long:"scratchpad-root-uri" description:"Shared scratchpad root URI template for scratchpad:// attachments"`
+	ScratchpadUserID        string `long:"scratchpad-user-id" description:"User id for shared scratchpad attachment resolution"`
+	AttachmentSourceSchemes string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty allows all"`
+	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Comma-separated allowed underlying artifact source schemes after scratchpad resolution"`
 }
 
 func main() {
@@ -52,6 +56,18 @@ func main() {
 	}
 	if opts.AzureRef == "" {
 		opts.AzureRef = envOr("OUTLOOK_AZURE_REF", "")
+	}
+	if opts.ScratchpadRootURI == "" {
+		opts.ScratchpadRootURI = envOr("OUTLOOK_SCRATCHPAD_ROOT_URI", "")
+	}
+	if opts.ScratchpadUserID == "" {
+		opts.ScratchpadUserID = envOr("OUTLOOK_SCRATCHPAD_USER_ID", "")
+	}
+	if opts.AttachmentSourceSchemes == "" {
+		opts.AttachmentSourceSchemes = envOr("OUTLOOK_ATTACHMENT_SOURCE_SCHEMES", "")
+	}
+	if opts.ScratchpadTargetSchemes == "" {
+		opts.ScratchpadTargetSchemes = envOr("OUTLOOK_SCRATCHPAD_TARGET_SCHEMES", "")
 	}
 	if opts.ClientID == "" && opts.AzureRef == "" {
 		log.Fatal("missing --client-id/OUTLOOK_CLIENT_ID (or provide --azure-ref / OUTLOOK_AZURE_REF)")
@@ -89,11 +105,15 @@ func main() {
 	}
 
 	svc := mcp.NewService(&mcp.Config{
-		ClientID:        opts.ClientID,
-		TenantID:        opts.TenantID,
-		SecretsBase:     strings.Replace(opts.SecretsBase, "$HOME", os.Getenv("HOME"), 1),
-		CallbackBaseURL: baseURL,
-		AzureRef:        scy.EncodedResource(opts.AzureRef),
+		ClientID:                opts.ClientID,
+		TenantID:                opts.TenantID,
+		SecretsBase:             strings.Replace(opts.SecretsBase, "$HOME", os.Getenv("HOME"), 1),
+		CallbackBaseURL:         baseURL,
+		AzureRef:                scy.EncodedResource(opts.AzureRef),
+		ScratchpadRootURI:       strings.Replace(opts.ScratchpadRootURI, "$HOME", os.Getenv("HOME"), 1),
+		ScratchpadUserID:        opts.ScratchpadUserID,
+		AttachmentSourceSchemes: splitCSV(opts.AttachmentSourceSchemes),
+		ScratchpadTargetSchemes: splitCSV(opts.ScratchpadTargetSchemes),
 	})
 
 	// Protected resource metadata for hosts that support OAuth2 challenge (future use)
@@ -213,6 +233,20 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	var result []string
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 func defaultStorageDir() string {

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/viant/afs"
@@ -29,6 +30,32 @@ const largeAttachmentChunkBytes = 320 * 1024 * 12
 
 var graphBaseURL = "https://graph.microsoft.com/v1.0"
 var graphHTTPClient = http.DefaultClient
+
+type AttachmentSourceConfig struct {
+	AllowedSourceSchemes []string
+}
+
+var attachmentSourceConfig = struct {
+	sync.RWMutex
+	allowedSchemes map[string]bool
+}{}
+
+func ConfigureAttachmentSources(config AttachmentSourceConfig) {
+	allowed := map[string]bool{}
+	for _, scheme := range config.AllowedSourceSchemes {
+		scheme = strings.ToLower(strings.TrimSpace(scheme))
+		if scheme != "" {
+			allowed[scheme] = true
+		}
+	}
+	attachmentSourceConfig.Lock()
+	defer attachmentSourceConfig.Unlock()
+	if len(allowed) == 0 {
+		attachmentSourceConfig.allowedSchemes = nil
+		return
+	}
+	attachmentSourceConfig.allowedSchemes = allowed
+}
 
 type resolvedEmailAttachment struct {
 	Name        string
@@ -279,6 +306,9 @@ func compactBase64(value string) string {
 
 func readAttachmentSource(ctx context.Context, sourceURL string) ([]byte, error) {
 	sourceURL = strings.TrimSpace(sourceURL)
+	if err := validateAttachmentSourceScheme(sourceURL); err != nil {
+		return nil, err
+	}
 	if size, ok, err := localFileSize(sourceURL); err != nil {
 		return nil, fmt.Errorf("read sourceURL: %w", err)
 	} else if ok && size > maxLargeAttachmentBytes {
@@ -297,6 +327,28 @@ func readAttachmentSource(ctx context.Context, sourceURL string) ([]byte, error)
 		return nil, fmt.Errorf("sourceURL exceeds Outlook large attachment limit of 150 MB")
 	}
 	return data, nil
+}
+
+func validateAttachmentSourceScheme(sourceURL string) error {
+	attachmentSourceConfig.RLock()
+	allowed := attachmentSourceConfig.allowedSchemes
+	attachmentSourceConfig.RUnlock()
+	if len(allowed) == 0 {
+		return nil
+	}
+	scheme := attachmentSourceScheme(sourceURL)
+	if allowed[scheme] {
+		return nil
+	}
+	return fmt.Errorf("sourceURL scheme %q is not allowed", scheme)
+}
+
+func attachmentSourceScheme(sourceURL string) string {
+	u, err := neturl.Parse(strings.TrimSpace(sourceURL))
+	if err == nil && strings.TrimSpace(u.Scheme) != "" {
+		return strings.ToLower(strings.TrimSpace(u.Scheme))
+	}
+	return "file"
 }
 
 func localFileSize(sourceURL string) (int64, bool, error) {

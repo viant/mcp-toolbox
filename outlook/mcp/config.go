@@ -16,6 +16,15 @@ type Config struct {
 	// SecretsBase is an AFS/scy base URL where auth records are persisted per namespace+alias.
 	SecretsBase string `json:"secretsBase,omitempty"`
 
+	// ScratchpadRootURI is the shared scratchpad root URI template used to resolve scratchpad:// attachments.
+	ScratchpadRootURI string `json:"scratchpadRootURI,omitempty"`
+	// ScratchpadUserID is the user id used to resolve the shared scratchpad root.
+	ScratchpadUserID string `json:"scratchpadUserID,omitempty"`
+	// AttachmentSourceSchemes restricts attachment sourceURL schemes. Empty allows all supported AFS schemes.
+	AttachmentSourceSchemes []string `json:"attachmentSourceSchemes,omitempty"`
+	// ScratchpadTargetSchemes restricts the underlying sourceURL schemes after scratchpad artifact resolution.
+	ScratchpadTargetSchemes []string `json:"scratchpadTargetSchemes,omitempty"`
+
 	// CallbackBaseURL is used to generate absolute URLs for OOB flows.
 	// Example: http://localhost:7788
 	CallbackBaseURL string `json:"callbackBaseURL,omitempty"`

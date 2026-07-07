@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	afsscratchpad "github.com/viant/afs/scratchpad"
 )
 
 func TestBuildSendMailPayloadWithoutAttachments(t *testing.T) {
@@ -96,6 +98,73 @@ func TestReadAttachmentSourceGCS(t *testing.T) {
 	}
 	if len(data) == 0 {
 		t.Fatalf("expected non-empty data from %s", sourceURL)
+	}
+}
+
+func TestReadAttachmentSourceRejectsDisallowedScheme(t *testing.T) {
+	ConfigureAttachmentSources(AttachmentSourceConfig{AllowedSourceSchemes: []string{"scratchpad"}})
+	t.Cleanup(func() {
+		ConfigureAttachmentSources(AttachmentSourceConfig{})
+	})
+
+	_, err := readAttachmentSource(context.Background(), "file:///tmp/report.txt")
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !strings.Contains(err.Error(), `sourceURL scheme "file" is not allowed`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReadAttachmentSourceScratchpadArtifact(t *testing.T) {
+	ConfigureAttachmentSources(AttachmentSourceConfig{AllowedSourceSchemes: []string{"scratchpad"}})
+	t.Cleanup(func() {
+		ConfigureAttachmentSources(AttachmentSourceConfig{})
+	})
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	reportPath := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(reportPath, []byte("report from scratchpad"), 0o600); err != nil {
+		t.Fatalf("failed to write report: %v", err)
+	}
+
+	root := "file://" + filepath.ToSlash(filepath.Join(dir, "scratchpad", "${userID}"))
+	sourceURL := "file://" + filepath.ToSlash(reportPath)
+	service := afsscratchpad.New(
+		afsscratchpad.WithRootURI(root),
+		afsscratchpad.WithUserID("devuser"),
+		afsscratchpad.WithAllowedTargetSchemes("file"),
+	)
+	metadata, err := json.Marshal(afsscratchpad.Artifact{
+		Kind:        "artifact",
+		ArtifactID:  "report-1",
+		Name:        "report.txt",
+		ContentType: "text/plain",
+		SourceURL:   sourceURL,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal artifact metadata: %v", err)
+	}
+	if _, err = service.Memorize(ctx, &afsscratchpad.MemorizeInput{
+		Key:         afsscratchpad.ArtifactKey("report-1"),
+		Description: "Artifact report-1",
+		Body:        string(metadata),
+	}); err != nil {
+		t.Fatalf("failed to write artifact metadata: %v", err)
+	}
+	afsscratchpad.Register(
+		afsscratchpad.WithRootURI(root),
+		afsscratchpad.WithUserID("devuser"),
+		afsscratchpad.WithAllowedTargetSchemes("file"),
+	)
+
+	data, err := readAttachmentSource(ctx, "scratchpad://artifact/report-1")
+	if err != nil {
+		t.Fatalf("failed to read scratchpad artifact: %v", err)
+	}
+	if got, want := string(data), "report from scratchpad"; got != want {
+		t.Fatalf("unexpected data: got %q want %q", got, want)
 	}
 }
 

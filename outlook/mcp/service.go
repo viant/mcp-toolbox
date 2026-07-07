@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	afsscratchpad "github.com/viant/afs/scratchpad"
 	oa "github.com/viant/mcp-toolbox/auth"
 	"github.com/viant/mcp-toolbox/outlook/graph"
 	nsprov "github.com/viant/mcp/server/namespace"
@@ -74,6 +75,16 @@ func NewService(cfg *Config) *Service {
 		clientID = az.ClientID
 	}
 	tenantID := cfg.TenantID
+	graph.ConfigureAttachmentSources(graph.AttachmentSourceConfig{
+		AllowedSourceSchemes: cfg.AttachmentSourceSchemes,
+	})
+	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" || strings.TrimSpace(cfg.ScratchpadUserID) != "" {
+		afsscratchpad.Register(
+			afsscratchpad.WithRootURI(cfg.ScratchpadRootURI),
+			afsscratchpad.WithUserID(cfg.ScratchpadUserID),
+			afsscratchpad.WithAllowedTargetSchemes(cfg.ScratchpadTargetSchemes...),
+		)
+	}
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
 	s := &Service{
