@@ -30,14 +30,15 @@ type Service struct {
 	graphMgr *graph.Manager
 	baseURL  string
 	// ui/secrets can be added when we introduce OOB UI forms later.
-	useText     bool
-	pending     *PendingAuths
-	auth        *oa.Service
-	ns          *nsprov.DefaultProvider
-	azure       *cred.Azure
-	tenantID    string
-	clientID    string
-	secretsBase string
+	useText          bool
+	pending          *PendingAuths
+	auth             *oa.Service
+	ns               *nsprov.DefaultProvider
+	azure            *cred.Azure
+	tenantID         string
+	clientID         string
+	secretsBase      string
+	scratchpadUserID string
 
 	// service-level lazy cache of DeviceCodeCredential per namespace+alias
 	credMu sync.RWMutex
@@ -78,30 +79,32 @@ func NewService(cfg *Config) *Service {
 	graph.ConfigureAttachmentSources(graph.AttachmentSourceConfig{
 		AllowedSourceSchemes: cfg.AttachmentSourceSchemes,
 	})
-	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" || strings.TrimSpace(cfg.ScratchpadUserID) != "" {
-		afsscratchpad.Register(
-			afsscratchpad.WithRootURI(cfg.ScratchpadRootURI),
-			afsscratchpad.WithUserID(cfg.ScratchpadUserID),
-			afsscratchpad.WithAllowedTargetSchemes(cfg.ScratchpadTargetSchemes...),
-		)
-	}
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
 	s := &Service{
-		graphMgr:       graph.NewManager(clientID, cfg.SecretsBase),
-		baseURL:        cfg.CallbackBaseURL,
-		useText:        useText,
-		pending:        NewPendingAuths(),
-		auth:           oa.New(),
-		azure:          az,
-		tenantID:       tenantID,
-		clientID:       clientID,
-		secretsBase:    cfg.SecretsBase,
-		creds:          map[string]*azidentity.DeviceCodeCredential{},
-		elicited:       map[string]time.Time{},
-		elicitedGlobal: map[string]time.Time{},
+		graphMgr:         graph.NewManager(clientID, cfg.SecretsBase),
+		baseURL:          cfg.CallbackBaseURL,
+		useText:          useText,
+		pending:          NewPendingAuths(),
+		auth:             oa.New(),
+		azure:            az,
+		tenantID:         tenantID,
+		clientID:         clientID,
+		secretsBase:      cfg.SecretsBase,
+		scratchpadUserID: strings.TrimSpace(cfg.ScratchpadUserID),
+		creds:            map[string]*azidentity.DeviceCodeCredential{},
+		elicited:         map[string]time.Time{},
+		elicitedGlobal:   map[string]time.Time{},
 	}
 	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
+	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" || strings.TrimSpace(cfg.ScratchpadUserID) != "" {
+		afsscratchpad.Register(
+			afsscratchpad.WithRootURI(cfg.ScratchpadRootURI),
+			afsscratchpad.WithUserIDProvider(s.scratchpadUserIDFromContext),
+			afsscratchpad.WithUserID(s.scratchpadUserID),
+			afsscratchpad.WithAllowedTargetSchemes(cfg.ScratchpadTargetSchemes...),
+		)
+	}
 	return s
 }
 
@@ -471,6 +474,26 @@ func (s *Service) namespace(ctx context.Context) string {
 	return "default"
 }
 
+func (s *Service) scratchpadUserIDFromContext(ctx context.Context) string {
+	if s != nil && s.ns != nil {
+		if d, err := s.ns.Namespace(ctx); err == nil && !d.IsDefault && strings.TrimSpace(d.Name) != "" {
+			return strings.TrimSpace(d.Name)
+		}
+	}
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.scratchpadUserID)
+}
+
+func (s *Service) withScratchpadUser(ctx context.Context) context.Context {
+	userID := s.scratchpadUserIDFromContext(ctx)
+	if userID == "" {
+		return ctx
+	}
+	return afsscratchpad.ContextWithUserID(ctx, userID)
+}
+
 func (s *Service) normalizeTenant(tenant string) string {
 	if strings.TrimSpace(tenant) != "" {
 		return tenant
@@ -487,34 +510,45 @@ func (s *Service) authSessionURL(session *PendingAuth) string {
 }
 
 func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+	start := time.Now()
 	tenant = s.normalizeTenant(tenant)
 	ns := s.namespace(ctx)
+	debugf("startAuthSession ns=%q alias=%q tenant=%q deadline_in=%s", ns, alias, tenant, debugDeadline(ctx))
 	if !s.graphMgr.NeedsInteractive(ctx, alias, tenant, scopes) {
 		session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, time.Minute, newUUID)
 		if created {
 			s.pending.Complete(session.UUID)
 			session, _ = s.pending.Get(session.UUID)
 		}
+		debugf("startAuthSession ns=%q alias=%q tenant=%q no_interactive session=%q created=%v status=%q elapsed=%s", ns, alias, tenant, session.UUID, created, session.Status, time.Since(start).Round(time.Millisecond))
 		return session
 	}
 	session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, authSessionTTL, newUUID)
 	if !created {
+		debugf("startAuthSession ns=%q alias=%q tenant=%q existing session=%q status=%q elapsed=%s", ns, alias, tenant, session.UUID, session.Status, time.Since(start).Round(time.Millisecond))
 		return session
 	}
+	debugf("startAuthSession ns=%q alias=%q tenant=%q created session=%q elapsed=%s", ns, alias, tenant, session.UUID, time.Since(start).Round(time.Millisecond))
 	authCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authSessionTTL)
 	go func(uuid string) {
+		bgStart := time.Now()
+		debugf("authSession background_start session=%q ns=%q alias=%q tenant=%q ttl=%s", uuid, ns, alias, tenant, authSessionTTL)
 		defer cancel()
 		_, err := s.graphMgr.Credential(authCtx, alias, tenant, scopes, func(msg string) {
+			debugf("authSession prompt session=%q ns=%q alias=%q tenant=%q message_len=%d elapsed=%s", uuid, ns, alias, tenant, len(msg), time.Since(bgStart).Round(time.Millisecond))
 			s.pending.SetMessage(uuid, msg)
 		})
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				debugf("authSession expired session=%q ns=%q alias=%q tenant=%q err=%v elapsed=%s", uuid, ns, alias, tenant, err, time.Since(bgStart).Round(time.Millisecond))
 				s.pending.Expire(uuid)
 				return
 			}
+			debugf("authSession failed session=%q ns=%q alias=%q tenant=%q err=%v elapsed=%s", uuid, ns, alias, tenant, err, time.Since(bgStart).Round(time.Millisecond))
 			s.pending.Fail(uuid, err.Error())
 			return
 		}
+		debugf("authSession authenticated session=%q ns=%q alias=%q tenant=%q elapsed=%s", uuid, ns, alias, tenant, time.Since(bgStart).Round(time.Millisecond))
 		s.pending.Complete(uuid)
 	}(session.UUID)
 	return session
@@ -524,15 +558,20 @@ func (s *Service) waitForAuthSession(ctx context.Context, session *PendingAuth) 
 	if session == nil {
 		return fmt.Errorf("missing Outlook sign-in session")
 	}
+	start := time.Now()
+	debugf("waitForAuthSession start session=%q status=%q deadline_in=%s", session.UUID, session.Status, debugDeadline(ctx))
 	select {
 	case <-ctx.Done():
+		debugf("waitForAuthSession context_done session=%q err=%v elapsed=%s", session.UUID, ctx.Err(), time.Since(start).Round(time.Millisecond))
 		return fmt.Errorf("Outlook sign-in was not completed: %w", ctx.Err())
 	case <-session.Done():
 	}
 	current, ok := s.pending.Get(session.UUID)
 	if !ok {
+		debugf("waitForAuthSession missing session=%q elapsed=%s", session.UUID, time.Since(start).Round(time.Millisecond))
 		return fmt.Errorf("Outlook sign-in session disappeared")
 	}
+	debugf("waitForAuthSession done session=%q status=%q error=%q elapsed=%s", session.UUID, current.Status, current.Error, time.Since(start).Round(time.Millisecond))
 	switch current.Status {
 	case AuthStatusAuthenticated:
 		return nil

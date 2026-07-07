@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/viant/jsonrpc"
@@ -38,27 +39,39 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	ops := h.ops
 
 	ensureAuthorized := func(ctx context.Context, alias, tenant string) error {
+		start := time.Now()
 		scopes := graph.DefaultScopes()
-		if !svc.GraphManager().NeedsInteractive(ctx, alias, tenant, scopes) {
+		needsInteractive := svc.GraphManager().NeedsInteractive(ctx, alias, tenant, scopes)
+		debugf("ensureAuthorized alias=%q tenant=%q needsInteractive=%v deadline_in=%s check_elapsed=%s", alias, tenant, needsInteractive, debugDeadline(ctx), time.Since(start).Round(time.Millisecond))
+		if !needsInteractive {
 			return nil
 		}
 		session := svc.startAuthSession(ctx, alias, tenant, scopes)
 		if session == nil {
+			debugf("ensureAuthorized alias=%q tenant=%q startAuthSession=nil elapsed=%s", alias, tenant, time.Since(start).Round(time.Millisecond))
 			return fmt.Errorf("Outlook sign-in session could not be started")
 		}
+		debugf("ensureAuthorized alias=%q tenant=%q session=%q status=%q elapsed=%s", alias, tenant, session.UUID, session.Status, time.Since(start).Round(time.Millisecond))
 		if session.Status == AuthStatusAuthenticated {
 			return nil
 		}
 		url := svc.authSessionURL(session)
 		if ops == nil || !ops.Implements(schema.MethodElicitationCreate) {
+			debugf("ensureAuthorized alias=%q tenant=%q session=%q no_elicitation url=%q elapsed=%s", alias, tenant, session.UUID, url, time.Since(start).Round(time.Millisecond))
 			return fmt.Errorf("Outlook sign-in required: %s", url)
 		}
+		elicitStart := time.Now()
 		if _, err := ops.Elicit(ctx, &jsonrpc.TypedRequest[*schema.ElicitRequest]{Request: &schema.ElicitRequest{
 			Params: schema.ElicitRequestParams{ElicitationId: newUUID(), Message: "Sign in to Outlook", Mode: schema.ElicitRequestParamsModeUrl, Url: url},
 		}}); err != nil {
+			debugf("ensureAuthorized alias=%q tenant=%q session=%q elicit_error=%v elapsed=%s total=%s", alias, tenant, session.UUID, err, time.Since(elicitStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
 			return fmt.Errorf("Outlook sign-in prompt failed: %w", err)
 		}
-		return svc.waitForAuthSession(ctx, session)
+		debugf("ensureAuthorized alias=%q tenant=%q session=%q elicit_ok elapsed=%s waiting deadline_in=%s", alias, tenant, session.UUID, time.Since(elicitStart).Round(time.Millisecond), debugDeadline(ctx))
+		waitStart := time.Now()
+		err := svc.waitForAuthSession(ctx, session)
+		debugf("ensureAuthorized alias=%q tenant=%q session=%q wait_done err=%v wait_elapsed=%s total=%s deadline_in=%s", alias, tenant, session.UUID, err, time.Since(waitStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+		return err
 	}
 
 	mailSvc := graph.NewMailService(svc.GraphManager())
@@ -87,18 +100,27 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Send mail
 	if err := protoserver.RegisterTool[*graph.SendEmailInput, *struct{}](base.Registry, "outlookSendMail", outlookSendMailDesc, func(ctx context.Context, in *graph.SendEmailInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		start := time.Now()
+		debugf("outlookSendMail start alias=%q tenant=%q to_count=%d attachment_count=%d deadline_in=%s", in.Account.Alias, in.Account.TenantID, len(in.To), len(in.Attachments), debugDeadline(ctx))
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
 		}
 		if in.Account.TenantID == "" {
 			in.Account.TenantID = svc.TenantID()
 		}
+		authStart := time.Now()
 		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
+			debugf("outlookSendMail auth_failed err=%v auth_elapsed=%s total=%s deadline_in=%s", err, time.Since(authStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 			return buildErrorResult(err.Error())
 		}
+		debugf("outlookSendMail auth_ok auth_elapsed=%s scratchpad_user=%q deadline_in=%s", time.Since(authStart).Round(time.Millisecond), svc.scratchpadUserIDFromContext(ctx), debugDeadline(ctx))
+		ctx = svc.withScratchpadUser(ctx)
+		sendStart := time.Now()
 		if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), nil); err != nil {
+			debugf("outlookSendMail send_failed err=%v send_elapsed=%s total=%s deadline_in=%s", err, time.Since(sendStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 			return buildErrorResult(err.Error())
 		}
+		debugf("outlookSendMail sent send_elapsed=%s total=%s deadline_in=%s", time.Since(sendStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 		return buildSuccessResult(svc, map[string]any{"status": "sent"})
 	}); err != nil {
 		return err

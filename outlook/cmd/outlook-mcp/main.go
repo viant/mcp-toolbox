@@ -33,7 +33,7 @@ type Options struct {
 	UseIdToken              bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
 	PublicBaseURL           string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-outlook.agently.svc.cluster.local:7788)"`
 	ScratchpadRootURI       string `long:"scratchpad-root-uri" description:"Shared scratchpad root URI template for scratchpad:// attachments"`
-	ScratchpadUserID        string `long:"scratchpad-user-id" description:"User id for shared scratchpad attachment resolution"`
+	ScratchpadUserID        string `long:"scratchpad-user-id" description:"Fallback user id for local/no-auth scratchpad attachment resolution"`
 	AttachmentSourceSchemes string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty allows all"`
 	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Comma-separated allowed underlying artifact source schemes after scratchpad resolution"`
 }
@@ -213,6 +213,8 @@ func main() {
 			mcpsrv.WithAuthorizer(authSvc.Middleware),
 			mcpsrv.WithProtectedResourcesHandler(authSvc.ProtectedResourcesHandler),
 		)
+	} else {
+		options = append(options, mcpsrv.WithAuthorizer(passiveBearerAuthorizer))
 	}
 
 	server, err := mcpsrv.New(options...)
@@ -255,4 +257,13 @@ func defaultStorageDir() string {
 		dir = "."
 	}
 	return filepath.Join(dir, "secret", "mcp-outlook")
+}
+
+func passiveBearerAuthorizer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token := strings.TrimSpace(r.Header.Get("Authorization")); token != "" {
+			r = r.WithContext(context.WithValue(r.Context(), authorization.TokenKey, &authorization.Token{Token: token}))
+		}
+		next.ServeHTTP(w, r)
+	})
 }

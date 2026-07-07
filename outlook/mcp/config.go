@@ -18,7 +18,7 @@ type Config struct {
 
 	// ScratchpadRootURI is the shared scratchpad root URI template used to resolve scratchpad:// attachments.
 	ScratchpadRootURI string `json:"scratchpadRootURI,omitempty"`
-	// ScratchpadUserID is the user id used to resolve the shared scratchpad root.
+	// ScratchpadUserID is the fallback user id used for local/no-auth scratchpad resolution.
 	ScratchpadUserID string `json:"scratchpadUserID,omitempty"`
 	// AttachmentSourceSchemes restricts attachment sourceURL schemes. Empty allows all supported AFS schemes.
 	AttachmentSourceSchemes []string `json:"attachmentSourceSchemes,omitempty"`

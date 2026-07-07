@@ -122,7 +122,7 @@ func TestReadAttachmentSourceScratchpadArtifact(t *testing.T) {
 		ConfigureAttachmentSources(AttachmentSourceConfig{})
 	})
 
-	ctx := context.Background()
+	ctx := afsscratchpad.ContextWithUserID(context.Background(), "devuser")
 	dir := t.TempDir()
 	reportPath := filepath.Join(dir, "report.txt")
 	if err := os.WriteFile(reportPath, []byte("report from scratchpad"), 0o600); err != nil {
@@ -133,7 +133,6 @@ func TestReadAttachmentSourceScratchpadArtifact(t *testing.T) {
 	sourceURL := "file://" + filepath.ToSlash(reportPath)
 	service := afsscratchpad.New(
 		afsscratchpad.WithRootURI(root),
-		afsscratchpad.WithUserID("devuser"),
 		afsscratchpad.WithAllowedTargetSchemes("file"),
 	)
 	metadata, err := json.Marshal(afsscratchpad.Artifact{
@@ -155,7 +154,6 @@ func TestReadAttachmentSourceScratchpadArtifact(t *testing.T) {
 	}
 	afsscratchpad.Register(
 		afsscratchpad.WithRootURI(root),
-		afsscratchpad.WithUserID("devuser"),
 		afsscratchpad.WithAllowedTargetSchemes("file"),
 	)
 
@@ -165,6 +163,83 @@ func TestReadAttachmentSourceScratchpadArtifact(t *testing.T) {
 	}
 	if got, want := string(data), "report from scratchpad"; got != want {
 		t.Fatalf("unexpected data: got %q want %q", got, want)
+	}
+}
+
+func TestReadAttachmentSourceScratchpadArtifactUsesContextUser(t *testing.T) {
+	ConfigureAttachmentSources(AttachmentSourceConfig{AllowedSourceSchemes: []string{"scratchpad"}})
+	t.Cleanup(func() {
+		ConfigureAttachmentSources(AttachmentSourceConfig{})
+	})
+
+	dir := t.TempDir()
+	root := "file://" + filepath.ToSlash(filepath.Join(dir, "scratchpad", "${userID}"))
+	service := afsscratchpad.New(
+		afsscratchpad.WithRootURI(root),
+		afsscratchpad.WithAllowedTargetSchemes("file"),
+	)
+	afsscratchpad.Register(
+		afsscratchpad.WithRootURI(root),
+		afsscratchpad.WithAllowedTargetSchemes("file"),
+	)
+
+	aliceCtx := afsscratchpad.ContextWithUserID(context.Background(), "alice@example.com")
+	bobCtx := afsscratchpad.ContextWithUserID(context.Background(), "bob@example.com")
+	writeScratchpadArtifact(t, service, aliceCtx, "report-1", writeTestFile(t, dir, "alice.txt", "alice report"))
+	writeScratchpadArtifact(t, service, bobCtx, "report-1", writeTestFile(t, dir, "bob.txt", "bob report"))
+
+	data, err := readAttachmentSource(aliceCtx, "scratchpad://artifact/report-1")
+	if err != nil {
+		t.Fatalf("failed to read alice scratchpad artifact: %v", err)
+	}
+	if got, want := string(data), "alice report"; got != want {
+		t.Fatalf("unexpected alice data: got %q want %q", got, want)
+	}
+
+	data, err = readAttachmentSource(bobCtx, "scratchpad://artifact/report-1")
+	if err != nil {
+		t.Fatalf("failed to read bob scratchpad artifact: %v", err)
+	}
+	if got, want := string(data), "bob report"; got != want {
+		t.Fatalf("unexpected bob data: got %q want %q", got, want)
+	}
+
+	_, err = readAttachmentSource(context.Background(), "scratchpad://artifact/report-1")
+	if err == nil {
+		t.Fatalf("expected missing scratchpad user error")
+	}
+	if !strings.Contains(err.Error(), "effective user id") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func writeTestFile(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("failed to write %s: %v", name, err)
+	}
+	return "file://" + filepath.ToSlash(path)
+}
+
+func writeScratchpadArtifact(t *testing.T, service *afsscratchpad.Service, ctx context.Context, artifactID, sourceURL string) {
+	t.Helper()
+	metadata, err := json.Marshal(afsscratchpad.Artifact{
+		Kind:        "artifact",
+		ArtifactID:  artifactID,
+		Name:        artifactID + ".txt",
+		ContentType: "text/plain",
+		SourceURL:   sourceURL,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal artifact metadata: %v", err)
+	}
+	if _, err = service.Memorize(ctx, &afsscratchpad.MemorizeInput{
+		Key:         afsscratchpad.ArtifactKey(artifactID),
+		Description: "Artifact " + artifactID,
+		Body:        string(metadata),
+	}); err != nil {
+		t.Fatalf("failed to write artifact metadata: %v", err)
 	}
 }
 
