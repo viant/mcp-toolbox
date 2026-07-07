@@ -13,7 +13,7 @@ require (
 	github.com/keybase/go-keychain v0.0.1
 	github.com/microsoftgraph/msgraph-sdk-go v1.86.0
 	github.com/tebeka/selenium v0.9.10-0.20211105214847-e9100b7f5ac1
-	github.com/viant/afs v1.26.2
+	github.com/viant/afs v1.30.1-0.20260707124824-0373fe4ae4cb
 	github.com/viant/afsc v1.9.1
 	github.com/viant/jsonrpc v0.17.0
 	github.com/viant/mcp v0.11.0
