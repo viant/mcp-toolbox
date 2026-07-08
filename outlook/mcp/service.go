@@ -276,7 +276,26 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
 		}
-		session := s.startAuthSession(r.Context(), alias, tenant, graph.DefaultScopes())
+		scopes := graph.DefaultScopes()
+		check := s.graphMgr.AuthCheck(r.Context(), alias, tenant, scopes)
+		if check.Status == graph.AuthCheckTransient {
+			http.Error(w, graph.UserMessageForAuthError(check.Err), http.StatusServiceUnavailable)
+			return
+		}
+		if check.Status == graph.AuthCheckFailed {
+			message := graph.UserMessageForAuthError(check.Err)
+			if message == "" {
+				message = "Outlook authentication check failed"
+			}
+			http.Error(w, message, http.StatusInternalServerError)
+			return
+		}
+		var session *PendingAuth
+		if check.Status == graph.AuthCheckReady {
+			session = s.completedAuthSession(r.Context(), alias, tenant, scopes)
+		} else {
+			session = s.startAuthSession(r.Context(), alias, tenant, scopes)
+		}
 		oob := s.authSessionURL(session)
 		if r.Method == http.MethodGet {
 			http.Redirect(w, r, oob, http.StatusTemporaryRedirect)
@@ -308,7 +327,7 @@ func (s *Service) DeviceCheckHandler() http.HandlerFunc {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
 		}
-		has := !s.graphMgr.NeedsInteractive(r.Context(), alias, tenant, graph.DefaultScopes())
+		has := s.graphMgr.AuthCheck(r.Context(), alias, tenant, graph.DefaultScopes()).Status == graph.AuthCheckReady
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out{HasToken: has})
 	}
@@ -509,20 +528,22 @@ func (s *Service) authSessionURL(session *PendingAuth) string {
 	return fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, session.UUID, session.Alias)
 }
 
+func (s *Service) completedAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+	tenant = s.normalizeTenant(tenant)
+	ns := s.namespace(ctx)
+	session, _ := s.pending.GetOrCreate(ns, alias, tenant, scopes, time.Minute, newUUID)
+	if session.Status != AuthStatusAuthenticated {
+		s.pending.Complete(session.UUID)
+		session, _ = s.pending.Get(session.UUID)
+	}
+	return session
+}
+
 func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
 	start := time.Now()
 	tenant = s.normalizeTenant(tenant)
 	ns := s.namespace(ctx)
 	debugf("startAuthSession ns=%q alias=%q tenant=%q deadline_in=%s", ns, alias, tenant, debugDeadline(ctx))
-	if !s.graphMgr.NeedsInteractive(ctx, alias, tenant, scopes) {
-		session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, time.Minute, newUUID)
-		if created {
-			s.pending.Complete(session.UUID)
-			session, _ = s.pending.Get(session.UUID)
-		}
-		debugf("startAuthSession ns=%q alias=%q tenant=%q no_interactive session=%q created=%v status=%q elapsed=%s", ns, alias, tenant, session.UUID, created, session.Status, time.Since(start).Round(time.Millisecond))
-		return session
-	}
 	session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, authSessionTTL, newUUID)
 	if !created {
 		debugf("startAuthSession ns=%q alias=%q tenant=%q existing session=%q status=%q elapsed=%s", ns, alias, tenant, session.UUID, session.Status, time.Since(start).Round(time.Millisecond))
@@ -539,9 +560,21 @@ func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, sc
 			s.pending.SetMessage(uuid, msg)
 		})
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			if graph.IsTransientAuthProviderError(err) && authCtx.Err() == nil {
+				message := graph.UserMessageForAuthError(err)
+				debugf("authSession failed_transient session=%q ns=%q alias=%q tenant=%q err=%v message=%q elapsed=%s", uuid, ns, alias, tenant, err, message, time.Since(bgStart).Round(time.Millisecond))
+				s.pending.Fail(uuid, message)
+				return
+			}
+			if authCtx.Err() != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 				debugf("authSession expired session=%q ns=%q alias=%q tenant=%q err=%v elapsed=%s", uuid, ns, alias, tenant, err, time.Since(bgStart).Round(time.Millisecond))
 				s.pending.Expire(uuid)
+				return
+			}
+			if graph.IsTransientAuthProviderError(err) {
+				message := graph.UserMessageForAuthError(err)
+				debugf("authSession failed_transient session=%q ns=%q alias=%q tenant=%q err=%v message=%q elapsed=%s", uuid, ns, alias, tenant, err, message, time.Since(bgStart).Round(time.Millisecond))
+				s.pending.Fail(uuid, message)
 				return
 			}
 			debugf("authSession failed session=%q ns=%q alias=%q tenant=%q err=%v elapsed=%s", uuid, ns, alias, tenant, err, time.Since(bgStart).Round(time.Millisecond))

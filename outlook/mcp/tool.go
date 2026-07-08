@@ -41,10 +41,23 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	ensureAuthorized := func(ctx context.Context, alias, tenant string) error {
 		start := time.Now()
 		scopes := graph.DefaultScopes()
-		needsInteractive := svc.GraphManager().NeedsInteractive(ctx, alias, tenant, scopes)
-		debugf("ensureAuthorized alias=%q tenant=%q needsInteractive=%v deadline_in=%s check_elapsed=%s", alias, tenant, needsInteractive, debugDeadline(ctx), time.Since(start).Round(time.Millisecond))
-		if !needsInteractive {
+		check := svc.GraphManager().AuthCheck(ctx, alias, tenant, scopes)
+		debugf("ensureAuthorized alias=%q tenant=%q auth_status=%q reason=%q err=%v deadline_in=%s check_elapsed=%s", alias, tenant, check.Status, check.Reason, check.Err, debugDeadline(ctx), time.Since(start).Round(time.Millisecond))
+		switch check.Status {
+		case graph.AuthCheckReady:
 			return nil
+		case graph.AuthCheckTransient:
+			return fmt.Errorf("%s", graph.UserMessageForAuthError(check.Err))
+		case graph.AuthCheckFailed:
+			message := graph.UserMessageForAuthError(check.Err)
+			if message == "" {
+				message = "Outlook authentication check failed"
+			}
+			return fmt.Errorf("%s", message)
+		case graph.AuthCheckNeedsInteractive:
+			// continue below
+		default:
+			return fmt.Errorf("Outlook authentication check returned unexpected status %q", check.Status)
 		}
 		session := svc.startAuthSession(ctx, alias, tenant, scopes)
 		if session == nil {

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +44,105 @@ type Manager struct {
 }
 
 const silentTokenTimeout = 10 * time.Second
+
+type AuthCheckStatus string
+
+const (
+	AuthCheckReady            AuthCheckStatus = "ready"
+	AuthCheckNeedsInteractive AuthCheckStatus = "needs_interactive"
+	AuthCheckTransient        AuthCheckStatus = "transient"
+	AuthCheckFailed           AuthCheckStatus = "failed"
+)
+
+const TransientAuthProviderMessage = "Outlook authentication provider is temporarily unavailable; retry later. Existing Outlook auth was not reset and re-authentication is not required."
+
+type AuthCheckResult struct {
+	Status AuthCheckStatus
+	Reason string
+	Err    error
+}
+
+type AuthProviderError struct {
+	Transient bool
+	Message   string
+	Err       error
+}
+
+func (e *AuthProviderError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if strings.TrimSpace(e.Message) != "" {
+		return e.Message
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return "Outlook authentication failed"
+}
+
+func (e *AuthProviderError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func NewTransientAuthProviderError(err error) error {
+	return &AuthProviderError{Transient: true, Message: TransientAuthProviderMessage, Err: err}
+}
+
+func UserMessageForAuthError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if IsTransientAuthProviderError(err) {
+		return TransientAuthProviderMessage
+	}
+	return err.Error()
+}
+
+func IsTransientAuthProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var authErr *AuthProviderError
+	if errors.As(err, &authErr) && authErr.Transient {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) && IsTransientAuthProviderError(urlErr.Err) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"unable to resolve an endpoint",
+		"context deadline exceeded",
+		"i/o timeout",
+		"no such host",
+		"server misbehaving",
+		"tls handshake timeout",
+		"temporary failure",
+		"connection refused",
+		"connection reset",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 func NewManager(clientID, storageDir string) *Manager {
 	return &Manager{
@@ -96,6 +197,39 @@ func (m *Manager) applyTokenCache(opts *azidentity.DeviceCodeCredentialOptions) 
 	}
 }
 
+type authRecordLoadResult struct {
+	record       azidentity.AuthenticationRecord
+	haveRecord   bool
+	bytes        int
+	openErr      error
+	readErr      error
+	unmarshalErr error
+	elapsed      time.Duration
+}
+
+func (m *Manager) loadAuthRecord(ctx context.Context, ns, alias string) authRecordLoadResult {
+	start := time.Now()
+	var result authRecordLoadResult
+	rc, err := afs.New().OpenURL(ctx, m.authRecordURL(ns, alias))
+	if err != nil || rc == nil {
+		result.openErr = err
+		result.elapsed = time.Since(start)
+		return result
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		result.readErr = err
+		result.elapsed = time.Since(start)
+		return result
+	}
+	result.bytes = len(data)
+	result.unmarshalErr = json.Unmarshal(data, &result.record)
+	result.haveRecord = result.unmarshalErr == nil
+	result.elapsed = time.Since(start)
+	return result
+}
+
 func (m *Manager) ensureDirs() error {
 	m.storageDir = expandPath(m.storageDir)
 	if m.storageDir == "" {
@@ -128,44 +262,25 @@ func expandPath(p string) string {
 	return p
 }
 
-// NeedsInteractive checks quickly (non-interactive) whether a device flow is required.
-func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, scopes []string) bool {
+// AuthCheck checks whether a credential is usable, needs user sign-in, or failed for a provider/local reason.
+func (m *Manager) AuthCheck(ctx context.Context, alias, tenantID string, scopes []string) AuthCheckResult {
 	start := time.Now()
-	debugf("graph.NeedsInteractive start alias=%q tenant=%q deadline_in=%s", alias, tenantID, debugDeadline(ctx))
+	debugf("graph.AuthCheck start alias=%q tenant=%q deadline_in=%s", alias, tenantID, debugDeadline(ctx))
 	if err := m.ensureDirs(); err != nil {
-		debugf("graph.NeedsInteractive ensureDirs_error alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", alias, tenantID, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-		return true
+		debugf("graph.AuthCheck ensureDirs_error alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", alias, tenantID, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+		return AuthCheckResult{Status: AuthCheckFailed, Reason: "storage_unavailable", Err: err}
 	}
 	dsc, _ := m.ns.Namespace(ctx)
 	ns := dsc.Name
 	if ns == "" {
 		ns = "default"
 	}
-	debugf("graph.NeedsInteractive namespace ns=%q alias=%q tenant=%q kind=%q isDefault=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, dsc.Kind, dsc.IsDefault, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-	// Load record if present
-	// afs-only I/O: use recURL; skip local path
-	recURL := m.authRecordURL(ns, alias)
-	var rec azidentity.AuthenticationRecord
-	haveRec := false
-	var recordBytes int
-	var openErr, readErr, unmarshalErr error
-	recordStart := time.Now()
-	if rc, err := afs.New().OpenURL(ctx, recURL); err == nil && rc != nil {
-		if data, rerr := io.ReadAll(rc); rerr == nil {
-			recordBytes = len(data)
-			unmarshalErr = json.Unmarshal(data, &rec)
-			haveRec = unmarshalErr == nil
-		} else {
-			readErr = rerr
-		}
-		_ = rc.Close()
-	} else {
-		openErr = err
-	}
-	debugf("graph.NeedsInteractive auth_record ns=%q alias=%q tenant=%q haveRec=%v bytes=%d openErr=%v readErr=%v unmarshalErr=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, haveRec, recordBytes, openErr, readErr, unmarshalErr, time.Since(recordStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-	if !haveRec {
-		debugf("graph.NeedsInteractive result ns=%q alias=%q tenant=%q needsInteractive=true reason=no_auth_record total=%s deadline_in=%s", ns, alias, tenantID, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-		return true
+	debugf("graph.AuthCheck namespace ns=%q alias=%q tenant=%q kind=%q isDefault=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, dsc.Kind, dsc.IsDefault, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	record := m.loadAuthRecord(ctx, ns, alias)
+	debugf("graph.AuthCheck auth_record ns=%q alias=%q tenant=%q haveRec=%v bytes=%d openErr=%v readErr=%v unmarshalErr=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, record.haveRecord, record.bytes, record.openErr, record.readErr, record.unmarshalErr, record.elapsed.Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	if !record.haveRecord {
+		debugf("graph.AuthCheck result ns=%q alias=%q tenant=%q status=%q reason=no_auth_record total=%s deadline_in=%s", ns, alias, tenantID, AuthCheckNeedsInteractive, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+		return AuthCheckResult{Status: AuthCheckNeedsInteractive, Reason: "no_usable_auth_record"}
 	}
 	// removed log.Printf diagnostics
 	credStart := time.Now()
@@ -174,23 +289,34 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 		ClientID:   m.clientID,
 		UserPrompt: func(context.Context, azidentity.DeviceCodeMessage) error { return nil },
 	}
-	opts.AuthenticationRecord = rec
+	opts.AuthenticationRecord = record.record
 	m.applyTokenCache(opts)
 	cred, err := azidentity.NewDeviceCodeCredential(opts)
 	if err != nil {
-		debugf("graph.NeedsInteractive new_credential_error ns=%q alias=%q tenant=%q err=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, err, time.Since(credStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-		return true
+		debugf("graph.AuthCheck new_credential_error ns=%q alias=%q tenant=%q err=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, err, time.Since(credStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+		return AuthCheckResult{Status: AuthCheckFailed, Reason: "credential_init_failed", Err: err}
 	}
-	debugf("graph.NeedsInteractive credential_ok ns=%q alias=%q tenant=%q elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, time.Since(credStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	debugf("graph.AuthCheck credential_ok ns=%q alias=%q tenant=%q elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, time.Since(credStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 	ctx2, cancel := context.WithTimeout(ctx, silentTokenTimeout)
 	defer cancel()
 	tokenStart := time.Now()
 	_, err = cred.GetToken(ctx2, policy.TokenRequestOptions{Scopes: scopes})
-	need := err != nil
-	debugf("graph.NeedsInteractive silent_token ns=%q alias=%q tenant=%q needsInteractive=%v err=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, need, err, time.Since(tokenStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-	// removed log.Printf diagnostics
-	debugf("graph.NeedsInteractive result ns=%q alias=%q tenant=%q needsInteractive=%v total=%s deadline_in=%s", ns, alias, tenantID, need, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-	return need
+	debugf("graph.AuthCheck silent_token ns=%q alias=%q tenant=%q err=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, err, time.Since(tokenStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	if err == nil {
+		debugf("graph.AuthCheck result ns=%q alias=%q tenant=%q status=%q total=%s deadline_in=%s", ns, alias, tenantID, AuthCheckReady, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+		return AuthCheckResult{Status: AuthCheckReady}
+	}
+	if IsTransientAuthProviderError(err) {
+		debugf("graph.AuthCheck result ns=%q alias=%q tenant=%q status=%q reason=transient_provider err=%v total=%s deadline_in=%s", ns, alias, tenantID, AuthCheckTransient, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+		return AuthCheckResult{Status: AuthCheckTransient, Reason: "transient_provider", Err: NewTransientAuthProviderError(err)}
+	}
+	debugf("graph.AuthCheck result ns=%q alias=%q tenant=%q status=%q reason=silent_token_failed err=%v total=%s deadline_in=%s", ns, alias, tenantID, AuthCheckNeedsInteractive, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	return AuthCheckResult{Status: AuthCheckNeedsInteractive, Reason: "silent_token_failed", Err: err}
+}
+
+// NeedsInteractive checks quickly (non-interactive) whether a device flow is required.
+func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, scopes []string) bool {
+	return m.AuthCheck(ctx, alias, tenantID, scopes).Status == AuthCheckNeedsInteractive
 }
 
 // Client returns a ready-to-use GraphServiceClient with given scopes.
@@ -315,24 +441,8 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 	}
 	debugf("graph.acquireCredential start ns=%q alias=%q tenant=%q deadline_in=%s", ns, alias, tenantID, debugDeadline(ctx))
 	// afs-only I/O: use recURL; skip local path
-	var rec azidentity.AuthenticationRecord
-	haveRec := false
-	var recordBytes int
-	var openErr, readErr, unmarshalErr error
-	recordStart := time.Now()
-	if rc, err := afs.New().OpenURL(ctx, m.authRecordURL(ns, alias)); err == nil && rc != nil {
-		if data, rerr := io.ReadAll(rc); rerr == nil {
-			recordBytes = len(data)
-			unmarshalErr = json.Unmarshal(data, &rec)
-			haveRec = unmarshalErr == nil
-		} else {
-			readErr = rerr
-		}
-		_ = rc.Close()
-	} else {
-		openErr = err
-	}
-	debugf("graph.acquireCredential auth_record ns=%q alias=%q tenant=%q haveRec=%v bytes=%d openErr=%v readErr=%v unmarshalErr=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, haveRec, recordBytes, openErr, readErr, unmarshalErr, time.Since(recordStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	record := m.loadAuthRecord(ctx, ns, alias)
+	debugf("graph.acquireCredential auth_record ns=%q alias=%q tenant=%q haveRec=%v bytes=%d openErr=%v readErr=%v unmarshalErr=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, record.haveRecord, record.bytes, record.openErr, record.readErr, record.unmarshalErr, record.elapsed.Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 
 	// Persist tokens via azidentity/cache (Keychain on macOS).
 	// Always provide a prompt callback (to avoid SDK printing to stdout and
@@ -348,8 +458,8 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 		ClientID:   m.clientID,
 		UserPrompt: userPrompt,
 	}
-	if haveRec {
-		opts.AuthenticationRecord = rec
+	if record.haveRecord {
+		opts.AuthenticationRecord = record.record
 	}
 	m.applyTokenCache(opts)
 	cred, err := azidentity.NewDeviceCodeCredential(opts)
@@ -358,20 +468,24 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 		return nil, azidentity.AuthenticationRecord{}, err
 	}
 
-	if haveRec {
-		// Try a quick silent token preflight. If it fails, fall back to interactive flow
-		// (this will invoke the prompt with a device code), then persist a fresh record.
+	if record.haveRecord {
+		// Try a quick silent token preflight. Transient provider/network failures are
+		// returned as retryable errors; auth failures fall back to device-code login.
 		tctx, cancel := context.WithTimeout(ctx, silentTokenTimeout)
 		_, preErr := cred.GetToken(tctx, policy.TokenRequestOptions{Scopes: scopes})
 		cancel()
 		debugf("graph.acquireCredential silent_preflight ns=%q alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, preErr, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 		if preErr != nil {
-			rec, err = cred.Authenticate(ctx, &policy.TokenRequestOptions{Scopes: scopes})
+			if IsTransientAuthProviderError(preErr) {
+				debugf("graph.acquireCredential transient_preflight ns=%q alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, preErr, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+				return nil, azidentity.AuthenticationRecord{}, NewTransientAuthProviderError(preErr)
+			}
+			record.record, err = cred.Authenticate(ctx, &policy.TokenRequestOptions{Scopes: scopes})
 			if err != nil {
 				debugf("graph.acquireCredential authenticate_error ns=%q alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 				return nil, azidentity.AuthenticationRecord{}, err
 			}
-			if b, err := json.Marshal(rec); err == nil {
+			if b, err := json.Marshal(record.record); err == nil {
 				recURL := m.authRecordURL(ns, alias)
 				_ = afs.New().Upload(ctx, recURL, 0o600, bytes.NewReader(b))
 				// removed log.Printf diagnostics
@@ -380,12 +494,12 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 		}
 	} else {
 		// No record: perform interactive device login and persist record.
-		rec, err = cred.Authenticate(ctx, &policy.TokenRequestOptions{Scopes: scopes})
+		record.record, err = cred.Authenticate(ctx, &policy.TokenRequestOptions{Scopes: scopes})
 		if err != nil {
 			debugf("graph.acquireCredential authenticate_error ns=%q alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 			return nil, azidentity.AuthenticationRecord{}, err
 		}
-		if b, err := json.Marshal(rec); err == nil {
+		if b, err := json.Marshal(record.record); err == nil {
 			recURL := m.authRecordURL(ns, alias)
 			_ = afs.New().Upload(ctx, recURL, 0o600, bytes.NewReader(b))
 			// removed log.Printf diagnostics
@@ -393,7 +507,7 @@ func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string,
 		debugf("graph.acquireCredential authenticate_ok ns=%q alias=%q tenant=%q elapsed=%s deadline_in=%s", ns, alias, tenantID, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 	}
 	debugf("graph.acquireCredential done ns=%q alias=%q tenant=%q elapsed=%s deadline_in=%s", ns, alias, tenantID, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-	return cred, rec, nil
+	return cred, record.record, nil
 }
 
 func outlookDebug() bool {

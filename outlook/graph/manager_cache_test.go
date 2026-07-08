@@ -2,6 +2,8 @@ package graph
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,6 +26,53 @@ func TestNeedsInteractiveWithoutAuthRecord(t *testing.T) {
 	m := NewManager("client-id", t.TempDir())
 	if !m.NeedsInteractive(context.Background(), "personal", "consumers", []string{"scope"}) {
 		t.Fatalf("expected missing auth record to require interactive auth")
+	}
+}
+
+func TestAuthCheckWithoutAuthRecord(t *testing.T) {
+	m := NewManager("client-id", t.TempDir())
+	result := m.AuthCheck(context.Background(), "personal", "consumers", []string{"scope"})
+	if result.Status != AuthCheckNeedsInteractive {
+		t.Fatalf("unexpected status: got %q want %q", result.Status, AuthCheckNeedsInteractive)
+	}
+	if result.Reason != "no_usable_auth_record" {
+		t.Fatalf("unexpected reason: %q", result.Reason)
+	}
+}
+
+func TestAuthCheckWithCorruptAuthRecordNeedsInteractive(t *testing.T) {
+	storageDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(storageDir, "default_personal_auth_record.json"), []byte(`{not-json`), 0o600); err != nil {
+		t.Fatalf("failed to write auth record: %v", err)
+	}
+	m := NewManager("client-id", storageDir)
+	result := m.AuthCheck(context.Background(), "personal", "consumers", []string{"scope"})
+	if result.Status != AuthCheckNeedsInteractive {
+		t.Fatalf("unexpected status: got %q want %q", result.Status, AuthCheckNeedsInteractive)
+	}
+}
+
+func TestIsTransientAuthProviderError(t *testing.T) {
+	tests := []error{
+		context.DeadlineExceeded,
+		&net.DNSError{Err: "no such host", Name: "login.microsoftonline.com"},
+		fmt.Errorf("unable to resolve an endpoint: server response error: %w", context.DeadlineExceeded),
+		fmt.Errorf("Post %q: i/o timeout", "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"),
+	}
+	for _, err := range tests {
+		if !IsTransientAuthProviderError(err) {
+			t.Fatalf("expected transient auth provider error for %v", err)
+		}
+	}
+}
+
+func TestTransientAuthProviderErrorMessageIsSanitized(t *testing.T) {
+	err := NewTransientAuthProviderError(fmt.Errorf("raw provider detail"))
+	if got := UserMessageForAuthError(err); got != TransientAuthProviderMessage {
+		t.Fatalf("unexpected message: got %q want %q", got, TransientAuthProviderMessage)
+	}
+	if got := err.Error(); got != TransientAuthProviderMessage {
+		t.Fatalf("unexpected error string: got %q want %q", got, TransientAuthProviderMessage)
 	}
 }
 
