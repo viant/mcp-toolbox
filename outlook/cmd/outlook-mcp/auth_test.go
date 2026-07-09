@@ -3,8 +3,10 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
+	flags "github.com/jessevdk/go-flags"
 	"github.com/viant/mcp-protocol/authorization"
 )
 
@@ -40,5 +42,39 @@ func TestPassiveBearerAuthorizerAllowsMissingAuthorization(t *testing.T) {
 	next.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/mcp", nil))
 	if !called {
 		t.Fatal("expected next handler to be called")
+	}
+}
+
+func TestOptionsParsesNamespaceClaimKeysFlag(t *testing.T) {
+	var opts Options
+	if _, err := flags.NewParser(&opts, flags.Default).ParseArgs([]string{"--namespace-claim-keys", "sub,email"}); err != nil {
+		t.Fatalf("failed to parse options: %v", err)
+	}
+	if got, want := opts.NamespaceClaimKeys, "sub,email"; got != want {
+		t.Fatalf("unexpected namespace claim keys option: got %q want %q", got, want)
+	}
+}
+
+func TestServiceConfigFromOptionsParsesNamespaceClaimKeys(t *testing.T) {
+	cfg := serviceConfigFromOptions(Options{NamespaceClaimKeys: " sub, email "}, "http://localhost:7788")
+	if !slices.Equal(cfg.NamespaceClaimKeys, []string{"sub", "email"}) {
+		t.Fatalf("unexpected namespace claim keys: got %v", cfg.NamespaceClaimKeys)
+	}
+}
+
+func TestServiceConfigFromOptionsDoesNotUseNamespaceClaimEnvFallback(t *testing.T) {
+	t.Setenv("OUTLOOK_NAMESPACE_CLAIM_KEYS", "sub,email")
+	cfg := serviceConfigFromOptions(Options{}, "http://localhost:7788")
+	if !slices.Equal(cfg.NamespaceClaimKeys, []string{"email", "sub"}) {
+		t.Fatalf("unexpected namespace claim keys: got %v", cfg.NamespaceClaimKeys)
+	}
+}
+
+func TestApplyOptionDefaultsDoesNotUseNamespaceClaimEnvFallback(t *testing.T) {
+	t.Setenv("OUTLOOK_NAMESPACE_CLAIM_KEYS", "sub,email")
+	opts := Options{}
+	applyOptionDefaults(&opts)
+	if opts.NamespaceClaimKeys != "" {
+		t.Fatalf("unexpected namespace claim keys option from env fallback: got %q", opts.NamespaceClaimKeys)
 	}
 }

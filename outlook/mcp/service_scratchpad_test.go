@@ -29,6 +29,68 @@ func TestServiceScratchpadUserIDFromContextUsesTokenIdentity(t *testing.T) {
 	}
 }
 
+func TestServiceScratchpadUserIDFromContextUsesSubjectNamespace(t *testing.T) {
+	svc := NewService(&Config{ScratchpadUserID: "fallback", NamespaceClaimKeys: []string{"sub", "email"}})
+	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
+		"email": "alice@example.com",
+		"sub":   "alice-subject",
+	}))
+
+	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice-subject"; got != want {
+		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+	}
+	if got, want := afsscratchpad.UserIDFromContext(svc.withScratchpadUser(ctx)), "alice-subject"; got != want {
+		t.Fatalf("unexpected context scratchpad user id: got %q want %q", got, want)
+	}
+}
+
+func TestServiceScratchpadUserIDFromContextSubjectNamespaceFallsBackToEmail(t *testing.T) {
+	svc := NewService(&Config{ScratchpadUserID: "fallback", NamespaceClaimKeys: []string{"sub", "email"}})
+	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
+		"email": "alice@example.com",
+	}))
+
+	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice@example.com"; got != want {
+		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+	}
+}
+
+func TestServiceWiresNamespaceClaimKeysToScratchpadAndGraphManager(t *testing.T) {
+	storageDir := t.TempDir()
+	svc := NewService(&Config{
+		SecretsBase:        storageDir,
+		ScratchpadUserID:   "fallback",
+		NamespaceClaimKeys: []string{"sub", "email"},
+	})
+	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
+		"email": "alice@example.com",
+		"sub":   "alice-subject",
+	}))
+
+	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice-subject"; got != want {
+		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+	}
+
+	subjectRecord := filepath.Join(storageDir, "alice-subject_personal_auth_record.json")
+	if err := os.WriteFile(subjectRecord, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("failed to write subject auth record: %v", err)
+	}
+	if !svc.graphMgr.HasAuthRecord(ctx, "personal") {
+		t.Fatal("expected graph manager to use subject namespace from service config")
+	}
+
+	if err := os.Remove(subjectRecord); err != nil {
+		t.Fatalf("failed to remove subject auth record: %v", err)
+	}
+	emailRecord := filepath.Join(storageDir, "alice_example.com_personal_auth_record.json")
+	if err := os.WriteFile(emailRecord, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("failed to write email auth record: %v", err)
+	}
+	if svc.graphMgr.HasAuthRecord(ctx, "personal") {
+		t.Fatal("expected graph manager not to fall back to email while subject claim is present")
+	}
+}
+
 func TestServiceScratchpadUserIDFromContextFallback(t *testing.T) {
 	svc := NewService(&Config{ScratchpadUserID: "fallback"})
 

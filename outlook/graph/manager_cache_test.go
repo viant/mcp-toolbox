@@ -2,6 +2,8 @@ package graph
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
+	"github.com/viant/mcp-protocol/authorization"
 )
 
 func TestClientCacheKeyNormalization(t *testing.T) {
@@ -52,6 +55,46 @@ func TestAuthCheckWithCorruptAuthRecordNeedsInteractive(t *testing.T) {
 	}
 }
 
+func TestManagerAuthRecordNamespaceDefaultsToEmail(t *testing.T) {
+	storageDir := t.TempDir()
+	m := NewManager("client-id", storageDir)
+	ctx := graphContextWithBearer(context.Background(), graphTestJWT(t, map[string]any{
+		"email": "alice@example.com",
+		"sub":   "alice-subject",
+	}))
+
+	d, err := m.ns.Namespace(ctx)
+	if err != nil {
+		t.Fatalf("failed to resolve namespace: %v", err)
+	}
+	if got, want := d.Name, "alice@example.com"; got != want {
+		t.Fatalf("unexpected namespace: got %q want %q", got, want)
+	}
+	if got, want := m.authRecordURL(d.Name, "personal"), filepath.Join(storageDir, "alice_example.com_personal_auth_record.json"); got != want {
+		t.Fatalf("unexpected auth record URL: got %q want %q", got, want)
+	}
+}
+
+func TestManagerAuthRecordNamespaceCanUseSubject(t *testing.T) {
+	storageDir := t.TempDir()
+	m := NewManagerWithNamespaceClaimKeys("client-id", storageDir, []string{"sub", "email"})
+	ctx := graphContextWithBearer(context.Background(), graphTestJWT(t, map[string]any{
+		"email": "alice@example.com",
+		"sub":   "alice-subject",
+	}))
+
+	d, err := m.ns.Namespace(ctx)
+	if err != nil {
+		t.Fatalf("failed to resolve namespace: %v", err)
+	}
+	if got, want := d.Name, "alice-subject"; got != want {
+		t.Fatalf("unexpected namespace: got %q want %q", got, want)
+	}
+	if got, want := m.authRecordURL(d.Name, "personal"), filepath.Join(storageDir, "alice-subject_personal_auth_record.json"); got != want {
+		t.Fatalf("unexpected auth record URL: got %q want %q", got, want)
+	}
+}
+
 func TestIsTransientAuthProviderError(t *testing.T) {
 	tests := []error{
 		context.DeadlineExceeded,
@@ -64,6 +107,22 @@ func TestIsTransientAuthProviderError(t *testing.T) {
 			t.Fatalf("expected transient auth provider error for %v", err)
 		}
 	}
+}
+
+func graphContextWithBearer(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, authorization.TokenKey, &authorization.Token{Token: "Bearer " + token})
+}
+
+func graphTestJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	encode := func(v any) string {
+		data, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("failed to marshal jwt part: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(data)
+	}
+	return encode(map[string]any{"alg": "none", "typ": "JWT"}) + "." + encode(claims) + "."
 }
 
 func TestTransientAuthProviderErrorMessageIsSanitized(t *testing.T) {

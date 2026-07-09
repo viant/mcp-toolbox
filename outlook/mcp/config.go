@@ -1,8 +1,12 @@
 package mcp
 
 import (
+	"strings"
+
 	"github.com/viant/scy"
 )
+
+var defaultNamespaceClaimKeys = []string{"email", "sub"}
 
 // Config controls Outlook MCP server behaviour and authentication.
 type Config struct {
@@ -24,6 +28,8 @@ type Config struct {
 	AttachmentSourceSchemes []string `json:"attachmentSourceSchemes,omitempty"`
 	// ScratchpadTargetSchemes restricts the underlying sourceURL schemes after scratchpad artifact resolution.
 	ScratchpadTargetSchemes []string `json:"scratchpadTargetSchemes,omitempty"`
+	// NamespaceClaimKeys is wired from the CLI flag and controls JWT identity claim lookup order.
+	NamespaceClaimKeys []string `json:"-"`
 
 	// CallbackBaseURL is used to generate absolute URLs for OOB flows.
 	// Example: http://localhost:7788
@@ -42,4 +48,25 @@ type Config struct {
 	//  - AWS secret:    "aws://secretmanager/us-west-2/secret/prod/azure-cred|blowfish://default"
 	// The referenced content should unmarshal into github.com/viant/scy/cred.Azure.
 	AzureRef scy.EncodedResource `json:"azureRef,omitempty"`
+}
+
+func ParseNamespaceClaimKeys(value string) []string {
+	return NormalizeNamespaceClaimKeys(strings.Split(value, ","))
+}
+
+func NormalizeNamespaceClaimKeys(keys []string) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, key)
+	}
+	if len(result) == 0 {
+		return append([]string(nil), defaultNamespaceClaimKeys...)
+	}
+	return result
 }

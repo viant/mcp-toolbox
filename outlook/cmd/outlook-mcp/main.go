@@ -36,6 +36,7 @@ type Options struct {
 	ScratchpadUserID        string `long:"scratchpad-user-id" description:"Fallback user id for local/no-auth scratchpad attachment resolution"`
 	AttachmentSourceSchemes string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty allows all"`
 	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Comma-separated allowed underlying artifact source schemes after scratchpad resolution"`
+	NamespaceClaimKeys      string `long:"namespace-claim-keys" description:"Comma-separated JWT identity claim lookup order for per-user namespaces (default: email,sub)"`
 }
 
 func main() {
@@ -44,34 +45,24 @@ func main() {
 	if _, err := flags.NewParser(&opts, flags.Default).Parse(); err != nil {
 		os.Exit(2)
 	}
-	// Apply simple defaults and env fallbacks
-	if opts.SecretsBase == "" {
-		opts.SecretsBase = "mem://localhost/mcp-outlook"
-	}
-	if opts.TenantID == "" {
-		opts.TenantID = envOr("OUTLOOK_TENANT_ID", "organizations")
-	}
-	if opts.ClientID == "" {
-		opts.ClientID = envOr("OUTLOOK_CLIENT_ID", "")
-	}
-	if opts.AzureRef == "" {
-		opts.AzureRef = envOr("OUTLOOK_AZURE_REF", "")
-	}
-	if opts.ScratchpadRootURI == "" {
-		opts.ScratchpadRootURI = envOr("OUTLOOK_SCRATCHPAD_ROOT_URI", "")
-	}
-	if opts.ScratchpadUserID == "" {
-		opts.ScratchpadUserID = envOr("OUTLOOK_SCRATCHPAD_USER_ID", "")
-	}
-	if opts.AttachmentSourceSchemes == "" {
-		opts.AttachmentSourceSchemes = envOr("OUTLOOK_ATTACHMENT_SOURCE_SCHEMES", "")
-	}
-	if opts.ScratchpadTargetSchemes == "" {
-		opts.ScratchpadTargetSchemes = envOr("OUTLOOK_SCRATCHPAD_TARGET_SCHEMES", "")
-	}
+	applyOptionDefaults(&opts)
 	if opts.ClientID == "" && opts.AzureRef == "" {
 		log.Fatal("missing --client-id/OUTLOOK_CLIENT_ID (or provide --azure-ref / OUTLOOK_AZURE_REF)")
 	}
+	debugf("startup options addr=%q tenant=%q client_id_set=%t azure_ref_set=%t oauth2config_set=%t public_base_url_set=%t secrets_base_set=%t scratchpad_root_set=%t scratchpad_user_id_set=%t attachment_source_schemes=%q scratchpad_target_schemes=%q namespace_claim_keys=%q",
+		opts.HTTPAddr,
+		opts.TenantID,
+		strings.TrimSpace(opts.ClientID) != "",
+		strings.TrimSpace(opts.AzureRef) != "",
+		strings.TrimSpace(opts.Oauth2Config) != "",
+		strings.TrimSpace(opts.PublicBaseURL) != "",
+		strings.TrimSpace(opts.SecretsBase) != "",
+		strings.TrimSpace(opts.ScratchpadRootURI) != "",
+		strings.TrimSpace(opts.ScratchpadUserID) != "",
+		opts.AttachmentSourceSchemes,
+		opts.ScratchpadTargetSchemes,
+		opts.NamespaceClaimKeys,
+	)
 
 	// Derive callback base URL from listen address.
 	baseURL := strings.TrimRight(strings.TrimSpace(opts.PublicBaseURL), "/")
@@ -104,17 +95,7 @@ func main() {
 		}
 	}
 
-	svc := mcp.NewService(&mcp.Config{
-		ClientID:                opts.ClientID,
-		TenantID:                opts.TenantID,
-		SecretsBase:             strings.Replace(opts.SecretsBase, "$HOME", os.Getenv("HOME"), 1),
-		CallbackBaseURL:         baseURL,
-		AzureRef:                scy.EncodedResource(opts.AzureRef),
-		ScratchpadRootURI:       strings.Replace(opts.ScratchpadRootURI, "$HOME", os.Getenv("HOME"), 1),
-		ScratchpadUserID:        opts.ScratchpadUserID,
-		AttachmentSourceSchemes: splitCSV(opts.AttachmentSourceSchemes),
-		ScratchpadTargetSchemes: splitCSV(opts.ScratchpadTargetSchemes),
-	})
+	svc := mcp.NewService(serviceConfigFromOptions(opts, baseURL))
 
 	// Protected resource metadata for hosts that support OAuth2 challenge (future use)
 	//protected := &authorization.Policy{
@@ -148,6 +129,7 @@ func main() {
 
 	// Optional server-level OAuth2
 	if v := strings.TrimSpace(opts.Oauth2Config); v != "" {
+		debugf("authorizer mode=server_oauth2 oauth2config_set=true use_id_token=%t", opts.UseIdToken)
 		res := scy.EncodedResource(v).Decode(context.Background(), cred.Oauth2Config{})
 		sec, err := scy.New().Load(context.Background(), res)
 		if err != nil {
@@ -214,6 +196,7 @@ func main() {
 			mcpsrv.WithProtectedResourcesHandler(authSvc.ProtectedResourcesHandler),
 		)
 	} else {
+		debugf("authorizer mode=passive_bearer oauth2config_set=false")
 		options = append(options, mcpsrv.WithAuthorizer(passiveBearerAuthorizer))
 	}
 
@@ -237,6 +220,33 @@ func envOr(k, def string) string {
 	return def
 }
 
+func applyOptionDefaults(opts *Options) {
+	if opts.SecretsBase == "" {
+		opts.SecretsBase = "mem://localhost/mcp-outlook"
+	}
+	if opts.TenantID == "" {
+		opts.TenantID = envOr("OUTLOOK_TENANT_ID", "organizations")
+	}
+	if opts.ClientID == "" {
+		opts.ClientID = envOr("OUTLOOK_CLIENT_ID", "")
+	}
+	if opts.AzureRef == "" {
+		opts.AzureRef = envOr("OUTLOOK_AZURE_REF", "")
+	}
+	if opts.ScratchpadRootURI == "" {
+		opts.ScratchpadRootURI = envOr("OUTLOOK_SCRATCHPAD_ROOT_URI", "")
+	}
+	if opts.ScratchpadUserID == "" {
+		opts.ScratchpadUserID = envOr("OUTLOOK_SCRATCHPAD_USER_ID", "")
+	}
+	if opts.AttachmentSourceSchemes == "" {
+		opts.AttachmentSourceSchemes = envOr("OUTLOOK_ATTACHMENT_SOURCE_SCHEMES", "")
+	}
+	if opts.ScratchpadTargetSchemes == "" {
+		opts.ScratchpadTargetSchemes = envOr("OUTLOOK_SCRATCHPAD_TARGET_SCHEMES", "")
+	}
+}
+
 func splitCSV(value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -249,6 +259,29 @@ func splitCSV(value string) []string {
 		}
 	}
 	return result
+}
+
+func serviceConfigFromOptions(opts Options, baseURL string) *mcp.Config {
+	return &mcp.Config{
+		ClientID:                opts.ClientID,
+		TenantID:                opts.TenantID,
+		SecretsBase:             strings.Replace(opts.SecretsBase, "$HOME", os.Getenv("HOME"), 1),
+		CallbackBaseURL:         baseURL,
+		AzureRef:                scy.EncodedResource(opts.AzureRef),
+		ScratchpadRootURI:       strings.Replace(opts.ScratchpadRootURI, "$HOME", os.Getenv("HOME"), 1),
+		ScratchpadUserID:        opts.ScratchpadUserID,
+		AttachmentSourceSchemes: splitCSV(opts.AttachmentSourceSchemes),
+		ScratchpadTargetSchemes: splitCSV(opts.ScratchpadTargetSchemes),
+		NamespaceClaimKeys:      mcp.ParseNamespaceClaimKeys(opts.NamespaceClaimKeys),
+	}
+}
+
+func debugf(format string, args ...any) {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("OUTLOOK_MCP_DEBUG")))
+	if v == "" || v == "0" || v == "false" {
+		return
+	}
+	log.Printf("[outlook-debug] "+format, args...)
 }
 
 func defaultStorageDir() string {

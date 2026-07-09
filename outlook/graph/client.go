@@ -145,14 +145,39 @@ func IsTransientAuthProviderError(err error) bool {
 }
 
 func NewManager(clientID, storageDir string) *Manager {
+	return newManager(clientID, storageDir, nil)
+}
+
+func NewManagerWithNamespaceClaimKeys(clientID, storageDir string, namespaceClaimKeys []string) *Manager {
+	return newManager(clientID, storageDir, normalizeNamespaceClaimKeys(namespaceClaimKeys))
+}
+
+func newManager(clientID, storageDir string, claimKeys []string) *Manager {
 	return &Manager{
 		clientID:   clientID,
 		storageDir: storageDir,
-		ns:         nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
+		ns:         nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: claimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
 		clients:    map[string]*msgraphsdk.GraphServiceClient{},
 		creds:      map[string]*azidentity.DeviceCodeCredential{},
 		waiters:    map[string][]chan struct{}{},
 	}
+}
+
+func normalizeNamespaceClaimKeys(keys []string) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, key)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (m *Manager) authRecordPath(ns, alias string) string {

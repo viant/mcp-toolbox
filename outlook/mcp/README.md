@@ -74,6 +74,31 @@ export OUTLOOK_AZURE_REF='gcp://secretmanager/projects/myproj/secrets/azure-cred
 go run ./outlook/cmd/outlook-mcp -addr :7788 -storage "$HOME/.config/mcp-outlook"
 ```
 
+### Namespace claim order
+
+By default, per-user namespaces for Outlook auth records and scratchpad attachments
+use JWT claims in `email,sub` order. To match artifact tools that write
+scratchpad entries under the JWT subject claim, pass:
+
+```
+go run ./outlook/cmd/outlook-mcp \
+  --addr :7788 \
+  --client-id "00000000-0000-0000-0000-000000000000" \
+  --tenant-id consumers \
+  --secretsBase file://$HOME/.mcp/outlook \
+  --oauth2config 'idp_viant.enc|blowfish://default' \
+  --use-id-token \
+  --scratchpad-root-uri 'file:///Users/pol-mfilipowicz/agently/runtime/scratchpad/${userID}' \
+  --attachment-source-schemes scratchpad \
+  --scratchpad-target-schemes gs \
+  --namespace-claim-keys sub,email
+```
+
+Artifact MCP and Outlook MCP must use the same claim order. Switching from
+email-based namespaces to subject-based namespaces creates new Outlook auth
+record names, so sign in once again after changing this flag. There is no
+environment variable fallback for `--namespace-claim-keys`.
+
 ### GCS attachment source URLs
 
 `outlookSendMail` can read attachments from `gs://...` source URLs. The Outlook

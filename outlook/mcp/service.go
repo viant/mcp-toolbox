@@ -79,10 +79,11 @@ func NewService(cfg *Config) *Service {
 	graph.ConfigureAttachmentSources(graph.AttachmentSourceConfig{
 		AllowedSourceSchemes: cfg.AttachmentSourceSchemes,
 	})
+	namespaceClaimKeys := NormalizeNamespaceClaimKeys(cfg.NamespaceClaimKeys)
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
 	s := &Service{
-		graphMgr:         graph.NewManager(clientID, cfg.SecretsBase),
+		graphMgr:         graph.NewManagerWithNamespaceClaimKeys(clientID, cfg.SecretsBase, namespaceClaimKeys),
 		baseURL:          cfg.CallbackBaseURL,
 		useText:          useText,
 		pending:          NewPendingAuths(),
@@ -96,7 +97,7 @@ func NewService(cfg *Config) *Service {
 		elicited:         map[string]time.Time{},
 		elicitedGlobal:   map[string]time.Time{},
 	}
-	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
+	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: namespaceClaimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
 	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" || strings.TrimSpace(cfg.ScratchpadUserID) != "" {
 		afsscratchpad.Register(
 			afsscratchpad.WithRootURI(cfg.ScratchpadRootURI),
