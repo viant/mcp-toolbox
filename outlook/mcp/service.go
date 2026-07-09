@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,13 +18,14 @@ import (
 
 	"sync"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	afsscratchpad "github.com/viant/afs/scratchpad"
 	oa "github.com/viant/mcp-toolbox/auth"
 	"github.com/viant/mcp-toolbox/outlook/graph"
 	nsprov "github.com/viant/mcp/server/namespace"
 	"github.com/viant/scy"
 	"github.com/viant/scy/cred"
+	"golang.org/x/oauth2"
 )
 
 // Service wires graph manager and optional UI/secret helpers.
@@ -30,19 +33,22 @@ type Service struct {
 	graphMgr *graph.Manager
 	baseURL  string
 	// ui/secrets can be added when we introduce OOB UI forms later.
-	useText          bool
-	pending          *PendingAuths
-	auth             *oa.Service
-	ns               *nsprov.DefaultProvider
-	azure            *cred.Azure
-	tenantID         string
-	clientID         string
-	secretsBase      string
-	scratchpadUserID string
+	useText           bool
+	pending           *PendingAuths
+	auth              *oa.Service
+	ns                *nsprov.DefaultProvider
+	azure             *cred.Azure
+	tenantID          string
+	clientID          string
+	secretsBase       string
+	scratchpadUserID  string
+	authFlow          graph.AuthFlow
+	oauthRedirectPath string
+	graphScopes       []string
 
-	// service-level lazy cache of DeviceCodeCredential per namespace+alias
+	// service-level lazy cache of Graph token credentials per namespace+alias
 	credMu sync.RWMutex
-	creds  map[string]*azidentity.DeviceCodeCredential
+	creds  map[string]azcore.TokenCredential
 
 	// Elicitation dedupe per session and globally (alias+tenant)
 	elicitMu       sync.Mutex
@@ -76,26 +82,44 @@ func NewService(cfg *Config) *Service {
 		clientID = az.ClientID
 	}
 	tenantID := cfg.TenantID
+	authFlow := graph.NormalizeAuthFlow(cfg.AuthFlow)
+	redirectPath := normalizeOAuthRedirectPath(cfg.OAuthRedirectPath)
+	graphScopes := normalizeGraphScopes(cfg.GraphScopes)
 	graph.ConfigureAttachmentSources(graph.AttachmentSourceConfig{
 		AllowedSourceSchemes: cfg.AttachmentSourceSchemes,
 	})
 	namespaceClaimKeys := NormalizeNamespaceClaimKeys(cfg.NamespaceClaimKeys)
+	redirectURL := ""
+	if strings.TrimSpace(cfg.CallbackBaseURL) != "" {
+		redirectURL = strings.TrimRight(cfg.CallbackBaseURL, "/") + redirectPath
+	}
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
 	s := &Service{
-		graphMgr:         graph.NewManagerWithNamespaceClaimKeys(clientID, cfg.SecretsBase, namespaceClaimKeys),
-		baseURL:          cfg.CallbackBaseURL,
-		useText:          useText,
-		pending:          NewPendingAuths(),
-		auth:             oa.New(),
-		azure:            az,
-		tenantID:         tenantID,
-		clientID:         clientID,
-		secretsBase:      cfg.SecretsBase,
-		scratchpadUserID: strings.TrimSpace(cfg.ScratchpadUserID),
-		creds:            map[string]*azidentity.DeviceCodeCredential{},
-		elicited:         map[string]time.Time{},
-		elicitedGlobal:   map[string]time.Time{},
+		graphMgr: graph.NewManagerWithConfig(&graph.ManagerConfig{
+			ClientID:           clientID,
+			StorageDir:         cfg.SecretsBase,
+			NamespaceClaimKeys: namespaceClaimKeys,
+			AuthFlow:           authFlow,
+			Authority:          cfg.Authority,
+			OAuthRedirectURL:   redirectURL,
+			OAuthScopes:        graphScopes,
+		}),
+		baseURL:           cfg.CallbackBaseURL,
+		useText:           useText,
+		pending:           NewPendingAuths(),
+		auth:              oa.New(),
+		azure:             az,
+		tenantID:          tenantID,
+		clientID:          clientID,
+		secretsBase:       cfg.SecretsBase,
+		scratchpadUserID:  strings.TrimSpace(cfg.ScratchpadUserID),
+		authFlow:          authFlow,
+		oauthRedirectPath: redirectPath,
+		graphScopes:       graphScopes,
+		creds:             map[string]azcore.TokenCredential{},
+		elicited:          map[string]time.Time{},
+		elicitedGlobal:    map[string]time.Time{},
 	}
 	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: namespaceClaimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
 	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" || strings.TrimSpace(cfg.ScratchpadUserID) != "" {
@@ -119,6 +143,33 @@ func (s *Service) RegisterHTTP(mux *http.ServeMux) {
 	mux.HandleFunc("/outlook/auth/start", s.DeviceStartHandler())
 	mux.HandleFunc("/outlook/auth/check", s.DeviceCheckHandler())
 	mux.HandleFunc("/outlook/auth/reset", s.DeviceResetHandler())
+	mux.HandleFunc(s.oauthRedirectPath, s.OAuthCallbackHandler())
+}
+
+func normalizeOAuthRedirectPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "/outlook/auth/callback"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return path
+}
+
+func normalizeGraphScopes(scopes []string) []string {
+	return graph.ParseScopes(strings.Join(scopes, ","))
+}
+
+func randomURLToken(bytesLen int) (string, error) {
+	if bytesLen <= 0 {
+		bytesLen = 32
+	}
+	data := make([]byte, bytesLen)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
 // DeviceHandler serves the device login page for a pending auth UUID.
@@ -277,7 +328,7 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
 		}
-		scopes := graph.DefaultScopes()
+		scopes := s.GraphScopes()
 		check := s.graphMgr.AuthCheck(r.Context(), alias, tenant, scopes)
 		if check.Status == graph.AuthCheckTransient {
 			http.Error(w, graph.UserMessageForAuthError(check.Err), http.StatusServiceUnavailable)
@@ -314,6 +365,55 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 	}
 }
 
+func (s *Service) OAuthCallbackHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		state := strings.TrimSpace(r.URL.Query().Get("state"))
+		if state == "" {
+			http.Error(w, "state required", http.StatusBadRequest)
+			return
+		}
+		session, ok := s.pending.GetByState(state)
+		if !ok {
+			http.Error(w, "unknown or expired Outlook sign-in state", http.StatusBadRequest)
+			return
+		}
+		s.pending.ClearState(state)
+		if providerErr := strings.TrimSpace(r.URL.Query().Get("error")); providerErr != "" {
+			message := providerErr
+			if desc := strings.TrimSpace(r.URL.Query().Get("error_description")); desc != "" {
+				message += ": " + desc
+			}
+			s.pending.Fail(session.UUID, message)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML(message))
+			return
+		}
+		code := strings.TrimSpace(r.URL.Query().Get("code"))
+		if code == "" {
+			s.pending.Fail(session.UUID, "authorization code is required")
+			http.Error(w, "authorization code required", http.StatusBadRequest)
+			return
+		}
+		if err := s.graphMgr.ExchangeAuthCode(r.Context(), session.Namespace, session.Alias, session.TenantID, session.Scopes, code, session.CodeVerifier); err != nil {
+			message := graph.UserMessageForAuthError(err)
+			if message == "" {
+				message = err.Error()
+			}
+			s.pending.Fail(session.UUID, message)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, buildDeviceLoginErrorHTML(message))
+			return
+		}
+		s.pending.Complete(session.UUID)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, buildDeviceLoginSuccessHTML())
+	}
+}
+
 // DeviceCheckHandler returns whether a credential is available for alias/tenant in current namespace.
 func (s *Service) DeviceCheckHandler() http.HandlerFunc {
 	type out struct{ HasToken bool }
@@ -328,7 +428,7 @@ func (s *Service) DeviceCheckHandler() http.HandlerFunc {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
 		}
-		has := s.graphMgr.AuthCheck(r.Context(), alias, tenant, graph.DefaultScopes()).Status == graph.AuthCheckReady
+		has := s.graphMgr.AuthCheck(r.Context(), alias, tenant, s.GraphScopes()).Status == graph.AuthCheckReady
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out{HasToken: has})
 	}
@@ -353,7 +453,7 @@ func (s *Service) DeviceResetHandler() http.HandlerFunc {
 			ns = "default"
 		}
 		purge := parseBool(r.URL.Query().Get("purge"))
-		result, err := s.graphMgr.ResetAuth(r.Context(), alias, tenant, graph.DefaultScopes(), purge)
+		result, err := s.graphMgr.ResetAuth(r.Context(), alias, tenant, s.GraphScopes(), purge)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -445,13 +545,24 @@ func (s *Service) Auth() *oa.Service            { return s.auth }
 func (s *Service) TenantID() string             { return s.tenantID }
 func (s *Service) ClientID() string             { return s.clientID }
 func (s *Service) SecretsBase() string          { return s.secretsBase }
+func (s *Service) AuthFlow() graph.AuthFlow     { return s.authFlow }
+func (s *Service) OAuthRedirectPath() string    { return s.oauthRedirectPath }
+func (s *Service) GraphScopes() []string {
+	if len(s.graphScopes) > 0 {
+		return append([]string(nil), s.graphScopes...)
+	}
+	if s.authFlow == graph.AuthFlowAuthCode {
+		return graph.DefaultOAuthScopes()
+	}
+	return graph.DefaultScopes()
+}
 
 // NewOperationsHook allows passing protocol client operations if needed later.
 func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
 
-// Credential returns an azidentity.DeviceCodeCredential cached per account alias.
+// Credential returns a Graph token credential cached per account alias.
 // It delegates acquisition to the graph manager on cache miss and stores it until process restart.
-func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
+func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (azcore.TokenCredential, error) {
 	tenantID = s.normalizeTenant(tenantID)
 	dsc, _ := s.ns.Namespace(ctx)
 	ns := dsc.Name
@@ -525,6 +636,9 @@ func (s *Service) authSessionURL(session *PendingAuth) string {
 	if session == nil {
 		return ""
 	}
+	if strings.TrimSpace(session.AuthURL) != "" {
+		return session.AuthURL
+	}
 	base := strings.TrimRight(s.baseURL, "/")
 	return fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, session.UUID, session.Alias)
 }
@@ -541,6 +655,31 @@ func (s *Service) completedAuthSession(ctx context.Context, alias, tenant string
 }
 
 func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+	if s.authFlow == graph.AuthFlowAuthCode {
+		return s.startAuthCodeSession(ctx, alias, tenant, scopes)
+	}
+	return s.startDeviceAuthSession(ctx, alias, tenant, scopes)
+}
+
+func (s *Service) startAuthCodeSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+	start := time.Now()
+	tenant = s.normalizeTenant(tenant)
+	ns := s.namespace(ctx)
+	state, err := randomURLToken(32)
+	if err != nil {
+		session, _ := s.pending.GetOrCreate(ns, alias, tenant, scopes, authSessionTTL, newUUID)
+		s.pending.Fail(session.UUID, err.Error())
+		failed, _ := s.pending.Get(session.UUID)
+		return failed
+	}
+	verifier := oauth2.GenerateVerifier()
+	authURL := s.graphMgr.AuthCodeURL(tenant, scopes, state, verifier)
+	session, created := s.pending.GetOrCreateAuthCode(ns, alias, tenant, scopes, authSessionTTL, newUUID, state, verifier, authURL)
+	debugf("startAuthCodeSession ns=%q alias=%q tenant=%q created=%v session=%q elapsed=%s", ns, alias, tenant, created, session.UUID, time.Since(start).Round(time.Millisecond))
+	return session
+}
+
+func (s *Service) startDeviceAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
 	start := time.Now()
 	tenant = s.normalizeTenant(tenant)
 	ns := s.namespace(ctx)

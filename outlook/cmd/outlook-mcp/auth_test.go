@@ -8,6 +8,7 @@ import (
 
 	flags "github.com/jessevdk/go-flags"
 	"github.com/viant/mcp-protocol/authorization"
+	"github.com/viant/mcp-toolbox/outlook/graph"
 )
 
 func TestPassiveBearerAuthorizerInjectsAuthorizationToken(t *testing.T) {
@@ -55,10 +56,62 @@ func TestOptionsParsesNamespaceClaimKeysFlag(t *testing.T) {
 	}
 }
 
+func TestOptionsParsesAuthCodeFlags(t *testing.T) {
+	var opts Options
+	args := []string{
+		"--auth-flow", "auth-code",
+		"--oauth-redirect-path", "/outlook/auth/callback",
+		"--graph-scopes", "openid,offline_access,Mail.Send",
+	}
+	if _, err := flags.NewParser(&opts, flags.Default).ParseArgs(args); err != nil {
+		t.Fatalf("failed to parse options: %v", err)
+	}
+	if got, want := opts.AuthFlow, "auth-code"; got != want {
+		t.Fatalf("unexpected auth flow: got %q want %q", got, want)
+	}
+	if got, want := opts.OAuthRedirectPath, "/outlook/auth/callback"; got != want {
+		t.Fatalf("unexpected redirect path: got %q want %q", got, want)
+	}
+	if got, want := opts.GraphScopes, "openid,offline_access,Mail.Send"; got != want {
+		t.Fatalf("unexpected graph scopes: got %q want %q", got, want)
+	}
+}
+
 func TestServiceConfigFromOptionsParsesNamespaceClaimKeys(t *testing.T) {
 	cfg := serviceConfigFromOptions(Options{NamespaceClaimKeys: " sub, email "}, "http://localhost:7788")
 	if !slices.Equal(cfg.NamespaceClaimKeys, []string{"sub", "email"}) {
 		t.Fatalf("unexpected namespace claim keys: got %v", cfg.NamespaceClaimKeys)
+	}
+}
+
+func TestServiceConfigFromOptionsParsesAuthCodeConfig(t *testing.T) {
+	cfg := serviceConfigFromOptions(Options{
+		AuthFlow:          "auth-code",
+		OAuthRedirectPath: "/outlook/auth/callback",
+		GraphScopes:       "openid offline_access Mail.Send",
+	}, "http://localhost:7788")
+	if got, want := cfg.AuthFlow, string(graph.AuthFlowAuthCode); got != want {
+		t.Fatalf("unexpected auth flow: got %q want %q", got, want)
+	}
+	if got, want := cfg.OAuthRedirectPath, "/outlook/auth/callback"; got != want {
+		t.Fatalf("unexpected redirect path: got %q want %q", got, want)
+	}
+	if !slices.Equal(cfg.GraphScopes, []string{"openid", "offline_access", "Mail.Send"}) {
+		t.Fatalf("unexpected graph scopes: got %v", cfg.GraphScopes)
+	}
+}
+
+func TestApplyOptionDefaultsPreservesDeviceScopeDefault(t *testing.T) {
+	opts := Options{}
+	applyOptionDefaults(&opts)
+	if got, want := opts.AuthFlow, string(graph.AuthFlowDevice); got != want {
+		t.Fatalf("unexpected auth flow: got %q want %q", got, want)
+	}
+	if got, want := opts.OAuthRedirectPath, "/outlook/auth/callback"; got != want {
+		t.Fatalf("unexpected redirect path: got %q want %q", got, want)
+	}
+	if opts.GraphScopes != "" {
+		t.Fatalf("expected graph scopes to remain empty for default device flow, got %q", opts.GraphScopes)
 	}
 }
 

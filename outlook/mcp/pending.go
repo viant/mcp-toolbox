@@ -19,20 +19,24 @@ const (
 )
 
 type PendingAuth struct {
-	UUID       string
-	Alias      string
-	TenantID   string
-	ElicitID   string
-	Namespace  string
-	Scopes     []string
-	Key        string
-	CreatedAt  time.Time
-	ExpiresAt  time.Time
-	Status     AuthStatus
-	Message    string
-	done       chan struct{}
-	doneClosed bool
-	Error      string
+	UUID         string
+	Alias        string
+	TenantID     string
+	ElicitID     string
+	Namespace    string
+	Scopes       []string
+	Key          string
+	Flow         string
+	State        string
+	CodeVerifier string
+	AuthURL      string
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+	Status       AuthStatus
+	Message      string
+	done         chan struct{}
+	doneClosed   bool
+	Error        string
 }
 
 func (p *PendingAuth) active(now time.Time) bool {
@@ -56,17 +60,19 @@ func (p *PendingAuth) Done() <-chan struct{} {
 }
 
 type PendingAuths struct {
-	mu    sync.RWMutex
-	byID  map[string]*PendingAuth
-	byNS  map[string]map[string]*PendingAuth // ns -> uuid -> pending
-	byKey map[string]*PendingAuth
+	mu      sync.RWMutex
+	byID    map[string]*PendingAuth
+	byNS    map[string]map[string]*PendingAuth // ns -> uuid -> pending
+	byKey   map[string]*PendingAuth
+	byState map[string]*PendingAuth
 }
 
 func NewPendingAuths() *PendingAuths {
 	return &PendingAuths{
-		byID:  make(map[string]*PendingAuth),
-		byNS:  make(map[string]map[string]*PendingAuth),
-		byKey: make(map[string]*PendingAuth),
+		byID:    make(map[string]*PendingAuth),
+		byNS:    make(map[string]map[string]*PendingAuth),
+		byKey:   make(map[string]*PendingAuth),
+		byState: make(map[string]*PendingAuth),
 	}
 }
 
@@ -114,6 +120,9 @@ func (p *PendingAuths) Put(x *PendingAuth) {
 	}
 	m[x.UUID] = x
 	p.byKey[x.Key] = x
+	if x.State != "" {
+		p.byState[x.State] = x
+	}
 }
 
 func (p *PendingAuths) GetOrCreate(ns, alias, tenantID string, scopes []string, ttl time.Duration, newID func() string) (*PendingAuth, bool) {
@@ -150,6 +159,104 @@ func (p *PendingAuths) GetOrCreate(ns, alias, tenantID string, scopes []string, 
 	p.byNS[ns][id] = session
 	p.byKey[key] = session
 	return clonePendingAuth(session), true
+}
+
+func (p *PendingAuths) GetOrCreateAuthCode(ns, alias, tenantID string, scopes []string, ttl time.Duration, newID func() string, state, verifier, authURL string) (*PendingAuth, bool) {
+	now := time.Now()
+	key := authSessionKey(ns, alias, tenantID, scopes)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if existing := p.byKey[key]; existing != nil {
+		if existing.active(now) {
+			if existing.AuthURL == "" {
+				existing.Flow = "auth-code"
+				existing.State = state
+				existing.CodeVerifier = verifier
+				existing.AuthURL = authURL
+				existing.Status = AuthStatusWaitingForUser
+				if state != "" {
+					p.byState[state] = existing
+				}
+			}
+			return clonePendingAuth(existing), false
+		}
+		p.removeLocked(existing, true)
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	id := newID()
+	session := &PendingAuth{
+		UUID:         id,
+		Alias:        alias,
+		TenantID:     tenantID,
+		Namespace:    ns,
+		Scopes:       append([]string(nil), scopes...),
+		Key:          key,
+		Flow:         "auth-code",
+		State:        state,
+		CodeVerifier: verifier,
+		AuthURL:      authURL,
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(ttl),
+		Status:       AuthStatusWaitingForUser,
+		done:         make(chan struct{}, 1),
+	}
+	p.byID[id] = session
+	if p.byNS[ns] == nil {
+		p.byNS[ns] = map[string]*PendingAuth{}
+	}
+	p.byNS[ns][id] = session
+	p.byKey[key] = session
+	if state != "" {
+		p.byState[state] = session
+	}
+	return clonePendingAuth(session), true
+}
+
+func (p *PendingAuths) SetOAuthStart(uuid, state, verifier, authURL string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	x := p.byID[uuid]
+	if x == nil {
+		return
+	}
+	if x.State != "" && x.State != state {
+		delete(p.byState, x.State)
+	}
+	x.Flow = "auth-code"
+	x.State = state
+	x.CodeVerifier = verifier
+	x.AuthURL = authURL
+	x.Status = AuthStatusWaitingForUser
+	if state != "" {
+		p.byState[state] = x
+	}
+}
+
+func (p *PendingAuths) GetByState(state string) (*PendingAuth, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	x := p.byState[state]
+	if x == nil {
+		return nil, false
+	}
+	if !x.ExpiresAt.IsZero() && time.Now().After(x.ExpiresAt) {
+		switch x.Status {
+		case AuthStatusAuthenticated, AuthStatusFailed, AuthStatusExpired, AuthStatusCanceled:
+		default:
+			x.Status = AuthStatusExpired
+			p.signalLocked(x)
+		}
+		return clonePendingAuth(x), false
+	}
+	return clonePendingAuth(x), true
+}
+
+func (p *PendingAuths) ClearState(state string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.byState, state)
 }
 
 func (p *PendingAuths) SetMessage(uuid, message string) {
@@ -262,6 +369,9 @@ func (p *PendingAuths) removeLocked(x *PendingAuth, canceled bool) {
 	}
 	delete(p.byID, x.UUID)
 	delete(p.byKey, x.Key)
+	if x.State != "" {
+		delete(p.byState, x.State)
+	}
 	if m := p.byNS[x.Namespace]; m != nil {
 		delete(m, x.UUID)
 		if len(m) == 0 {

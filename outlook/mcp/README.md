@@ -6,6 +6,9 @@ This service supports loading Azure OAuth2 client configuration from a scy resou
 
 - `clientID`: Fallback Azure application (client) ID.
 - `tenantID`: Fallback tenant ID.
+- `authFlow`: Microsoft Graph auth flow, `device` or `auth-code`.
+- `oauthRedirectPath`: Callback path for authorization-code flow (default `/outlook/auth/callback`).
+- `graphScopes`: Delegated Microsoft Graph/OIDC scopes requested for Outlook tools.
 - `secretsBase`: AFS/scy base URL for auth records per namespace+alias (e.g., `mem://localhost/mcp-outlook`, `file://~/.mcp/outlook`).
 - `callbackBaseURL`: Base URL for device login page rendering.
 - `useData` / `useText`: Output formatting flags.
@@ -99,6 +102,44 @@ email-based namespaces to subject-based namespaces creates new Outlook auth
 record names, so sign in once again after changing this flag. There is no
 environment variable fallback for `--namespace-claim-keys`.
 
+### Authorization Code + PKCE
+
+Device Code flow remains available as `--auth-flow device`. To use browser
+OAuth callback flow instead, register this redirect URI in the Microsoft Entra
+app registration:
+
+```
+<public-base-url>/outlook/auth/callback
+```
+
+Then start Outlook MCP with auth-code flow. Use `common` when the app
+registration supports both personal Microsoft accounts and work/school
+accounts:
+
+```
+go run ./outlook/cmd/outlook-mcp \
+  --addr :7788 \
+  --client-id "00000000-0000-0000-0000-000000000000" \
+  --tenant-id common \
+  --auth-flow auth-code \
+  --public-base-url "http://localhost:7788" \
+  --secretsBase file://$HOME/.mcp/outlook \
+  --scratchpad-root-uri 'file:///Users/pol-mfilipowicz/agently/runtime/scratchpad/${userID}' \
+  --attachment-source-schemes scratchpad \
+  --scratchpad-target-schemes gs \
+  --namespace-claim-keys sub,email
+```
+
+The default auth-code scopes are:
+
+```
+openid,profile,offline_access,User.Read,Mail.Read,Mail.Send,Mail.ReadWrite,Calendars.ReadWrite,Tasks.ReadWrite
+```
+
+Tokens are stored per `namespace + alias + tenant + clientID + scopes` under
+`secretsBase`. A `file://` `secretsBase` is suitable for local development; use
+a secure scy/secret-manager backed location for production.
+
 ### GCS attachment source URLs
 
 `outlookSendMail` can read attachments from `gs://...` source URLs. The Outlook
@@ -118,7 +159,8 @@ shell is not enough unless the variable was exported or provided inline to
 
 - On startup, if `azureRef` is set, the service loads the secret via scy and applies `ClientID` from the secret. If absent, it uses `clientID` from config.
 - If `tenantID` flag/env is empty or set to `organizations`, the server will use `TenantID` from the `azureRef` secret when available.
-- Device Code flow is used for Microsoft Graph and auth records are written under `secretsBase`.
+- Device Code flow is used for Microsoft Graph when `authFlow=device`, and auth records are written under `secretsBase`.
+- Authorization Code + PKCE is used for Microsoft Graph when `authFlow=auth-code`, and OAuth tokens are written under `secretsBase`.
 
 ## Notes
 

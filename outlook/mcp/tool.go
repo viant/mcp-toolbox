@@ -40,7 +40,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	ensureAuthorized := func(ctx context.Context, alias, tenant string) error {
 		start := time.Now()
-		scopes := graph.DefaultScopes()
+		scopes := svc.GraphScopes()
 		check := svc.GraphManager().AuthCheck(ctx, alias, tenant, scopes)
 		debugf("ensureAuthorized alias=%q tenant=%q auth_status=%q reason=%q err=%v deadline_in=%s check_elapsed=%s", alias, tenant, check.Status, check.Reason, check.Err, debugDeadline(ctx), time.Since(start).Round(time.Millisecond))
 		switch check.Status {
@@ -102,7 +102,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
 			return buildErrorResult(err.Error())
 		}
-		out, err := mailSvc.List(ctx, in, graph.DefaultScopes(), nil)
+		out, err := mailSvc.List(ctx, in, svc.GraphScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -129,7 +129,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		debugf("outlookSendMail auth_ok auth_elapsed=%s scratchpad_user=%q deadline_in=%s", time.Since(authStart).Round(time.Millisecond), svc.scratchpadUserIDFromContext(ctx), debugDeadline(ctx))
 		ctx = svc.withScratchpadUser(ctx)
 		sendStart := time.Now()
-		if err := mailSvc.Send(ctx, in, graph.DefaultScopes(), nil); err != nil {
+		if err := mailSvc.Send(ctx, in, svc.GraphScopes(), nil); err != nil {
 			debugf("outlookSendMail send_failed err=%v send_elapsed=%s total=%s deadline_in=%s", err, time.Since(sendStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 			return buildErrorResult(err.Error())
 		}
@@ -150,7 +150,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
 			return buildErrorResult(err.Error())
 		}
-		out, err := calSvc.List(ctx, in, graph.DefaultScopes(), nil)
+		out, err := calSvc.List(ctx, in, svc.GraphScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -170,7 +170,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
 			return buildErrorResult(err.Error())
 		}
-		out, err := calSvc.Create(ctx, in, graph.DefaultScopes(), nil)
+		out, err := calSvc.Create(ctx, in, svc.GraphScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -190,7 +190,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
 			return buildErrorResult(err.Error())
 		}
-		out, err := taskSvc.List(ctx, in, graph.DefaultScopes(), nil)
+		out, err := taskSvc.List(ctx, in, svc.GraphScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}
@@ -210,7 +210,7 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		if err := ensureAuthorized(ctx, in.Account.Alias, in.Account.TenantID); err != nil {
 			return buildErrorResult(err.Error())
 		}
-		out, err := taskSvc.Create(ctx, in, graph.DefaultScopes(), nil)
+		out, err := taskSvc.Create(ctx, in, svc.GraphScopes(), nil)
 		if err != nil {
 			return buildErrorResult(err.Error())
 		}

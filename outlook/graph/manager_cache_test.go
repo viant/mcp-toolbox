@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/viant/mcp-protocol/authorization"
+	"golang.org/x/oauth2"
 )
 
 func TestClientCacheKeyNormalization(t *testing.T) {
@@ -178,6 +180,50 @@ func TestResetAuthClearsMemoryAndAuthRecord(t *testing.T) {
 	}
 	if _, ok := m.waiters[clientKey]; ok {
 		t.Fatalf("expected waiter entry to be removed")
+	}
+}
+
+func TestResetAuthClearsAllOAuthTokensForAliasAcrossScopeChanges(t *testing.T) {
+	ctx := context.Background()
+	storageDir := t.TempDir()
+	m := NewManagerWithConfig(&ManagerConfig{
+		ClientID:   "client/id",
+		StorageDir: storageDir,
+		AuthFlow:   AuthFlowAuthCode,
+	})
+	alias := "personal"
+	tenant := "common"
+	oldScopes := []string{"Mail.Send"}
+	newScopes := []string{"Mail.Send", "Mail.Read"}
+
+	if err := m.saveOAuthToken(ctx, "default", alias, tenant, oldScopes, testOAuthToken("old-token")); err != nil {
+		t.Fatalf("failed to save old token: %v", err)
+	}
+	if err := m.saveOAuthToken(ctx, "default", alias, tenant, newScopes, testOAuthToken("new-token")); err != nil {
+		t.Fatalf("failed to save new token: %v", err)
+	}
+
+	result, err := m.ResetAuth(ctx, alias, tenant, newScopes, false)
+	if err != nil {
+		t.Fatalf("ResetAuth failed: %v", err)
+	}
+	if !result.ClearedOAuthToken {
+		t.Fatalf("expected OAuth tokens to be cleared")
+	}
+	if rec, err := m.loadOAuthToken(ctx, "default", alias, tenant, oldScopes); err != nil || rec != nil {
+		t.Fatalf("expected old-scope token to be removed, got rec=%v err=%v", rec, err)
+	}
+	if rec, err := m.loadOAuthToken(ctx, "default", alias, tenant, newScopes); err != nil || rec != nil {
+		t.Fatalf("expected new-scope token to be removed, got rec=%v err=%v", rec, err)
+	}
+}
+
+func testOAuthToken(accessToken string) *oauth2.Token {
+	return &oauth2.Token{
+		AccessToken:  accessToken,
+		TokenType:    "Bearer",
+		RefreshToken: "refresh-token",
+		Expiry:       time.Now().Add(time.Hour),
 	}
 }
 

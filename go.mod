@@ -20,6 +20,7 @@ require (
 	github.com/viant/mcp-protocol v0.11.0
 	github.com/viant/scy v0.25.4-0.20251010021037-5a0b62e88695
 	golang.org/x/net v0.46.0
+	golang.org/x/oauth2 v0.30.0
 )
 
 require (
@@ -120,7 +121,6 @@ require (
 	golang.org/x/exp v0.0.0-20251125195548-87e1e737ad39 // indirect
 	golang.org/x/image v0.33.0 // indirect
 	golang.org/x/mod v0.30.0 // indirect
-	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect

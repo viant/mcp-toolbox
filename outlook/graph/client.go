@@ -14,9 +14,11 @@ import (
 
 	"bytes"
 	"io"
+	"net/http"
 	"sort"
 	"sync"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	azcache "github.com/Azure/azure-sdk-for-go/sdk/azidentity/cache"
@@ -30,11 +32,20 @@ type Manager struct {
 	clientID   string
 	storageDir string
 	ns         *nsprov.DefaultProvider
+	authFlow   AuthFlow
+	authority  string
+
+	oauthRedirectURL      string
+	oauthScopes           []string
+	oauthHTTPClient       *http.Client
+	oauthAuthURLOverride  string
+	oauthTokenURLOverride string
+
 	// clients caches GraphServiceClient instances per alias+tenant+scopes.
 	mu      sync.RWMutex
 	clients map[string]*msgraphsdk.GraphServiceClient
-	// creds caches device code credentials per namespace+alias+tenant+scopes.
-	creds map[string]*azidentity.DeviceCodeCredential
+	// creds caches Graph token credentials per namespace+alias+tenant+scopes.
+	creds map[string]azcore.TokenCredential
 	// inflight credential acquisitions per namespace+alias+tenant+scopes to serialize device flows.
 	waiters map[string][]chan struct{}
 	// persistentCache is the optional cross-process MSAL token cache.
@@ -153,13 +164,34 @@ func NewManagerWithNamespaceClaimKeys(clientID, storageDir string, namespaceClai
 }
 
 func newManager(clientID, storageDir string, claimKeys []string) *Manager {
+	return NewManagerWithConfig(&ManagerConfig{
+		ClientID:           clientID,
+		StorageDir:         storageDir,
+		NamespaceClaimKeys: claimKeys,
+		AuthFlow:           AuthFlowDevice,
+	})
+}
+
+func NewManagerWithConfig(cfg *ManagerConfig) *Manager {
+	if cfg == nil {
+		cfg = &ManagerConfig{}
+	}
+	claimKeys := normalizeNamespaceClaimKeys(cfg.NamespaceClaimKeys)
+	authFlow := NormalizeAuthFlow(string(cfg.AuthFlow))
 	return &Manager{
-		clientID:   clientID,
-		storageDir: storageDir,
-		ns:         nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: claimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
-		clients:    map[string]*msgraphsdk.GraphServiceClient{},
-		creds:      map[string]*azidentity.DeviceCodeCredential{},
-		waiters:    map[string][]chan struct{}{},
+		clientID:              cfg.ClientID,
+		storageDir:            cfg.StorageDir,
+		ns:                    nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: claimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
+		authFlow:              authFlow,
+		authority:             cfg.Authority,
+		oauthRedirectURL:      cfg.OAuthRedirectURL,
+		oauthScopes:           normalizeScopes(cfg.OAuthScopes),
+		oauthHTTPClient:       cfg.OAuthHTTPClient,
+		oauthAuthURLOverride:  cfg.OAuthAuthURLOverride,
+		oauthTokenURLOverride: cfg.OAuthTokenURLOverride,
+		clients:               map[string]*msgraphsdk.GraphServiceClient{},
+		creds:                 map[string]azcore.TokenCredential{},
+		waiters:               map[string][]chan struct{}{},
 	}
 }
 
@@ -289,6 +321,9 @@ func expandPath(p string) string {
 
 // AuthCheck checks whether a credential is usable, needs user sign-in, or failed for a provider/local reason.
 func (m *Manager) AuthCheck(ctx context.Context, alias, tenantID string, scopes []string) AuthCheckResult {
+	if m.authFlow == AuthFlowAuthCode {
+		return m.oauthAuthCheck(ctx, alias, tenantID, scopes)
+	}
 	start := time.Now()
 	debugf("graph.AuthCheck start alias=%q tenant=%q deadline_in=%s", alias, tenantID, debugDeadline(ctx))
 	if err := m.ensureDirs(); err != nil {
@@ -442,6 +477,14 @@ func (m *Manager) ResetAuth(ctx context.Context, alias, tenantID string, scopes 
 		}
 		result.ClearedAuthRecord = true
 	}
+	clearedOAuth, warnings, err := m.clearOAuthTokens(ctx, ns, alias, tenantID, scopes)
+	if err != nil {
+		return result, err
+	}
+	result.ClearedOAuthToken = clearedOAuth
+	if len(warnings) > 0 {
+		result.Warnings = append(result.Warnings, warnings...)
+	}
 	if purgePersistent {
 		if err := purgePersistentTokenCache(ctx, result.PersistentCacheName); err != nil {
 			result.Warnings = append(result.Warnings, err.Error())
@@ -582,7 +625,7 @@ func (m *Manager) cacheKeyPrefix(ns, alias, tenantID string) string {
 	return ns + "|" + alias + "|" + tenantID + "|"
 }
 
-func (m *Manager) cachedCredential(ctx context.Context, key string, scopes []string) (*azidentity.DeviceCodeCredential, bool) {
+func (m *Manager) cachedCredential(ctx context.Context, key string, scopes []string) (azcore.TokenCredential, bool) {
 	m.mu.RLock()
 	cred := m.creds[key]
 	m.mu.RUnlock()
@@ -596,7 +639,7 @@ func (m *Manager) cachedCredential(ctx context.Context, key string, scopes []str
 	return nil, false
 }
 
-func (m *Manager) credentialUsable(ctx context.Context, cred *azidentity.DeviceCodeCredential, scopes []string) bool {
+func (m *Manager) credentialUsable(ctx context.Context, cred azcore.TokenCredential, scopes []string) bool {
 	start := time.Now()
 	if cred == nil {
 		debugf("graph.credentialUsable result ok=false reason=nil_credential elapsed=%s deadline_in=%s", time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
@@ -610,7 +653,7 @@ func (m *Manager) credentialUsable(ctx context.Context, cred *azidentity.DeviceC
 	return ok
 }
 
-func (m *Manager) dropCredential(key string, cred *azidentity.DeviceCodeCredential) {
+func (m *Manager) dropCredential(key string, cred azcore.TokenCredential) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.creds[key] == cred {
@@ -619,8 +662,8 @@ func (m *Manager) dropCredential(key string, cred *azidentity.DeviceCodeCredenti
 	}
 }
 
-// Credential returns a cached DeviceCodeCredential for alias, acquiring and caching if needed.
-func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, error) {
+// Credential returns a cached Graph token credential for alias, acquiring and caching if needed.
+func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (azcore.TokenCredential, error) {
 	start := time.Now()
 	dsc, _ := m.ns.Namespace(ctx)
 	ns := dsc.Name
@@ -676,7 +719,13 @@ func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes
 	m.waiters[key] = []chan struct{}{}
 	m.mu.Unlock()
 	debugf("graph.Credential acquire_start ns=%q alias=%q tenant=%q elapsed=%s deadline_in=%s", ns, alias, tenantID, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
-	cred, _, err := m.acquireCredential(ctx, alias, tenantID, scopes, prompt)
+	var cred azcore.TokenCredential
+	var err error
+	if m.authFlow == AuthFlowAuthCode {
+		cred, err = m.oauthCredential(ctx, ns, alias, tenantID, scopes)
+	} else {
+		cred, _, err = m.acquireCredential(ctx, alias, tenantID, scopes, prompt)
+	}
 	// Publish result and wake waiters
 	m.mu.Lock()
 	if existing := m.creds[key]; existing != nil {

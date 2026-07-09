@@ -12,6 +12,7 @@ import (
 	"github.com/viant/mcp-protocol/authorization"
 	oauthmeta "github.com/viant/mcp-protocol/oauth2/meta"
 	"github.com/viant/mcp-protocol/schema"
+	"github.com/viant/mcp-toolbox/outlook/graph"
 	"github.com/viant/mcp-toolbox/outlook/mcp"
 	mcpsrv "github.com/viant/mcp/server"
 	serverauth "github.com/viant/mcp/server/auth"
@@ -26,6 +27,9 @@ type Options struct {
 	HTTPAddr                string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
 	ClientID                string `long:"client-id" description:"Azure AD application (client) ID"`
 	TenantID                string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
+	AuthFlow                string `long:"auth-flow" description:"Microsoft Graph auth flow: device or auth-code"`
+	OAuthRedirectPath       string `long:"oauth-redirect-path" description:"Callback path for auth-code OAuth flow"`
+	GraphScopes             string `long:"graph-scopes" description:"Comma/space-separated Microsoft Graph delegated scopes"`
 	SecretsBase             string `long:"secretsBase" description:"AFS/scy base URL for persisting auth records (e.g., mem://localhost/mcp-outlook)"`
 	AzureRef                string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
 	Oauth2Config            string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
@@ -49,9 +53,13 @@ func main() {
 	if opts.ClientID == "" && opts.AzureRef == "" {
 		log.Fatal("missing --client-id/OUTLOOK_CLIENT_ID (or provide --azure-ref / OUTLOOK_AZURE_REF)")
 	}
-	debugf("startup options addr=%q tenant=%q client_id_set=%t azure_ref_set=%t oauth2config_set=%t public_base_url_set=%t secrets_base_set=%t scratchpad_root_set=%t scratchpad_user_id_set=%t attachment_source_schemes=%q scratchpad_target_schemes=%q namespace_claim_keys=%q",
+	if !graph.ValidAuthFlow(opts.AuthFlow) {
+		log.Fatalf("invalid --auth-flow %q (expected device or auth-code)", opts.AuthFlow)
+	}
+	debugf("startup options addr=%q tenant=%q auth_flow=%q client_id_set=%t azure_ref_set=%t oauth2config_set=%t public_base_url_set=%t secrets_base_set=%t scratchpad_root_set=%t scratchpad_user_id_set=%t attachment_source_schemes=%q scratchpad_target_schemes=%q namespace_claim_keys=%q",
 		opts.HTTPAddr,
 		opts.TenantID,
+		opts.AuthFlow,
 		strings.TrimSpace(opts.ClientID) != "",
 		strings.TrimSpace(opts.AzureRef) != "",
 		strings.TrimSpace(opts.Oauth2Config) != "",
@@ -123,6 +131,7 @@ func main() {
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/start", svc.DeviceStartHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/check", svc.DeviceCheckHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/reset", svc.DeviceResetHandler()),
+		mcpsrv.WithCustomHTTPHandler(svc.OAuthRedirectPath(), svc.OAuthCallbackHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/pending", svc.PendingListHandler()),
 		mcpsrv.WithCustomHTTPHandler("/outlook/auth/pending/clear", svc.PendingClearHandler()),
 	}
@@ -227,6 +236,15 @@ func applyOptionDefaults(opts *Options) {
 	if opts.TenantID == "" {
 		opts.TenantID = envOr("OUTLOOK_TENANT_ID", "organizations")
 	}
+	if opts.AuthFlow == "" {
+		opts.AuthFlow = envOr("OUTLOOK_AUTH_FLOW", string(graph.AuthFlowDevice))
+	}
+	if opts.OAuthRedirectPath == "" {
+		opts.OAuthRedirectPath = envOr("OUTLOOK_OAUTH_REDIRECT_PATH", "/outlook/auth/callback")
+	}
+	if opts.GraphScopes == "" {
+		opts.GraphScopes = envOr("OUTLOOK_GRAPH_SCOPES", "")
+	}
 	if opts.ClientID == "" {
 		opts.ClientID = envOr("OUTLOOK_CLIENT_ID", "")
 	}
@@ -265,6 +283,9 @@ func serviceConfigFromOptions(opts Options, baseURL string) *mcp.Config {
 	return &mcp.Config{
 		ClientID:                opts.ClientID,
 		TenantID:                opts.TenantID,
+		AuthFlow:                string(graph.NormalizeAuthFlow(opts.AuthFlow)),
+		OAuthRedirectPath:       opts.OAuthRedirectPath,
+		GraphScopes:             graph.ParseScopes(opts.GraphScopes),
 		SecretsBase:             strings.Replace(opts.SecretsBase, "$HOME", os.Getenv("HOME"), 1),
 		CallbackBaseURL:         baseURL,
 		AzureRef:                scy.EncodedResource(opts.AzureRef),

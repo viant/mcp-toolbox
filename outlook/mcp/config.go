@@ -16,6 +16,12 @@ type Config struct {
 	TenantID string `json:"tenantID"`
 	// Optional authority/issuer URL; defaults to https://login.microsoftonline.com.
 	Authority string `json:"authority,omitempty"`
+	// AuthFlow selects Microsoft Graph authentication flow: "device" or "auth-code".
+	AuthFlow string `json:"authFlow,omitempty"`
+	// OAuthRedirectPath is the local callback path used by auth-code flow.
+	OAuthRedirectPath string `json:"oauthRedirectPath,omitempty"`
+	// GraphScopes are delegated Microsoft Graph/OIDC scopes requested for Outlook tools.
+	GraphScopes []string `json:"graphScopes,omitempty"`
 
 	// SecretsBase is an AFS/scy base URL where auth records are persisted per namespace+alias.
 	SecretsBase string `json:"secretsBase,omitempty"`
