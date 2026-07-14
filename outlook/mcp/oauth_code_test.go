@@ -23,6 +23,7 @@ func TestAuthCodeStartHandlerRedirectsToAuthorizeURL(t *testing.T) {
 		GraphScopes:       []string{"Mail.Send"},
 	})
 	req := httptest.NewRequest(http.MethodGet, "/outlook/auth/start?alias=personal&tenant=common", nil)
+	req.Header.Set("Authorization", "Bearer "+testJWT(t, map[string]any{"email": "alice@example.com"}))
 	rec := httptest.NewRecorder()
 
 	svc.DeviceStartHandler().ServeHTTP(rec, req)
@@ -43,6 +44,10 @@ func TestAuthCodeStartHandlerRedirectsToAuthorizeURL(t *testing.T) {
 	}
 	if got := parsed.Query().Get("state"); got == "" {
 		t.Fatalf("expected state in authorize URL")
+	}
+	session, ok := svc.pending.GetByState(parsed.Query().Get("state"))
+	if !ok || session.Namespace != "alice@example.com" {
+		t.Fatalf("expected pending session to retain bearer identity, got %#v", session)
 	}
 	if got := parsed.Query().Get("code_challenge"); got == "" {
 		t.Fatalf("expected code_challenge in authorize URL")
@@ -73,20 +78,30 @@ func TestStartAuthCodeSessionConcurrentCallsReuseState(t *testing.T) {
 		GraphScopes:     []string{"Mail.Send"},
 	})
 	const workers = 16
-	results := make(chan *PendingAuth, workers)
+	type result struct {
+		session *PendingAuth
+		err     error
+	}
+	results := make(chan result, workers)
+	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{"email": "alice@example.com"}))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results <- svc.startAuthSession(context.Background(), "personal", "common", []string{"Mail.Send"})
+			session, err := svc.startAuthSession(ctx, "personal", "common", []string{"Mail.Send"})
+			results <- result{session: session, err: err}
 		}()
 	}
 	wg.Wait()
 	close(results)
 
 	var first *PendingAuth
-	for session := range results {
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("startAuthSession failed: %v", result.err)
+		}
+		session := result.session
 		if session == nil {
 			t.Fatalf("expected session")
 		}
@@ -103,7 +118,7 @@ func TestStartAuthCodeSessionConcurrentCallsReuseState(t *testing.T) {
 	}
 }
 
-func TestOAuthCallbackStoresTokenAndCompletesSession(t *testing.T) {
+func TestOAuthCallbackUsesPendingStateWithoutBearer(t *testing.T) {
 	scopes := []string{"Mail.Send"}
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -135,17 +150,23 @@ func TestOAuthCallbackStoresTokenAndCompletesSession(t *testing.T) {
 		GraphScopes:       scopes,
 	})
 	svc.graphMgr = graph.NewManagerWithConfig(&graph.ManagerConfig{
-		ClientID:              "client-id",
-		StorageDir:            svc.SecretsBase(),
-		AuthFlow:              graph.AuthFlowAuthCode,
-		OAuthRedirectURL:      "http://outlook-mcp.local/outlook/auth/callback",
-		OAuthScopes:           scopes,
-		OAuthAuthURLOverride:  "http://localhost/authorize",
-		OAuthTokenURLOverride: tokenServer.URL,
-		OAuthHTTPClient:       tokenServer.Client(),
+		ClientID:                 "client-id",
+		StorageDir:               svc.SecretsBase(),
+		NamespaceProvider:        svc.ns,
+		RequireIdentityNamespace: true,
+		AuthFlow:                 graph.AuthFlowAuthCode,
+		OAuthRedirectURL:         "http://outlook-mcp.local/outlook/auth/callback",
+		OAuthScopes:              scopes,
+		OAuthAuthURLOverride:     "http://localhost/authorize",
+		OAuthTokenURLOverride:    tokenServer.URL,
+		OAuthHTTPClient:          tokenServer.Client(),
 	})
 
-	session := svc.startAuthSession(context.Background(), "personal", "common", scopes)
+	identityContext := contextWithBearer(context.Background(), testJWT(t, map[string]any{"email": "alice@example.com"}))
+	session, err := svc.startAuthSession(identityContext, "personal", "common", scopes)
+	if err != nil {
+		t.Fatalf("startAuthSession failed: %v", err)
+	}
 	if session == nil || session.State == "" {
 		t.Fatalf("expected auth-code session with state, got %#v", session)
 	}
@@ -164,7 +185,7 @@ func TestOAuthCallbackStoresTokenAndCompletesSession(t *testing.T) {
 	if current.Status != AuthStatusAuthenticated {
 		t.Fatalf("expected authenticated status, got %q", current.Status)
 	}
-	check := svc.graphMgr.AuthCheck(context.Background(), "personal", "common", scopes)
+	check := svc.graphMgr.AuthCheck(identityContext, "personal", "common", scopes)
 	if check.Status != graph.AuthCheckReady {
 		t.Fatalf("expected saved token to be ready, got %q err=%v", check.Status, check.Err)
 	}

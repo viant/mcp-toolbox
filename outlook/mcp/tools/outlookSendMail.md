@@ -1,4 +1,5 @@
 Send an email from the authenticated account.
+Requires a Bearer JWT with a configured non-empty identity claim; no default or token-hash namespace is accepted. Scratchpad attachments are resolved with exactly this same identity.
 Inputs:
 - account.alias (required): stored account alias.
 - to (required): list of recipient email addresses.

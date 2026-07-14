@@ -1,4 +1,5 @@
 List calendar events in the next N days.
+Requires a Bearer JWT with a configured non-empty identity claim; no default or token-hash namespace is accepted.
 Inputs:
 - account.alias (required): stored account alias.
 - daysAhead (optional): default 7.

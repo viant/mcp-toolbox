@@ -10,6 +10,8 @@ This service supports loading Azure OAuth2 client configuration from a scy resou
 - `oauthRedirectPath`: Callback path for authorization-code flow (default `/outlook/auth/callback`).
 - `graphScopes`: Delegated Microsoft Graph/OIDC scopes requested for Outlook tools.
 - `secretsBase`: AFS/scy base URL for auth records per namespace+alias (e.g., `mem://localhost/mcp-outlook`, `file://~/.mcp/outlook`).
+- `scratchpadRootURI`: Shared scratchpad root used for `scratchpad://` attachments. The resolved Outlook identity is passed per request; there is no static scratchpad user.
+- `namespaceClaimKeys`: JWT identity claim lookup order (default `email,sub`).
 - `callbackBaseURL`: Base URL for device login page rendering.
 - `useData` / `useText`: Output formatting flags.
 - `azureRef`: scy EncodedResource to load `cred.Azure`.
@@ -63,8 +65,9 @@ go run ./outlook/cmd/outlook-mcp \
   -addr :7788 \
   -client-id "00000000-0000-0000-0000-000000000000" \
   -tenant-id "organizations" \
-  -storage "$HOME/.config/mcp-outlook" \
-  -azure-ref "gcp://secretmanager/projects/myproj/secrets/azure-cred|blowfish://default"
+  --secretsBase "file://$HOME/.config/mcp-outlook" \
+  -azure-ref "gcp://secretmanager/projects/myproj/secrets/azure-cred|blowfish://default" \
+  --allow-unverified-bearer-context
 ```
 
 Or environment variables:
@@ -74,7 +77,10 @@ export OUTLOOK_CLIENT_ID=00000000-0000-0000-0000-000000000000
 # Optional: Tenant ID will be taken from the azureRef secret if not provided or if set to "organizations".
 # export OUTLOOK_TENANT_ID=organizations
 export OUTLOOK_AZURE_REF='gcp://secretmanager/projects/myproj/secrets/azure-cred|blowfish://default'
-go run ./outlook/cmd/outlook-mcp -addr :7788 -storage "$HOME/.config/mcp-outlook"
+go run ./outlook/cmd/outlook-mcp \
+  -addr :7788 \
+  --secretsBase "file://$HOME/.config/mcp-outlook" \
+  --allow-unverified-bearer-context
 ```
 
 ### Namespace claim order
@@ -102,6 +108,23 @@ email-based namespaces to subject-based namespaces creates new Outlook auth
 record names, so sign in once again after changing this flag. There is no
 environment variable fallback for `--namespace-claim-keys`.
 
+Every Outlook tool requires a non-empty value from the configured claim order.
+JWT parsing is intentionally unverified here; default, token-hash, malformed,
+and missing-claim results are unauthorized. The same resolved identity scopes
+Graph credentials, pending sign-in state, and scratchpad attachments.
+
+### HTTP identity modes
+
+- `--oauth2config` keeps the OAuth/BFF authorizer path.
+- `--allow-unverified-bearer-context` enables the passive local bridge, which copies only a non-empty direct Bearer header into request context.
+- The two options are mutually exclusive. Active HTTP without either option fails at startup; an empty `--addr` is allowed.
+- The passive mode does not validate JWT signatures and has no environment-variable fallback.
+
+The `/outlook/auth/start`, `/check`, `/reset`, `/pending`, and
+`/pending/clear` endpoints require a direct Bearer with an identity claim and
+ignore any `namespace` query override. The device page and OAuth callback are
+Bearer-free and continue from the identity saved in pending state.
+
 ### Authorization Code + PKCE
 
 Device Code flow remains available as `--auth-flow device`. To use browser
@@ -127,7 +150,8 @@ go run ./outlook/cmd/outlook-mcp \
   --scratchpad-root-uri 'file:///Users/pol-mfilipowicz/agently/runtime/scratchpad/${userID}' \
   --attachment-source-schemes scratchpad \
   --scratchpad-target-schemes gs \
-  --namespace-claim-keys sub,email
+  --namespace-claim-keys sub,email \
+  --allow-unverified-bearer-context
 ```
 
 The default auth-code scopes are:
@@ -147,7 +171,7 @@ MCP process must have Google credentials in its environment before it starts:
 
 ```
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/google-service-account.json
-go run ./outlook/cmd/outlook-mcp -addr :7788 ...
+go run ./outlook/cmd/outlook-mcp -addr :7788 --allow-unverified-bearer-context ...
 ```
 
 If `GOOGLE_APPLICATION_CREDENTIALS` is set after the server is already running,
@@ -161,6 +185,7 @@ shell is not enough unless the variable was exported or provided inline to
 - If `tenantID` flag/env is empty or set to `organizations`, the server will use `TenantID` from the `azureRef` secret when available.
 - Device Code flow is used for Microsoft Graph when `authFlow=device`, and auth records are written under `secretsBase`.
 - Authorization Code + PKCE is used for Microsoft Graph when `authFlow=auth-code`, and OAuth tokens are written under `secretsBase`.
+- Outlook tools fail as unauthorized before Graph auth checks or pending-session creation when identity is absent.
 
 ## Notes
 

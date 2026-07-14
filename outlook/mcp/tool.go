@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	afsscratchpad "github.com/viant/afs/scratchpad"
 	"github.com/viant/jsonrpc"
 	"github.com/viant/mcp-protocol/schema"
 	protoserver "github.com/viant/mcp-protocol/server"
@@ -59,7 +60,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		default:
 			return fmt.Errorf("Outlook authentication check returned unexpected status %q", check.Status)
 		}
-		session := svc.startAuthSession(ctx, alias, tenant, scopes)
+		session, err := svc.startAuthSession(ctx, alias, tenant, scopes)
+		if err != nil {
+			return err
+		}
 		if session == nil {
 			debugf("ensureAuthorized alias=%q tenant=%q startAuthSession=nil elapsed=%s", alias, tenant, time.Since(start).Round(time.Millisecond))
 			return fmt.Errorf("Outlook sign-in session could not be started")
@@ -82,9 +86,17 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 		}
 		debugf("ensureAuthorized alias=%q tenant=%q session=%q elicit_ok elapsed=%s waiting deadline_in=%s", alias, tenant, session.UUID, time.Since(elicitStart).Round(time.Millisecond), debugDeadline(ctx))
 		waitStart := time.Now()
-		err := svc.waitForAuthSession(ctx, session)
+		err = svc.waitForAuthSession(ctx, session)
 		debugf("ensureAuthorized alias=%q tenant=%q session=%q wait_done err=%v wait_elapsed=%s total=%s deadline_in=%s", alias, tenant, session.UUID, err, time.Since(waitStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 		return err
+	}
+
+	resolveToolIdentity := func(ctx context.Context) (string, *jsonrpc.Error) {
+		identity, err := svc.identityNamespace(ctx)
+		if err != nil {
+			return "", jsonrpc.NewError(schema.Unauthorized, graph.IdentityNamespaceRequiredMessage, nil)
+		}
+		return identity, nil
 	}
 
 	mailSvc := graph.NewMailService(svc.GraphManager())
@@ -93,6 +105,9 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List mail
 	if err := protoserver.RegisterTool[*graph.ListMailInput, *graph.ListMailOutput](base.Registry, "outlookListMail", outlookListMailDesc, func(ctx context.Context, in *graph.ListMailInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if _, identityErr := resolveToolIdentity(ctx); identityErr != nil {
+			return nil, identityErr
+		}
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
 		}
@@ -114,6 +129,10 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 	// Send mail
 	if err := protoserver.RegisterTool[*graph.SendEmailInput, *struct{}](base.Registry, "outlookSendMail", outlookSendMailDesc, func(ctx context.Context, in *graph.SendEmailInput) (*schema.CallToolResult, *jsonrpc.Error) {
 		start := time.Now()
+		identity, identityErr := resolveToolIdentity(ctx)
+		if identityErr != nil {
+			return nil, identityErr
+		}
 		debugf("outlookSendMail start alias=%q tenant=%q to_count=%d attachment_count=%d deadline_in=%s", in.Account.Alias, in.Account.TenantID, len(in.To), len(in.Attachments), debugDeadline(ctx))
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
@@ -126,8 +145,8 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 			debugf("outlookSendMail auth_failed err=%v auth_elapsed=%s total=%s deadline_in=%s", err, time.Since(authStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 			return buildErrorResult(err.Error())
 		}
-		debugf("outlookSendMail auth_ok auth_elapsed=%s scratchpad_user=%q deadline_in=%s", time.Since(authStart).Round(time.Millisecond), svc.scratchpadUserIDFromContext(ctx), debugDeadline(ctx))
-		ctx = svc.withScratchpadUser(ctx)
+		debugf("outlookSendMail auth_ok auth_elapsed=%s deadline_in=%s", time.Since(authStart).Round(time.Millisecond), debugDeadline(ctx))
+		ctx = afsscratchpad.ContextWithUserID(ctx, identity)
 		sendStart := time.Now()
 		if err := mailSvc.Send(ctx, in, svc.GraphScopes(), nil); err != nil {
 			debugf("outlookSendMail send_failed err=%v send_elapsed=%s total=%s deadline_in=%s", err, time.Since(sendStart).Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
@@ -141,6 +160,9 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List events
 	if err := protoserver.RegisterTool[*graph.ListEventsInput, *graph.ListEventsOutput](base.Registry, "outlookListEvents", outlookListEventsDesc, func(ctx context.Context, in *graph.ListEventsInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if _, identityErr := resolveToolIdentity(ctx); identityErr != nil {
+			return nil, identityErr
+		}
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
 		}
@@ -161,6 +183,9 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Create event
 	if err := protoserver.RegisterTool[*graph.CreateEventInput, *graph.CalendarEvent](base.Registry, "outlookCreateEvent", outlookCreateEventDesc, func(ctx context.Context, in *graph.CreateEventInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if _, identityErr := resolveToolIdentity(ctx); identityErr != nil {
+			return nil, identityErr
+		}
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
 		}
@@ -181,6 +206,9 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// List tasks
 	if err := protoserver.RegisterTool[*graph.ListTasksInput, *graph.ListTasksOutput](base.Registry, "outlookListTasks", outlookListTasksDesc, func(ctx context.Context, in *graph.ListTasksInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if _, identityErr := resolveToolIdentity(ctx); identityErr != nil {
+			return nil, identityErr
+		}
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
 		}
@@ -201,6 +229,9 @@ func registerTools(base *protoserver.DefaultHandler, h *Handler) error {
 
 	// Create task
 	if err := protoserver.RegisterTool[*graph.CreateTaskInput, *graph.Task](base.Registry, "outlookCreateTask", outlookCreateTaskDesc, func(ctx context.Context, in *graph.CreateTaskInput) (*schema.CallToolResult, *jsonrpc.Error) {
+		if _, identityErr := resolveToolIdentity(ctx); identityErr != nil {
+			return nil, identityErr
+		}
 		if in.Account.Alias == "" {
 			return buildErrorResult("account.alias is required")
 		}

@@ -29,11 +29,12 @@ import (
 
 // Manager provides Microsoft Graph client instances per account alias.
 type Manager struct {
-	clientID   string
-	storageDir string
-	ns         *nsprov.DefaultProvider
-	authFlow   AuthFlow
-	authority  string
+	clientID                 string
+	storageDir               string
+	ns                       nsprov.Provider
+	requireIdentityNamespace bool
+	authFlow                 AuthFlow
+	authority                string
 
 	oauthRedirectURL      string
 	oauthScopes           []string
@@ -55,6 +56,13 @@ type Manager struct {
 }
 
 const silentTokenTimeout = 10 * time.Second
+
+const (
+	IdentityNamespaceRequiredReason  = "identity_namespace_required"
+	IdentityNamespaceRequiredMessage = "Unauthorized: identity namespace is required"
+)
+
+var ErrIdentityNamespaceRequired = errors.New(IdentityNamespaceRequiredMessage)
 
 type AuthCheckStatus string
 
@@ -178,21 +186,61 @@ func NewManagerWithConfig(cfg *ManagerConfig) *Manager {
 	}
 	claimKeys := normalizeNamespaceClaimKeys(cfg.NamespaceClaimKeys)
 	authFlow := NormalizeAuthFlow(string(cfg.AuthFlow))
-	return &Manager{
-		clientID:              cfg.ClientID,
-		storageDir:            cfg.StorageDir,
-		ns:                    nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: claimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}}),
-		authFlow:              authFlow,
-		authority:             cfg.Authority,
-		oauthRedirectURL:      cfg.OAuthRedirectURL,
-		oauthScopes:           normalizeScopes(cfg.OAuthScopes),
-		oauthHTTPClient:       cfg.OAuthHTTPClient,
-		oauthAuthURLOverride:  cfg.OAuthAuthURLOverride,
-		oauthTokenURLOverride: cfg.OAuthTokenURLOverride,
-		clients:               map[string]*msgraphsdk.GraphServiceClient{},
-		creds:                 map[string]azcore.TokenCredential{},
-		waiters:               map[string][]chan struct{}{},
+	namespaceProvider := cfg.NamespaceProvider
+	if namespaceProvider == nil {
+		namespaceProvider = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: claimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
 	}
+	return &Manager{
+		clientID:                 cfg.ClientID,
+		storageDir:               cfg.StorageDir,
+		ns:                       namespaceProvider,
+		requireIdentityNamespace: cfg.RequireIdentityNamespace,
+		authFlow:                 authFlow,
+		authority:                cfg.Authority,
+		oauthRedirectURL:         cfg.OAuthRedirectURL,
+		oauthScopes:              normalizeScopes(cfg.OAuthScopes),
+		oauthHTTPClient:          cfg.OAuthHTTPClient,
+		oauthAuthURLOverride:     cfg.OAuthAuthURLOverride,
+		oauthTokenURLOverride:    cfg.OAuthTokenURLOverride,
+		clients:                  map[string]*msgraphsdk.GraphServiceClient{},
+		creds:                    map[string]azcore.TokenCredential{},
+		waiters:                  map[string][]chan struct{}{},
+	}
+}
+
+// ResolveIdentityNamespace resolves an unverified JWT identity namespace and
+// rejects default, token-hash, malformed, and missing-claim results.
+func ResolveIdentityNamespace(ctx context.Context, provider nsprov.Provider) (string, error) {
+	if provider == nil {
+		return "", ErrIdentityNamespaceRequired
+	}
+	descriptor, err := provider.Namespace(ctx)
+	if err != nil {
+		return "", ErrIdentityNamespaceRequired
+	}
+	return identityNamespaceFromDescriptor(descriptor)
+}
+
+func identityNamespaceFromDescriptor(descriptor nsprov.Descriptor) (string, error) {
+	name := strings.TrimSpace(descriptor.Name)
+	if descriptor.Kind != nsprov.KindIdentity || name == "" {
+		return "", ErrIdentityNamespaceRequired
+	}
+	return name, nil
+}
+
+func (m *Manager) namespace(ctx context.Context) (string, error) {
+	if m.requireIdentityNamespace {
+		if descriptor, ok := nsprov.FromContext(ctx); ok {
+			return identityNamespaceFromDescriptor(descriptor)
+		}
+		return ResolveIdentityNamespace(ctx, m.ns)
+	}
+	descriptor, _ := m.ns.Namespace(ctx)
+	if name := strings.TrimSpace(descriptor.Name); name != "" {
+		return name, nil
+	}
+	return "default", nil
 }
 
 func normalizeNamespaceClaimKeys(keys []string) []string {
@@ -326,16 +374,16 @@ func (m *Manager) AuthCheck(ctx context.Context, alias, tenantID string, scopes 
 	}
 	start := time.Now()
 	debugf("graph.AuthCheck start alias=%q tenant=%q deadline_in=%s", alias, tenantID, debugDeadline(ctx))
+	ns, err := m.namespace(ctx)
+	if err != nil {
+		debugf("graph.AuthCheck result alias=%q tenant=%q status=%q reason=%q", alias, tenantID, AuthCheckFailed, IdentityNamespaceRequiredReason)
+		return AuthCheckResult{Status: AuthCheckFailed, Reason: IdentityNamespaceRequiredReason, Err: err}
+	}
 	if err := m.ensureDirs(); err != nil {
 		debugf("graph.AuthCheck ensureDirs_error alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", alias, tenantID, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 		return AuthCheckResult{Status: AuthCheckFailed, Reason: "storage_unavailable", Err: err}
 	}
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
-	}
-	debugf("graph.AuthCheck namespace ns=%q alias=%q tenant=%q kind=%q isDefault=%v elapsed=%s deadline_in=%s", ns, alias, tenantID, dsc.Kind, dsc.IsDefault, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
+	debugf("graph.AuthCheck namespace ns=%q alias=%q tenant=%q elapsed=%s deadline_in=%s", ns, alias, tenantID, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 	record := m.loadAuthRecord(ctx, ns, alias)
 	debugf("graph.AuthCheck auth_record ns=%q alias=%q tenant=%q haveRec=%v bytes=%d openErr=%v readErr=%v unmarshalErr=%v elapsed=%s total=%s deadline_in=%s", ns, alias, tenantID, record.haveRecord, record.bytes, record.openErr, record.readErr, record.unmarshalErr, record.elapsed.Round(time.Millisecond), time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 	if !record.haveRecord {
@@ -381,10 +429,9 @@ func (m *Manager) NeedsInteractive(ctx context.Context, alias, tenantID string, 
 
 // Client returns a ready-to-use GraphServiceClient with given scopes.
 func (m *Manager) Client(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*msgraphsdk.GraphServiceClient, error) {
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
+	ns, err := m.namespace(ctx)
+	if err != nil {
+		return nil, err
 	}
 	key := m.clientKey(ns, alias, tenantID, scopes)
 	cred, err := m.Credential(ctx, alias, tenantID, scopes, prompt)
@@ -423,10 +470,9 @@ func (m *Manager) Acquire(ctx context.Context, alias, tenantID string, scopes []
 
 // HasAuthRecord reports whether an auth record exists for alias.
 func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
+	ns, err := m.namespace(ctx)
+	if err != nil {
+		return false
 	}
 	recURL := m.authRecordURL(ns, alias)
 	ok, _ := afs.New().Exists(ctx, recURL)
@@ -435,13 +481,12 @@ func (m *Manager) HasAuthRecord(ctx context.Context, alias string) bool {
 
 // ResetAuth clears local authentication state for an alias in the current namespace.
 func (m *Manager) ResetAuth(ctx context.Context, alias, tenantID string, scopes []string, purgePersistent bool) (ResetResult, error) {
-	if err := m.ensureDirs(); err != nil {
+	ns, err := m.namespace(ctx)
+	if err != nil {
 		return ResetResult{}, err
 	}
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
+	if err := m.ensureDirs(); err != nil {
+		return ResetResult{}, err
 	}
 	result := ResetResult{PersistentCacheName: m.persistentCacheName()}
 
@@ -498,14 +543,13 @@ func (m *Manager) ResetAuth(ctx context.Context, alias, tenantID string, scopes 
 // acquireCredential performs Device Code flow. If an auth record exists, use it for silent login.
 func (m *Manager) acquireCredential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (*azidentity.DeviceCodeCredential, azidentity.AuthenticationRecord, error) {
 	start := time.Now()
+	ns, err := m.namespace(ctx)
+	if err != nil {
+		return nil, azidentity.AuthenticationRecord{}, err
+	}
 	if err := m.ensureDirs(); err != nil {
 		debugf("graph.acquireCredential ensureDirs_error alias=%q tenant=%q err=%v elapsed=%s deadline_in=%s", alias, tenantID, err, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 		return nil, azidentity.AuthenticationRecord{}, err
-	}
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
 	}
 	debugf("graph.acquireCredential start ns=%q alias=%q tenant=%q deadline_in=%s", ns, alias, tenantID, debugDeadline(ctx))
 	// afs-only I/O: use recURL; skip local path
@@ -665,10 +709,9 @@ func (m *Manager) dropCredential(key string, cred azcore.TokenCredential) {
 // Credential returns a cached Graph token credential for alias, acquiring and caching if needed.
 func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (azcore.TokenCredential, error) {
 	start := time.Now()
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
+	ns, err := m.namespace(ctx)
+	if err != nil {
+		return nil, err
 	}
 	key := m.clientKey(ns, alias, tenantID, scopes)
 	debugf("graph.Credential start ns=%q alias=%q tenant=%q deadline_in=%s", ns, alias, tenantID, debugDeadline(ctx))
@@ -720,7 +763,6 @@ func (m *Manager) Credential(ctx context.Context, alias, tenantID string, scopes
 	m.mu.Unlock()
 	debugf("graph.Credential acquire_start ns=%q alias=%q tenant=%q elapsed=%s deadline_in=%s", ns, alias, tenantID, time.Since(start).Round(time.Millisecond), debugDeadline(ctx))
 	var cred azcore.TokenCredential
-	var err error
 	if m.authFlow == AuthFlowAuthCode {
 		cred, err = m.oauthCredential(ctx, ns, alias, tenantID, scopes)
 	} else {

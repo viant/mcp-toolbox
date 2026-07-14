@@ -12,14 +12,13 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
-
-	protoclient "github.com/viant/mcp-protocol/client"
-
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	afsscratchpad "github.com/viant/afs/scratchpad"
+	"github.com/viant/mcp-protocol/authorization"
+	protoclient "github.com/viant/mcp-protocol/client"
 	oa "github.com/viant/mcp-toolbox/auth"
 	"github.com/viant/mcp-toolbox/outlook/graph"
 	nsprov "github.com/viant/mcp/server/namespace"
@@ -36,12 +35,11 @@ type Service struct {
 	useText           bool
 	pending           *PendingAuths
 	auth              *oa.Service
-	ns                *nsprov.DefaultProvider
+	ns                nsprov.Provider
 	azure             *cred.Azure
 	tenantID          string
 	clientID          string
 	secretsBase       string
-	scratchpadUserID  string
 	authFlow          graph.AuthFlow
 	oauthRedirectPath string
 	graphScopes       []string
@@ -93,27 +91,35 @@ func NewService(cfg *Config) *Service {
 	if strings.TrimSpace(cfg.CallbackBaseURL) != "" {
 		redirectURL = strings.TrimRight(cfg.CallbackBaseURL, "/") + redirectPath
 	}
+	namespaceProvider := nsprov.NewProvider(&nsprov.Config{
+		PreferIdentity: true,
+		ClaimKeys:      namespaceClaimKeys,
+		Hash:           nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"},
+		Path:           nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120},
+	})
 
 	// Reuse SQLKit interaction UI helpers to keep elicitation patterns consistent.
 	s := &Service{
 		graphMgr: graph.NewManagerWithConfig(&graph.ManagerConfig{
-			ClientID:           clientID,
-			StorageDir:         cfg.SecretsBase,
-			NamespaceClaimKeys: namespaceClaimKeys,
-			AuthFlow:           authFlow,
-			Authority:          cfg.Authority,
-			OAuthRedirectURL:   redirectURL,
-			OAuthScopes:        graphScopes,
+			ClientID:                 clientID,
+			StorageDir:               cfg.SecretsBase,
+			NamespaceClaimKeys:       namespaceClaimKeys,
+			NamespaceProvider:        namespaceProvider,
+			RequireIdentityNamespace: true,
+			AuthFlow:                 authFlow,
+			Authority:                cfg.Authority,
+			OAuthRedirectURL:         redirectURL,
+			OAuthScopes:              graphScopes,
 		}),
 		baseURL:           cfg.CallbackBaseURL,
 		useText:           useText,
 		pending:           NewPendingAuths(),
 		auth:              oa.New(),
+		ns:                namespaceProvider,
 		azure:             az,
 		tenantID:          tenantID,
 		clientID:          clientID,
 		secretsBase:       cfg.SecretsBase,
-		scratchpadUserID:  strings.TrimSpace(cfg.ScratchpadUserID),
 		authFlow:          authFlow,
 		oauthRedirectPath: redirectPath,
 		graphScopes:       graphScopes,
@@ -121,12 +127,9 @@ func NewService(cfg *Config) *Service {
 		elicited:          map[string]time.Time{},
 		elicitedGlobal:    map[string]time.Time{},
 	}
-	s.ns = nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: namespaceClaimKeys, Hash: nsprov.HashConfig{Algorithm: "md5", Prefix: "tkn-"}, Path: nsprov.PathConfig{Prefix: "id-", Sanitize: true, MaxLen: 120}})
-	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" || strings.TrimSpace(cfg.ScratchpadUserID) != "" {
+	if strings.TrimSpace(cfg.ScratchpadRootURI) != "" {
 		afsscratchpad.Register(
 			afsscratchpad.WithRootURI(cfg.ScratchpadRootURI),
-			afsscratchpad.WithUserIDProvider(s.scratchpadUserIDFromContext),
-			afsscratchpad.WithUserID(s.scratchpadUserID),
 			afsscratchpad.WithAllowedTargetSchemes(cfg.ScratchpadTargetSchemes...),
 		)
 	}
@@ -322,6 +325,10 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		r, _, ok := s.requireDirectBearerIdentity(w, r)
+		if !ok {
+			return
+		}
 		alias := r.URL.Query().Get("alias")
 		tenant := s.normalizeTenant(r.URL.Query().Get("tenant"))
 		if alias == "" {
@@ -335,6 +342,10 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 			return
 		}
 		if check.Status == graph.AuthCheckFailed {
+			if check.Reason == graph.IdentityNamespaceRequiredReason {
+				http.Error(w, graph.IdentityNamespaceRequiredMessage, http.StatusUnauthorized)
+				return
+			}
 			message := graph.UserMessageForAuthError(check.Err)
 			if message == "" {
 				message = "Outlook authentication check failed"
@@ -343,10 +354,15 @@ func (s *Service) DeviceStartHandler() http.HandlerFunc {
 			return
 		}
 		var session *PendingAuth
+		var err error
 		if check.Status == graph.AuthCheckReady {
-			session = s.completedAuthSession(r.Context(), alias, tenant, scopes)
+			session, err = s.completedAuthSession(r.Context(), alias, tenant, scopes)
 		} else {
-			session = s.startAuthSession(r.Context(), alias, tenant, scopes)
+			session, err = s.startAuthSession(r.Context(), alias, tenant, scopes)
+		}
+		if err != nil {
+			http.Error(w, graph.IdentityNamespaceRequiredMessage, http.StatusUnauthorized)
+			return
 		}
 		oob := s.authSessionURL(session)
 		if r.Method == http.MethodGet {
@@ -422,6 +438,10 @@ func (s *Service) DeviceCheckHandler() http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		r, _, ok := s.requireDirectBearerIdentity(w, r)
+		if !ok {
+			return
+		}
 		alias := r.URL.Query().Get("alias")
 		tenant := s.normalizeTenant(r.URL.Query().Get("tenant"))
 		if alias == "" {
@@ -441,16 +461,15 @@ func (s *Service) DeviceResetHandler() http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		r, ns, ok := s.requireDirectBearerIdentity(w, r)
+		if !ok {
+			return
+		}
 		alias := r.URL.Query().Get("alias")
 		tenant := s.normalizeTenant(r.URL.Query().Get("tenant"))
 		if alias == "" {
 			http.Error(w, "alias required", http.StatusBadRequest)
 			return
-		}
-		d, _ := s.ns.Namespace(r.Context())
-		ns := d.Name
-		if ns == "" {
-			ns = "default"
 		}
 		purge := parseBool(r.URL.Query().Get("purge"))
 		result, err := s.graphMgr.ResetAuth(r.Context(), alias, tenant, s.GraphScopes(), purge)
@@ -486,6 +505,29 @@ func parseBool(value string) bool {
 	}
 }
 
+func bearerAuthorizationHeader(value string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") || strings.TrimSpace(fields[1]) == "" {
+		return "", false
+	}
+	return "Bearer " + fields[1], true
+}
+
+func (s *Service) requireDirectBearerIdentity(w http.ResponseWriter, r *http.Request) (*http.Request, string, bool) {
+	header, ok := bearerAuthorizationHeader(r.Header.Get("Authorization"))
+	if !ok {
+		http.Error(w, graph.IdentityNamespaceRequiredMessage, http.StatusUnauthorized)
+		return r, "", false
+	}
+	ctx := context.WithValue(r.Context(), authorization.TokenKey, &authorization.Token{Token: header})
+	namespace, err := s.identityNamespace(ctx)
+	if err != nil {
+		http.Error(w, graph.IdentityNamespaceRequiredMessage, http.StatusUnauthorized)
+		return r, "", false
+	}
+	return r.WithContext(ctx), namespace, true
+}
+
 // PendingListHandler returns JSON of pending auths for a namespace.
 func (s *Service) PendingListHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -493,14 +535,8 @@ func (s *Service) PendingListHandler() http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		ns := r.URL.Query().Get("namespace")
-		if ns == "" {
-			if d, err := s.ns.Namespace(r.Context()); err == nil {
-				ns = d.Name
-			}
-		}
-		if ns == "" {
-			http.Error(w, "namespace required", http.StatusBadRequest)
+		_, ns, ok := s.requireDirectBearerIdentity(w, r)
+		if !ok {
 			return
 		}
 		list := s.pending.ListNamespace(ns)
@@ -521,14 +557,8 @@ func (s *Service) PendingClearHandler() http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		ns := r.URL.Query().Get("namespace")
-		if ns == "" {
-			if d, err := s.ns.Namespace(r.Context()); err == nil {
-				ns = d.Name
-			}
-		}
-		if ns == "" {
-			http.Error(w, "namespace required", http.StatusBadRequest)
+		_, ns, ok := s.requireDirectBearerIdentity(w, r)
+		if !ok {
 			return
 		}
 		cleared := s.pending.ClearNamespace(ns)
@@ -564,10 +594,9 @@ func (s *Service) NewOperationsHook(_ protoclient.Operations) {}
 // It delegates acquisition to the graph manager on cache miss and stores it until process restart.
 func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes []string, prompt func(string)) (azcore.TokenCredential, error) {
 	tenantID = s.normalizeTenant(tenantID)
-	dsc, _ := s.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
+	ns, err := s.identityNamespace(ctx)
+	if err != nil {
+		return nil, err
 	}
 	key := authSessionKey(ns, alias, tenantID, scopes)
 	s.credMu.RLock()
@@ -597,32 +626,11 @@ func (s *Service) Credential(ctx context.Context, alias, tenantID string, scopes
 	return cred, nil
 }
 
-func (s *Service) namespace(ctx context.Context) string {
-	d, _ := s.ns.Namespace(ctx)
-	if d.Name != "" {
-		return d.Name
-	}
-	return "default"
-}
-
-func (s *Service) scratchpadUserIDFromContext(ctx context.Context) string {
-	if s != nil && s.ns != nil {
-		if d, err := s.ns.Namespace(ctx); err == nil && !d.IsDefault && strings.TrimSpace(d.Name) != "" {
-			return strings.TrimSpace(d.Name)
-		}
-	}
+func (s *Service) identityNamespace(ctx context.Context) (string, error) {
 	if s == nil {
-		return ""
+		return "", graph.ErrIdentityNamespaceRequired
 	}
-	return strings.TrimSpace(s.scratchpadUserID)
-}
-
-func (s *Service) withScratchpadUser(ctx context.Context) context.Context {
-	userID := s.scratchpadUserIDFromContext(ctx)
-	if userID == "" {
-		return ctx
-	}
-	return afsscratchpad.ContextWithUserID(ctx, userID)
+	return graph.ResolveIdentityNamespace(ctx, s.ns)
 }
 
 func (s *Service) normalizeTenant(tenant string) string {
@@ -643,28 +651,34 @@ func (s *Service) authSessionURL(session *PendingAuth) string {
 	return fmt.Sprintf("%s/outlook/auth/device/%s?alias=%s", base, session.UUID, session.Alias)
 }
 
-func (s *Service) completedAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+func (s *Service) completedAuthSession(ctx context.Context, alias, tenant string, scopes []string) (*PendingAuth, error) {
 	tenant = s.normalizeTenant(tenant)
-	ns := s.namespace(ctx)
+	ns, err := s.identityNamespace(ctx)
+	if err != nil {
+		return nil, err
+	}
 	session, _ := s.pending.GetOrCreate(ns, alias, tenant, scopes, time.Minute, newUUID)
 	if session.Status != AuthStatusAuthenticated {
 		s.pending.Complete(session.UUID)
 		session, _ = s.pending.Get(session.UUID)
 	}
-	return session
+	return session, nil
 }
 
-func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
-	if s.authFlow == graph.AuthFlowAuthCode {
-		return s.startAuthCodeSession(ctx, alias, tenant, scopes)
+func (s *Service) startAuthSession(ctx context.Context, alias, tenant string, scopes []string) (*PendingAuth, error) {
+	ns, err := s.identityNamespace(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return s.startDeviceAuthSession(ctx, alias, tenant, scopes)
+	if s.authFlow == graph.AuthFlowAuthCode {
+		return s.startAuthCodeSession(ns, alias, tenant, scopes), nil
+	}
+	return s.startDeviceAuthSession(ns, alias, tenant, scopes), nil
 }
 
-func (s *Service) startAuthCodeSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+func (s *Service) startAuthCodeSession(ns, alias, tenant string, scopes []string) *PendingAuth {
 	start := time.Now()
 	tenant = s.normalizeTenant(tenant)
-	ns := s.namespace(ctx)
 	state, err := randomURLToken(32)
 	if err != nil {
 		session, _ := s.pending.GetOrCreate(ns, alias, tenant, scopes, authSessionTTL, newUUID)
@@ -679,18 +693,18 @@ func (s *Service) startAuthCodeSession(ctx context.Context, alias, tenant string
 	return session
 }
 
-func (s *Service) startDeviceAuthSession(ctx context.Context, alias, tenant string, scopes []string) *PendingAuth {
+func (s *Service) startDeviceAuthSession(ns, alias, tenant string, scopes []string) *PendingAuth {
 	start := time.Now()
 	tenant = s.normalizeTenant(tenant)
-	ns := s.namespace(ctx)
-	debugf("startAuthSession ns=%q alias=%q tenant=%q deadline_in=%s", ns, alias, tenant, debugDeadline(ctx))
+	debugf("startAuthSession ns=%q alias=%q tenant=%q", ns, alias, tenant)
 	session, created := s.pending.GetOrCreate(ns, alias, tenant, scopes, authSessionTTL, newUUID)
 	if !created {
 		debugf("startAuthSession ns=%q alias=%q tenant=%q existing session=%q status=%q elapsed=%s", ns, alias, tenant, session.UUID, session.Status, time.Since(start).Round(time.Millisecond))
 		return session
 	}
 	debugf("startAuthSession ns=%q alias=%q tenant=%q created session=%q elapsed=%s", ns, alias, tenant, session.UUID, time.Since(start).Round(time.Millisecond))
-	authCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authSessionTTL)
+	identityContext := nsprov.IntoContext(context.Background(), nsprov.Descriptor{Name: session.Namespace, Kind: nsprov.KindIdentity})
+	authCtx, cancel := context.WithTimeout(identityContext, authSessionTTL)
 	go func(uuid string) {
 		bgStart := time.Now()
 		debugf("authSession background_start session=%q ns=%q alias=%q tenant=%q ttl=%s", uuid, ns, alias, tenant, authSessionTTL)
@@ -764,10 +778,10 @@ func (s *Service) waitForAuthSession(ctx context.Context, session *PendingAuth) 
 
 // sessionOrNamespace prefers transport session id else auth namespace
 func (s *Service) sessionOrNamespace(ctx context.Context) string {
-	if d, err := s.ns.Namespace(ctx); err == nil && d.Name != "" {
-		return d.Name
+	if namespace, err := s.identityNamespace(ctx); err == nil {
+		return namespace
 	}
-	return "default"
+	return ""
 }
 
 // ElicitCooldown returns cooldown between repeated elicitations; default 60s.

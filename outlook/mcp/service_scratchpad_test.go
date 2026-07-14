@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,46 +13,73 @@ import (
 	"github.com/viant/afs"
 	afsscratchpad "github.com/viant/afs/scratchpad"
 	"github.com/viant/mcp-protocol/authorization"
+	"github.com/viant/mcp-toolbox/outlook/graph"
 )
 
-func TestServiceScratchpadUserIDFromContextUsesTokenIdentity(t *testing.T) {
-	svc := NewService(&Config{ScratchpadUserID: "fallback"})
+func TestServiceIdentityNamespaceUsesConfiguredClaimOrder(t *testing.T) {
+	svc := NewService(&Config{})
 	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
 		"email": "alice@example.com",
 		"sub":   "alice-subject",
 	}))
-
-	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice@example.com"; got != want {
-		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+	identity, err := svc.identityNamespace(ctx)
+	if err != nil {
+		t.Fatalf("identityNamespace failed: %v", err)
 	}
-	if got, want := afsscratchpad.UserIDFromContext(svc.withScratchpadUser(ctx)), "alice@example.com"; got != want {
-		t.Fatalf("unexpected context scratchpad user id: got %q want %q", got, want)
+	if got, want := identity, "alice@example.com"; got != want {
+		t.Fatalf("unexpected identity: got %q want %q", got, want)
 	}
-}
 
-func TestServiceScratchpadUserIDFromContextUsesSubjectNamespace(t *testing.T) {
-	svc := NewService(&Config{ScratchpadUserID: "fallback", NamespaceClaimKeys: []string{"sub", "email"}})
-	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
+	svc = NewService(&Config{NamespaceClaimKeys: []string{"sub", "email"}})
+	ctx = contextWithBearer(context.Background(), testJWT(t, map[string]any{
 		"email": "alice@example.com",
 		"sub":   "alice-subject",
 	}))
-
-	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice-subject"; got != want {
-		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+	identity, err = svc.identityNamespace(ctx)
+	if err != nil {
+		t.Fatalf("identityNamespace failed: %v", err)
 	}
-	if got, want := afsscratchpad.UserIDFromContext(svc.withScratchpadUser(ctx)), "alice-subject"; got != want {
-		t.Fatalf("unexpected context scratchpad user id: got %q want %q", got, want)
+	if got, want := identity, "alice-subject"; got != want {
+		t.Fatalf("unexpected identity: got %q want %q", got, want)
 	}
 }
 
-func TestServiceScratchpadUserIDFromContextSubjectNamespaceFallsBackToEmail(t *testing.T) {
-	svc := NewService(&Config{ScratchpadUserID: "fallback", NamespaceClaimKeys: []string{"sub", "email"}})
+func TestServiceIdentityNamespaceUsesNextConfiguredClaim(t *testing.T) {
+	svc := NewService(&Config{NamespaceClaimKeys: []string{"sub", "email"}})
 	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
 		"email": "alice@example.com",
 	}))
+	identity, err := svc.identityNamespace(ctx)
+	if err != nil {
+		t.Fatalf("identityNamespace failed: %v", err)
+	}
+	if got, want := identity, "alice@example.com"; got != want {
+		t.Fatalf("unexpected identity: got %q want %q", got, want)
+	}
+}
 
-	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice@example.com"; got != want {
-		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+func TestServiceIdentityNamespaceRejectsNonIdentityDescriptors(t *testing.T) {
+	svc := NewService(&Config{})
+	tests := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "default", ctx: context.Background()},
+		{name: "token hash", ctx: contextWithBearer(context.Background(), "opaque-token")},
+		{name: "malformed", ctx: contextWithBearer(context.Background(), "not.a.jwt")},
+		{name: "missing claims", ctx: contextWithBearer(context.Background(), testJWT(t, map[string]any{"aud": "outlook"}))},
+		{name: "empty claim", ctx: contextWithBearer(context.Background(), testJWT(t, map[string]any{"email": "", "sub": ""}))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := svc.identityNamespace(test.ctx)
+			if !errors.Is(err, graph.ErrIdentityNamespaceRequired) {
+				t.Fatalf("expected identity error, got %v", err)
+			}
+			if err.Error() != graph.IdentityNamespaceRequiredMessage {
+				t.Fatalf("unexpected identity error message: %q", err.Error())
+			}
+		})
 	}
 }
 
@@ -59,7 +87,6 @@ func TestServiceWiresNamespaceClaimKeysToScratchpadAndGraphManager(t *testing.T)
 	storageDir := t.TempDir()
 	svc := NewService(&Config{
 		SecretsBase:        storageDir,
-		ScratchpadUserID:   "fallback",
 		NamespaceClaimKeys: []string{"sub", "email"},
 	})
 	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{
@@ -67,8 +94,12 @@ func TestServiceWiresNamespaceClaimKeysToScratchpadAndGraphManager(t *testing.T)
 		"sub":   "alice-subject",
 	}))
 
-	if got, want := svc.scratchpadUserIDFromContext(ctx), "alice-subject"; got != want {
-		t.Fatalf("unexpected scratchpad user id: got %q want %q", got, want)
+	identity, err := svc.identityNamespace(ctx)
+	if err != nil || identity != "alice-subject" {
+		t.Fatalf("unexpected identity: got %q err=%v", identity, err)
+	}
+	if got := afsscratchpad.UserIDFromContext(afsscratchpad.ContextWithUserID(ctx, identity)); got != identity {
+		t.Fatalf("scratchpad identity %q differs from Outlook identity %q", got, identity)
 	}
 
 	subjectRecord := filepath.Join(storageDir, "alice-subject_personal_auth_record.json")
@@ -91,17 +122,6 @@ func TestServiceWiresNamespaceClaimKeysToScratchpadAndGraphManager(t *testing.T)
 	}
 }
 
-func TestServiceScratchpadUserIDFromContextFallback(t *testing.T) {
-	svc := NewService(&Config{ScratchpadUserID: "fallback"})
-
-	if got, want := svc.scratchpadUserIDFromContext(context.Background()), "fallback"; got != want {
-		t.Fatalf("unexpected fallback scratchpad user id: got %q want %q", got, want)
-	}
-	if got, want := afsscratchpad.UserIDFromContext(svc.withScratchpadUser(context.Background())), "fallback"; got != want {
-		t.Fatalf("unexpected fallback context scratchpad user id: got %q want %q", got, want)
-	}
-}
-
 func TestServiceScratchpadRegistrationUsesRequestUser(t *testing.T) {
 	dir := t.TempDir()
 	root := "file://" + filepath.ToSlash(filepath.Join(dir, "scratchpad", "${userID}"))
@@ -114,12 +134,22 @@ func TestServiceScratchpadRegistrationUsesRequestUser(t *testing.T) {
 		afsscratchpad.WithAllowedTargetSchemes("file"),
 	)
 
-	aliceCtx := svc.withScratchpadUser(contextWithBearer(context.Background(), testJWT(t, map[string]any{
+	aliceRequestContext := contextWithBearer(context.Background(), testJWT(t, map[string]any{
 		"email": "alice@example.com",
-	})))
-	bobCtx := svc.withScratchpadUser(contextWithBearer(context.Background(), testJWT(t, map[string]any{
+	}))
+	bobRequestContext := contextWithBearer(context.Background(), testJWT(t, map[string]any{
 		"email": "bob@example.com",
-	})))
+	}))
+	aliceIdentity, err := svc.identityNamespace(aliceRequestContext)
+	if err != nil {
+		t.Fatalf("failed to resolve alice identity: %v", err)
+	}
+	bobIdentity, err := svc.identityNamespace(bobRequestContext)
+	if err != nil {
+		t.Fatalf("failed to resolve bob identity: %v", err)
+	}
+	aliceCtx := afsscratchpad.ContextWithUserID(aliceRequestContext, aliceIdentity)
+	bobCtx := afsscratchpad.ContextWithUserID(bobRequestContext, bobIdentity)
 	writeMCPTestArtifact(t, scratchpad, aliceCtx, "report-1", "file://"+filepath.ToSlash(writeMCPTestFile(t, dir, "alice.txt", "alice report")))
 
 	data, err := afs.New().DownloadWithURL(aliceCtx, "scratchpad://artifact/report-1")

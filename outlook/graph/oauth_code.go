@@ -19,6 +19,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/viant/afs"
+	nsprov "github.com/viant/mcp/server/namespace"
 	"golang.org/x/oauth2"
 )
 
@@ -34,11 +35,13 @@ const defaultMicrosoftAuthority = "https://login.microsoftonline.com"
 var errOAuthTokenMissing = errors.New("no usable OAuth token")
 
 type ManagerConfig struct {
-	ClientID           string
-	StorageDir         string
-	NamespaceClaimKeys []string
-	AuthFlow           AuthFlow
-	Authority          string
+	ClientID                 string
+	StorageDir               string
+	NamespaceClaimKeys       []string
+	NamespaceProvider        nsprov.Provider
+	RequireIdentityNamespace bool
+	AuthFlow                 AuthFlow
+	Authority                string
 
 	OAuthRedirectURL      string
 	OAuthScopes           []string
@@ -305,16 +308,15 @@ func (c *oauthCodeCredential) GetToken(ctx context.Context, opts policy.TokenReq
 func (m *Manager) oauthAuthCheck(ctx context.Context, alias, tenantID string, scopes []string) AuthCheckResult {
 	start := time.Now()
 	debugf("graph.oauthAuthCheck start alias=%q tenant=%q deadline_in=%s", alias, tenantID, debugDeadline(ctx))
+	ns, err := m.namespace(ctx)
+	if err != nil {
+		return AuthCheckResult{Status: AuthCheckFailed, Reason: IdentityNamespaceRequiredReason, Err: err}
+	}
 	if err := m.ensureDirs(); err != nil {
 		return AuthCheckResult{Status: AuthCheckFailed, Reason: "storage_unavailable", Err: err}
 	}
-	dsc, _ := m.ns.Namespace(ctx)
-	ns := dsc.Name
-	if ns == "" {
-		ns = "default"
-	}
 	scopes = m.effectiveOAuthScopes(scopes)
-	_, err := m.oauthToken(ctx, ns, alias, tenantID, scopes)
+	_, err = m.oauthToken(ctx, ns, alias, tenantID, scopes)
 	debugf("graph.oauthAuthCheck token ns=%q alias=%q tenant=%q err=%v elapsed=%s", ns, alias, tenantID, err, time.Since(start).Round(time.Millisecond))
 	if err == nil {
 		return AuthCheckResult{Status: AuthCheckReady}

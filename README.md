@@ -85,9 +85,10 @@ Run with flags:
 
 ```
 go run ./outlook/cmd/outlook-mcp \
-  --a :7788 \
-  --azure-ref "azure-cred|blowfish://default"
-   -o "ipd_xxx.enc|blowfish://default" -i
+  --addr :7788 \
+  --azure-ref "azure-cred|blowfish://default" \
+  --oauth2config "idp_xxx.enc|blowfish://default" \
+  --use-id-token
 ```
 
 
@@ -100,7 +101,10 @@ export OUTLOOK_CLIENT_ID=00000000-0000-0000-0000-000000000000
 # Optional: OUTLOOK_TENANT_ID defaults to "organizations" if not set.
 # export OUTLOOK_TENANT_ID=organizations
 export OUTLOOK_AZURE_REF='gcp://secretmanager/projects/myproj/secrets/azure-cred|blowfish://default'
-go run ./outlook/cmd/outlook-mcp -addr :7788 --secretsBase mem://localhost/mcp-outlook
+go run ./outlook/cmd/outlook-mcp \
+  -addr :7788 \
+  --secretsBase mem://localhost/mcp-outlook \
+  --allow-unverified-bearer-context
 ```
 
 For more on Outlook configuration, see `outlook/mcp/README.md`.
@@ -138,28 +142,29 @@ Storage directories default to a subfolder in the user config directory.
     - `--elicit-cooldown-secs`: cooldown between repeated credential prompts per namespace+alias+domain (default 60)
 
 - Outlook
-  - Flags: `-addr`, `--public-base-url`, `-client-id`, `-tenant-id`, `-azure-ref`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`
+  - Flags: `-addr`, `--public-base-url`, `-client-id`, `-tenant-id`, `-azure-ref`, `-o/--oauth2config`, `-i/--use-id-token`, `--secretsBase`, `--allow-unverified-bearer-context`, `--namespace-claim-keys`
   - Env: `OUTLOOK_CLIENT_ID`, `OUTLOOK_TENANT_ID`, `OUTLOOK_AZURE_REF`
   - `-azure-ref`/`OUTLOOK_AZURE_REF` uses `scy` EncodedResource to load `cred.Azure` secrets (supports file/GCP/AWS backends with KMS like `blowfish://default`).
 
 ## Namespace Isolation
 
-MCP requests and stored credentials are isolated by a “namespace” derived from the caller’s identity:
+Outlook MCP requests and stored Graph credentials are isolated by a strict identity namespace. The default claim order is `email,sub`, configurable only with `--namespace-claim-keys`. The first configured non-empty claim is used after an unverified JWT parse. Missing, malformed, default, and token-hash results are rejected; this flow has no static or shared namespace fallback.
 
-- With server auth enabled (`-o/--oauth2config`), the authorizer places a token in the request context. We extract `email` or `sub` (subject) from that token to form the namespace. If neither can be extracted, we fall back to a stable token hash namespace `tkn-<md5>` to prevent cross-user leakage.
-- Without server auth, if the caller supplies `Authorization: Bearer <jwt>`, we still derive namespace from claims or fall back to `tkn-<md5>`; otherwise, the namespace defaults to `default`.
+- With server auth enabled (`-o/--oauth2config`), the existing OAuth/BFF authorizer branch supplies the request token. Do not combine this option with `--allow-unverified-bearer-context`.
+- For local direct-Bearer HTTP, explicitly pass `--allow-unverified-bearer-context`. The passive bridge then copies only a non-empty `Authorization: Bearer ...` header into the request context. It does not validate the JWT signature.
+- Active Outlook HTTP requires one of those two modes. An empty `--addr` remains valid and disables HTTP.
 
 Per-namespace separation in this repo:
 - GitHub: tokens, wait/wakeup keys, and repo tree caches are keyed by namespace. Elicitation is deduped per session and per namespace (no cross‑namespace suppression). Out‑of‑band flows include a `uuid` that binds the UI to the original namespace so token saves land in the correct scope.
-- Outlook: authentication records (disk/AFS), azidentity caches, and in‑memory clients/creds are keyed by namespace. Concurrent acquisitions are serialized per ns+alias to avoid duplicate prompts.
+- Outlook: authentication records (disk/AFS), pending sign-ins, scratchpad attachments, and in-memory clients/credentials use the same strict identity. Concurrent acquisitions are serialized per identity+alias to avoid duplicate prompts.
 
 Important for remote deployments:
-- To guarantee isolation across concurrently connected users, run with both `-o` and `-i` (ID tokens) and ensure the client completes the BFF/auth flow. Otherwise, auth tokens or connections obtained under a weaker namespace (e.g., `default`) could be visible to other users via fallback behavior.
-- If you intentionally share credentials (e.g., a team-wide token), you may omit `-o/-i` and rely on the `default` namespace, but be aware this is shared across users.
+- For remote deployments, use `-o` and the appropriate token mode (commonly `-i` for an ID token carrying the configured identity claim), and ensure the client completes the BFF/auth flow.
+- `--allow-unverified-bearer-context` is an explicit trust-boundary option for deployments that already control the direct Bearer header. It performs no JWT validation.
 
 HTTP auth endpoints and BFF:
 - JSON‑RPC (`/mcp`) calls are mediated by the authorizer when `-o` is set.
-- Custom HTTP auth endpoints (`/github/auth/*`, `/outlook/auth/*`) can be wrapped by the authorizer, or you can pass `Authorization: Bearer <id_token>` directly. GitHub’s OOB UI also uses a `uuid` to bind subsequent HTTP requests to the original namespace.
+- Outlook `/outlook/auth/start`, `/check`, `/reset`, `/pending`, and `/pending/clear` require a direct Bearer JWT with an identity claim; a `namespace` query parameter cannot override it. `/outlook/auth/device/{uuid}` and the OAuth callback do not require Bearer because they use the identity stored in the pending sign-in at start. GitHub’s OOB behavior is unchanged.
 
 GitHub checkout destination:
 - When `destDir` is not provided, checkouts are written under a namespaced path to avoid collisions:

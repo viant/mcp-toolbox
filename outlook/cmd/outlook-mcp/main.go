@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -24,23 +25,23 @@ import (
 
 // Options defines CLI flags for the Outlook MCP server.
 type Options struct {
-	HTTPAddr                string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
-	ClientID                string `long:"client-id" description:"Azure AD application (client) ID"`
-	TenantID                string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
-	AuthFlow                string `long:"auth-flow" description:"Microsoft Graph auth flow: device or auth-code"`
-	OAuthRedirectPath       string `long:"oauth-redirect-path" description:"Callback path for auth-code OAuth flow"`
-	GraphScopes             string `long:"graph-scopes" description:"Comma/space-separated Microsoft Graph delegated scopes"`
-	SecretsBase             string `long:"secretsBase" description:"AFS/scy base URL for persisting auth records (e.g., mem://localhost/mcp-outlook)"`
-	AzureRef                string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
-	Oauth2Config            string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
-	BFFRedirectURI          string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
-	UseIdToken              bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
-	PublicBaseURL           string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-outlook.agently.svc.cluster.local:7788)"`
-	ScratchpadRootURI       string `long:"scratchpad-root-uri" description:"Shared scratchpad root URI template for scratchpad:// attachments"`
-	ScratchpadUserID        string `long:"scratchpad-user-id" description:"Fallback user id for local/no-auth scratchpad attachment resolution"`
-	AttachmentSourceSchemes string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty allows all"`
-	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Comma-separated allowed underlying artifact source schemes after scratchpad resolution"`
-	NamespaceClaimKeys      string `long:"namespace-claim-keys" description:"Comma-separated JWT identity claim lookup order for per-user namespaces (default: email,sub)"`
+	HTTPAddr                     string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
+	ClientID                     string `long:"client-id" description:"Azure AD application (client) ID"`
+	TenantID                     string `long:"tenant-id" description:"Tenant ID or 'organizations'"`
+	AuthFlow                     string `long:"auth-flow" description:"Microsoft Graph auth flow: device or auth-code"`
+	OAuthRedirectPath            string `long:"oauth-redirect-path" description:"Callback path for auth-code OAuth flow"`
+	GraphScopes                  string `long:"graph-scopes" description:"Comma/space-separated Microsoft Graph delegated scopes"`
+	SecretsBase                  string `long:"secretsBase" description:"AFS/scy base URL for persisting auth records (e.g., mem://localhost/mcp-outlook)"`
+	AzureRef                     string `long:"azure-ref" description:"scy EncodedResource for Azure cred (e.g., gcp://...|blowfish://default)"`
+	Oauth2Config                 string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration file (scy EncodedResource)"`
+	BFFRedirectURI               string `long:"bff-redirect-uri" description:"Redirect URI for Backend-For-Frontend OAuth flow (browser callback)"`
+	UseIdToken                   bool   `short:"i" long:"use-id-token" description:"Use ID token (instead of access token) for identity scoping"`
+	PublicBaseURL                string `long:"public-base-url" description:"Public base URL for OOB/auth callbacks (e.g., http://mcp-toolbox-outlook.agently.svc.cluster.local:7788)"`
+	AllowUnverifiedBearerContext bool   `long:"allow-unverified-bearer-context" description:"Allow direct Bearer JWT headers to populate request identity context without verification"`
+	ScratchpadRootURI            string `long:"scratchpad-root-uri" description:"Shared scratchpad root URI template for scratchpad:// attachments"`
+	AttachmentSourceSchemes      string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty allows all"`
+	ScratchpadTargetSchemes      string `long:"scratchpad-target-schemes" description:"Comma-separated allowed underlying artifact source schemes after scratchpad resolution"`
+	NamespaceClaimKeys           string `long:"namespace-claim-keys" description:"Comma-separated JWT identity claim lookup order for per-user namespaces (default: email,sub)"`
 }
 
 func main() {
@@ -50,23 +51,26 @@ func main() {
 		os.Exit(2)
 	}
 	applyOptionDefaults(&opts)
+	if err := validateAuthMode(opts); err != nil {
+		log.Fatal(err)
+	}
 	if opts.ClientID == "" && opts.AzureRef == "" {
 		log.Fatal("missing --client-id/OUTLOOK_CLIENT_ID (or provide --azure-ref / OUTLOOK_AZURE_REF)")
 	}
 	if !graph.ValidAuthFlow(opts.AuthFlow) {
 		log.Fatalf("invalid --auth-flow %q (expected device or auth-code)", opts.AuthFlow)
 	}
-	debugf("startup options addr=%q tenant=%q auth_flow=%q client_id_set=%t azure_ref_set=%t oauth2config_set=%t public_base_url_set=%t secrets_base_set=%t scratchpad_root_set=%t scratchpad_user_id_set=%t attachment_source_schemes=%q scratchpad_target_schemes=%q namespace_claim_keys=%q",
+	debugf("startup options addr=%q tenant=%q auth_flow=%q client_id_set=%t azure_ref_set=%t oauth2config_set=%t allow_unverified_bearer_context=%t public_base_url_set=%t secrets_base_set=%t scratchpad_root_set=%t attachment_source_schemes=%q scratchpad_target_schemes=%q namespace_claim_keys=%q",
 		opts.HTTPAddr,
 		opts.TenantID,
 		opts.AuthFlow,
 		strings.TrimSpace(opts.ClientID) != "",
 		strings.TrimSpace(opts.AzureRef) != "",
 		strings.TrimSpace(opts.Oauth2Config) != "",
+		opts.AllowUnverifiedBearerContext,
 		strings.TrimSpace(opts.PublicBaseURL) != "",
 		strings.TrimSpace(opts.SecretsBase) != "",
 		strings.TrimSpace(opts.ScratchpadRootURI) != "",
-		strings.TrimSpace(opts.ScratchpadUserID) != "",
 		opts.AttachmentSourceSchemes,
 		opts.ScratchpadTargetSchemes,
 		opts.NamespaceClaimKeys,
@@ -204,9 +208,11 @@ func main() {
 			mcpsrv.WithAuthorizer(authSvc.Middleware),
 			mcpsrv.WithProtectedResourcesHandler(authSvc.ProtectedResourcesHandler),
 		)
-	} else {
+	} else if opts.AllowUnverifiedBearerContext {
 		debugf("authorizer mode=passive_bearer oauth2config_set=false")
 		options = append(options, mcpsrv.WithAuthorizer(passiveBearerAuthorizer))
+	} else {
+		debugf("authorizer mode=none oauth2config_set=false")
 	}
 
 	server, err := mcpsrv.New(options...)
@@ -230,6 +236,7 @@ func envOr(k, def string) string {
 }
 
 func applyOptionDefaults(opts *Options) {
+	opts.HTTPAddr = strings.TrimSpace(opts.HTTPAddr)
 	if opts.SecretsBase == "" {
 		opts.SecretsBase = "mem://localhost/mcp-outlook"
 	}
@@ -253,9 +260,6 @@ func applyOptionDefaults(opts *Options) {
 	}
 	if opts.ScratchpadRootURI == "" {
 		opts.ScratchpadRootURI = envOr("OUTLOOK_SCRATCHPAD_ROOT_URI", "")
-	}
-	if opts.ScratchpadUserID == "" {
-		opts.ScratchpadUserID = envOr("OUTLOOK_SCRATCHPAD_USER_ID", "")
 	}
 	if opts.AttachmentSourceSchemes == "" {
 		opts.AttachmentSourceSchemes = envOr("OUTLOOK_ATTACHMENT_SOURCE_SCHEMES", "")
@@ -290,7 +294,6 @@ func serviceConfigFromOptions(opts Options, baseURL string) *mcp.Config {
 		CallbackBaseURL:         baseURL,
 		AzureRef:                scy.EncodedResource(opts.AzureRef),
 		ScratchpadRootURI:       strings.Replace(opts.ScratchpadRootURI, "$HOME", os.Getenv("HOME"), 1),
-		ScratchpadUserID:        opts.ScratchpadUserID,
 		AttachmentSourceSchemes: splitCSV(opts.AttachmentSourceSchemes),
 		ScratchpadTargetSchemes: splitCSV(opts.ScratchpadTargetSchemes),
 		NamespaceClaimKeys:      mcp.ParseNamespaceClaimKeys(opts.NamespaceClaimKeys),
@@ -315,9 +318,28 @@ func defaultStorageDir() string {
 
 func passiveBearerAuthorizer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if token := strings.TrimSpace(r.Header.Get("Authorization")); token != "" {
+		if token, ok := directBearerHeader(r.Header.Get("Authorization")); ok {
 			r = r.WithContext(context.WithValue(r.Context(), authorization.TokenKey, &authorization.Token{Token: token}))
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func directBearerHeader(value string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") || strings.TrimSpace(fields[1]) == "" {
+		return "", false
+	}
+	return "Bearer " + fields[1], true
+}
+
+func validateAuthMode(opts Options) error {
+	hasOAuth := strings.TrimSpace(opts.Oauth2Config) != ""
+	if hasOAuth && opts.AllowUnverifiedBearerContext {
+		return fmt.Errorf("--oauth2config cannot be combined with --allow-unverified-bearer-context")
+	}
+	if strings.TrimSpace(opts.HTTPAddr) != "" && !hasOAuth && !opts.AllowUnverifiedBearerContext {
+		return fmt.Errorf("active HTTP requires --oauth2config or --allow-unverified-bearer-context")
+	}
+	return nil
 }

@@ -1,4 +1,5 @@
 List tasks from Microsoft To Do.
+Requires a Bearer JWT with a configured non-empty identity claim; no default or token-hash namespace is accepted.
 Inputs:
 - account.alias (required): stored account alias.
 - top (optional): max tasks (default 20).

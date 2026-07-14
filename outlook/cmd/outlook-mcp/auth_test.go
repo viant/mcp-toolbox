@@ -46,6 +46,63 @@ func TestPassiveBearerAuthorizerAllowsMissingAuthorization(t *testing.T) {
 	}
 }
 
+func TestPassiveBearerAuthorizerOnlyCopiesNonEmptyBearer(t *testing.T) {
+	for _, header := range []string{"Basic dXNlcjpwYXNz", "Bearer", "Bearer   ", "Token abc", "Bearer one two"} {
+		t.Run(header, func(t *testing.T) {
+			var got any
+			next := passiveBearerAuthorizer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Context().Value(authorization.TokenKey)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			req.Header.Set("Authorization", header)
+			next.ServeHTTP(httptest.NewRecorder(), req)
+			if got != nil {
+				t.Fatalf("unexpected token context for %q: %v", header, got)
+			}
+		})
+	}
+}
+
+func TestValidateAuthMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    Options
+		wantErr bool
+	}{
+		{name: "empty address", opts: Options{}},
+		{name: "empty address with bridge", opts: Options{AllowUnverifiedBearerContext: true}},
+		{name: "active HTTP without auth", opts: Options{HTTPAddr: ":7788"}, wantErr: true},
+		{name: "active HTTP with passive bridge", opts: Options{HTTPAddr: ":7788", AllowUnverifiedBearerContext: true}},
+		{name: "active HTTP with oauth", opts: Options{HTTPAddr: ":7788", Oauth2Config: "oauth.json"}},
+		{name: "oauth and passive bridge conflict", opts: Options{HTTPAddr: ":7788", Oauth2Config: "oauth.json", AllowUnverifiedBearerContext: true}, wantErr: true},
+		{name: "empty address oauth conflict", opts: Options{Oauth2Config: "oauth.json", AllowUnverifiedBearerContext: true}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAuthMode(test.opts)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateAuthMode() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestAllowUnverifiedBearerContextFlagHasNoEnvFallback(t *testing.T) {
+	t.Setenv("OUTLOOK_ALLOW_UNVERIFIED_BEARER_CONTEXT", "true")
+	opts := Options{}
+	applyOptionDefaults(&opts)
+	if opts.AllowUnverifiedBearerContext {
+		t.Fatal("unexpected environment fallback")
+	}
+	if _, err := flags.NewParser(&opts, flags.Default).ParseArgs([]string{"--allow-unverified-bearer-context"}); err != nil {
+		t.Fatalf("failed to parse flag: %v", err)
+	}
+	if !opts.AllowUnverifiedBearerContext {
+		t.Fatal("expected flag to enable passive bridge")
+	}
+}
+
 func TestOptionsParsesNamespaceClaimKeysFlag(t *testing.T) {
 	var opts Options
 	if _, err := flags.NewParser(&opts, flags.Default).ParseArgs([]string{"--namespace-claim-keys", "sub,email"}); err != nil {

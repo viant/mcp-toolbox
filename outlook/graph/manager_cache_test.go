@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	msgraphsdk "github.com/microsoftgraph/msgraph-sdk-go"
 	"github.com/viant/mcp-protocol/authorization"
+	nsprov "github.com/viant/mcp/server/namespace"
 	"golang.org/x/oauth2"
 )
 
@@ -94,6 +96,73 @@ func TestManagerAuthRecordNamespaceCanUseSubject(t *testing.T) {
 	}
 	if got, want := m.authRecordURL(d.Name, "personal"), filepath.Join(storageDir, "alice-subject_personal_auth_record.json"); got != want {
 		t.Fatalf("unexpected auth record URL: got %q want %q", got, want)
+	}
+}
+
+func TestStrictManagerRejectsMissingIdentityBeforeStorage(t *testing.T) {
+	storageDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(storageDir, "default_personal_auth_record.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("failed to write default auth record: %v", err)
+	}
+	provider := nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: []string{"email", "sub"}})
+	m := NewManagerWithConfig(&ManagerConfig{
+		ClientID:                 "client-id",
+		StorageDir:               storageDir,
+		NamespaceProvider:        provider,
+		RequireIdentityNamespace: true,
+	})
+
+	check := m.AuthCheck(context.Background(), "personal", "consumers", []string{"scope"})
+	if check.Status != AuthCheckFailed || check.Reason != IdentityNamespaceRequiredReason {
+		t.Fatalf("unexpected auth check: %#v", check)
+	}
+	if !errors.Is(check.Err, ErrIdentityNamespaceRequired) {
+		t.Fatalf("expected identity error, got %v", check.Err)
+	}
+	if m.HasAuthRecord(context.Background(), "personal") {
+		t.Fatal("strict HasAuthRecord must not use the default namespace")
+	}
+	if _, err := m.ResetAuth(context.Background(), "personal", "consumers", []string{"scope"}, false); !errors.Is(err, ErrIdentityNamespaceRequired) {
+		t.Fatalf("ResetAuth error = %v", err)
+	}
+	if _, err := m.Credential(context.Background(), "personal", "consumers", []string{"scope"}, nil); !errors.Is(err, ErrIdentityNamespaceRequired) {
+		t.Fatalf("Credential error = %v", err)
+	}
+	if _, err := m.Client(context.Background(), "personal", "consumers", []string{"scope"}, nil); !errors.Is(err, ErrIdentityNamespaceRequired) {
+		t.Fatalf("Client error = %v", err)
+	}
+	if err := m.Acquire(context.Background(), "personal", "consumers", []string{"scope"}, nil); !errors.Is(err, ErrIdentityNamespaceRequired) {
+		t.Fatalf("Acquire error = %v", err)
+	}
+
+	oauthManager := NewManagerWithConfig(&ManagerConfig{
+		ClientID:                 "client-id",
+		StorageDir:               storageDir,
+		NamespaceProvider:        provider,
+		RequireIdentityNamespace: true,
+		AuthFlow:                 AuthFlowAuthCode,
+	})
+	oauthCheck := oauthManager.AuthCheck(context.Background(), "personal", "common", []string{"Mail.Send"})
+	if oauthCheck.Status != AuthCheckFailed || oauthCheck.Reason != IdentityNamespaceRequiredReason || !errors.Is(oauthCheck.Err, ErrIdentityNamespaceRequired) {
+		t.Fatalf("unexpected strict OAuth auth check: %#v", oauthCheck)
+	}
+}
+
+func TestStrictManagerAcceptsUnsignedJWTIdentity(t *testing.T) {
+	storageDir := t.TempDir()
+	provider := nsprov.NewProvider(&nsprov.Config{PreferIdentity: true, ClaimKeys: []string{"email", "sub"}})
+	m := NewManagerWithConfig(&ManagerConfig{
+		ClientID:                 "client-id",
+		StorageDir:               storageDir,
+		NamespaceProvider:        provider,
+		RequireIdentityNamespace: true,
+	})
+	ctx := graphContextWithBearer(context.Background(), graphTestJWT(t, map[string]any{"email": "alice@example.com"}))
+	if err := os.WriteFile(filepath.Join(storageDir, "alice_example.com_personal_auth_record.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("failed to write identity auth record: %v", err)
+	}
+	if !m.HasAuthRecord(ctx, "personal") {
+		t.Fatal("expected unsigned JWT identity namespace to be accepted")
 	}
 }
 

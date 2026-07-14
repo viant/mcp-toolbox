@@ -23,6 +23,7 @@ func TestDeviceResetHandlerRequiresPost(t *testing.T) {
 func TestDeviceResetHandlerRequiresAlias(t *testing.T) {
 	svc := NewService(&Config{SecretsBase: t.TempDir()})
 	req := httptest.NewRequest(http.MethodPost, "/outlook/auth/reset", nil)
+	req.Header.Set("Authorization", "Bearer "+testJWT(t, map[string]any{"email": "alice@example.com"}))
 	rec := httptest.NewRecorder()
 
 	svc.DeviceResetHandler().ServeHTTP(rec, req)
@@ -35,14 +36,18 @@ func TestDeviceResetHandlerRequiresAlias(t *testing.T) {
 func TestCompletedAuthSessionCompletesExistingPendingSession(t *testing.T) {
 	svc := NewService(&Config{SecretsBase: t.TempDir()})
 	scopes := []string{"scope"}
-	pending, created := svc.pending.GetOrCreate("default", "personal", "consumers", scopes, time.Hour, func() string {
+	ctx := contextWithBearer(context.Background(), testJWT(t, map[string]any{"email": "alice@example.com"}))
+	pending, created := svc.pending.GetOrCreate("alice@example.com", "personal", "consumers", scopes, time.Hour, func() string {
 		return "pending-session"
 	})
 	if !created {
 		t.Fatalf("expected pending session to be created")
 	}
 
-	session := svc.completedAuthSession(context.Background(), "personal", "consumers", scopes)
+	session, err := svc.completedAuthSession(ctx, "personal", "consumers", scopes)
+	if err != nil {
+		t.Fatalf("completedAuthSession failed: %v", err)
+	}
 	if session.UUID != pending.UUID {
 		t.Fatalf("expected existing pending session to be reused, got %q want %q", session.UUID, pending.UUID)
 	}
