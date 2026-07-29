@@ -12,6 +12,7 @@ require (
 	github.com/jessevdk/go-flags v1.5.0
 	github.com/keybase/go-keychain v0.0.1
 	github.com/microsoftgraph/msgraph-sdk-go v1.86.0
+	github.com/sendgrid/sendgrid-go v3.16.1+incompatible
 	github.com/tebeka/selenium v0.9.10-0.20211105214847-e9100b7f5ac1
 	github.com/viant/afs v1.30.1-0.20260707124824-0373fe4ae4cb
 	github.com/viant/afsc v1.9.1
@@ -28,6 +29,7 @@ require (
 	github.com/go-vgo/robotgo v1.0.0
 	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/otiai10/gosseract/v2 v2.4.1
+	github.com/sendgrid/rest v2.6.9+incompatible
 	github.com/stretchr/testify v1.11.1
 	github.com/tailscale/win v0.0.0-20250627215312-f4da2b8ee071
 	github.com/trivago/tgo v1.0.7
@@ -42,12 +44,14 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.2.5 // indirect
 	cloud.google.com/go/compute/metadata v0.5.2 // indirect
 	cloud.google.com/go/iam v1.2.1 // indirect
+	cloud.google.com/go/secretmanager v1.14.1 // indirect
 	cloud.google.com/go/storage v1.43.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.3.0 // indirect
+	github.com/aws/aws-sdk-go v1.51.23 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/cloudflare/circl v1.6.1 // indirect
 	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
@@ -74,6 +78,7 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.4 // indirect
 	github.com/googleapis/gax-go/v2 v2.13.0 // indirect
 	github.com/jezek/xgb v1.2.0 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/kevinburke/ssh_config v1.4.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
