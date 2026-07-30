@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -24,6 +28,10 @@ import (
 )
 
 const (
+	sendGridServiceName = "sendgrid-mcp"
+	sendGridVersion     = "0.1.0"
+	sendGridEndpoint    = "/mcp"
+
 	// sendGridMaxRequestBodyBytes accommodates the base64 and JSON envelope for
 	// SendGrid's 21,000,000-byte decoded attachment limit while bounding reads.
 	sendGridMaxRequestBodyBytes = int64(32 << 20)
@@ -53,42 +61,140 @@ type Options struct {
 
 func main() {
 	ctx := context.Background()
-	var opts Options
-	if _, err := flags.NewParser(&opts, flags.Default).Parse(); err != nil {
+	opts, failure := parseCommandLine(os.Args[1:], os.Stdout)
+	if failure != nil {
+		logStartupFailure(log.Default(), failure)
 		os.Exit(2)
 	}
+	if opts == nil {
+		return
+	}
+	if failure := run(ctx, *opts, log.Default()); failure != nil {
+		logStartupFailure(log.Default(), failure)
+		os.Exit(1)
+	}
+}
+
+func parseCommandLine(args []string, helpOutput io.Writer) (*Options, *startupFailure) {
+	var opts Options
+	parser := flags.NewParser(&opts, flags.Default&^flags.PrintErrors)
+	if _, err := parser.ParseArgs(args); err != nil {
+		if flags.WroteHelp(err) {
+			parser.WriteHelp(helpOutput)
+			return nil, nil
+		}
+		return nil, &startupFailure{
+			stage: startupStageConfig,
+			err:   errors.New("invalid command-line configuration"),
+		}
+	}
+	return &opts, nil
+}
+
+type startupStage string
+
+const (
+	startupStageConfig   startupStage = "config"
+	startupStageSendGrid startupStage = "sendgrid"
+	startupStageOAuth    startupStage = "oauth"
+	startupStageOIDC     startupStage = "oidc"
+	startupStageServer   startupStage = "server"
+	startupStageListener startupStage = "listener"
+	startupStageServe    startupStage = "serve"
+)
+
+type startupFailure struct {
+	stage startupStage
+	err   error
+}
+
+func (f *startupFailure) Error() string {
+	if f == nil || f.err == nil {
+		return ""
+	}
+	return f.err.Error()
+}
+
+func (f *startupFailure) Unwrap() error {
+	if f == nil {
+		return nil
+	}
+	return f.err
+}
+
+func logStartupFailure(logger *log.Logger, failure *startupFailure) {
+	logger.Printf(
+		"startup_failed service=%q version=%q stage=%s error=%q",
+		sendGridServiceName,
+		sendGridVersion,
+		failure.stage,
+		failure.Error(),
+	)
+}
+
+type startupDependencies struct {
+	newSendGridService func(context.Context, sendgridsvc.Config) (*sendgridsvc.Service, error)
+	loadOAuthConfig    func(context.Context, string) (*cred.Oauth2Config, error)
+	newAuthService     func(*serverauth.Config) (*serverauth.Service, error)
+	newOIDCVerifier    func(context.Context, sendgridauth.OIDCConfig) (sendgridauth.TokenVerifier, error)
+	newMCPServer       func(...mcpsrv.Option) (*mcpsrv.Server, error)
+	listen             func(string, string) (net.Listener, error)
+	serve              func(*http.Server, net.Listener) error
+}
+
+func defaultStartupDependencies() startupDependencies {
+	return startupDependencies{
+		newSendGridService: func(ctx context.Context, cfg sendgridsvc.Config) (*sendgridsvc.Service, error) {
+			return sendgridsvc.NewService(ctx, cfg)
+		},
+		loadOAuthConfig: loadOAuthConfig,
+		newAuthService:  serverauth.New,
+		newOIDCVerifier: func(ctx context.Context, cfg sendgridauth.OIDCConfig) (sendgridauth.TokenVerifier, error) {
+			return sendgridauth.NewOIDCVerifier(ctx, cfg)
+		},
+		newMCPServer: mcpsrv.New,
+		listen:       net.Listen,
+		serve: func(server *http.Server, listener net.Listener) error {
+			return server.Serve(listener)
+		},
+	}
+}
+
+func run(ctx context.Context, opts Options, logger *log.Logger) *startupFailure {
+	return runWithDependencies(ctx, opts, logger, defaultStartupDependencies())
+}
+
+func runWithDependencies(ctx context.Context, opts Options, logger *log.Logger, deps startupDependencies) *startupFailure {
 	applyOptionDefaults(&opts)
 	if err := validateAuthMode(opts); err != nil {
-		log.Fatal(err)
+		return &startupFailure{stage: startupStageConfig, err: err}
 	}
 	cfg, err := serviceConfigFromOptions(opts)
 	if err != nil {
-		log.Fatal(err)
+		return &startupFailure{stage: startupStageConfig, err: errors.New("invalid SendGrid service configuration")}
 	}
-	service, err := sendgridsvc.NewService(ctx, cfg)
+	namespaceKeys := sendgridmcp.ParseNamespaceClaimKeys(opts.NamespaceClaimKeys)
+
+	service, err := deps.newSendGridService(ctx, cfg)
 	if err != nil {
-		log.Fatal(err)
+		return &startupFailure{stage: startupStageSendGrid, err: errors.New("failed to initialize SendGrid service")}
 	}
+	logStartupConfig(logger, opts, cfg, namespaceKeys)
 
 	options := []mcpsrv.Option{
-		mcpsrv.WithImplementation(schema.Implementation{Name: "sendgrid-mcp", Version: "0.1.0"}),
+		mcpsrv.WithImplementation(schema.Implementation{Name: sendGridServiceName, Version: sendGridVersion}),
 		mcpsrv.WithNewHandler(sendgridmcp.NewHandler(service, &sendgridmcp.Config{
-			NamespaceClaimKeys: sendgridmcp.ParseNamespaceClaimKeys(opts.NamespaceClaimKeys),
+			NamespaceClaimKeys: namespaceKeys,
 		})),
 		mcpsrv.WithEndpointAddress(opts.HTTPAddr),
 		mcpsrv.WithRootRedirect(true),
-		mcpsrv.WithStreamableURI("/mcp"),
+		mcpsrv.WithStreamableURI(sendGridEndpoint),
 	}
 
 	if value := strings.TrimSpace(opts.Oauth2Config); value != "" {
-		resource := scy.EncodedResource(value).Decode(context.Background(), cred.Oauth2Config{})
-		secret, err := scy.New().Load(context.Background(), resource)
-		if err != nil {
-			log.Fatalf("failed to load oauth2config: %v", err)
-		}
-		oauthConfig, ok := secret.Target.(*cred.Oauth2Config)
-		if !ok {
-			log.Fatal("invalid oauth2config secret type")
+		oauthConfig, err := deps.loadOAuthConfig(ctx, value)
+		if err != nil || oauthConfig == nil {
+			return &startupFailure{stage: startupStageOAuth, err: errors.New("failed to load OAuth configuration")}
 		}
 		policy := &authorization.Policy{
 			Global: &authorization.Authorization{
@@ -103,15 +209,15 @@ func main() {
 			Client:                      &oauthConfig.Config,
 			AuthorizationExchangeHeader: flow.AuthorizationExchangeHeader,
 		}
-		authService, err := serverauth.New(&serverauth.Config{Policy: policy, BackendForFrontend: bff})
-		if err != nil {
-			log.Fatalf("failed to initialize MCP auth service: %v", err)
+		authService, err := deps.newAuthService(&serverauth.Config{Policy: policy, BackendForFrontend: bff})
+		if err != nil || authService == nil {
+			return &startupFailure{stage: startupStageOAuth, err: errors.New("failed to initialize OAuth service")}
 		}
 		audience := strings.TrimSpace(opts.JWTAudience)
 		if audience == "" {
 			audience = strings.TrimSpace(oauthConfig.Config.ClientID)
 		}
-		tokenVerifier, err := sendgridauth.NewOIDCVerifier(context.Background(), sendgridauth.OIDCConfig{
+		tokenVerifier, err := deps.newOIDCVerifier(ctx, sendgridauth.OIDCConfig{
 			AuthURL:    oauthConfig.Config.Endpoint.AuthURL,
 			TokenURL:   oauthConfig.Config.Endpoint.TokenURL,
 			Issuer:     opts.JWTIssuer,
@@ -120,7 +226,7 @@ func main() {
 			Algorithms: splitCSV(opts.JWTAlgorithms),
 		})
 		if err != nil {
-			log.Fatalf("failed to initialize strict OIDC verifier: %v", err)
+			return &startupFailure{stage: startupStageOIDC, err: errors.New("failed to initialize OIDC verifier")}
 		}
 		options = append(options,
 			mcpsrv.WithAuthorizer(verifiedOAuthMiddleware(authService.Middleware, tokenVerifier)),
@@ -128,17 +234,97 @@ func main() {
 		)
 	}
 
-	server, err := mcpsrv.New(options...)
+	server, err := deps.newMCPServer(options...)
 	if err != nil {
-		log.Fatal(err)
+		return &startupFailure{stage: startupStageServer, err: fmt.Errorf("failed to initialize MCP server: %w", err)}
 	}
 	if opts.HTTPAddr != "" {
 		server.UseStreamableHTTP(true)
-		httpServer := hardenSendGridHTTPServer(server.HTTP(context.Background(), opts.HTTPAddr))
-		if err := httpServer.ListenAndServe(); err != nil {
-			log.Fatal(err)
-		}
+		httpServer := hardenSendGridHTTPServer(server.HTTP(ctx, opts.HTTPAddr))
+		return serveHTTPServer(logger, httpServer, deps)
 	}
+	return nil
+}
+
+func loadOAuthConfig(ctx context.Context, value string) (*cred.Oauth2Config, error) {
+	resource := scy.EncodedResource(value).Decode(ctx, cred.Oauth2Config{})
+	secret, err := scy.New().Load(ctx, resource)
+	if err != nil || secret == nil {
+		return nil, errors.New("OAuth secret load failed")
+	}
+	oauthConfig, ok := secret.Target.(*cred.Oauth2Config)
+	if !ok {
+		return nil, errors.New("OAuth secret has invalid type")
+	}
+	return oauthConfig, nil
+}
+
+func logStartupConfig(logger *log.Logger, opts Options, cfg sendgridsvc.Config, namespaceKeys []string) {
+	scratchpadEnabled := strings.TrimSpace(cfg.ScratchpadRootURI) != ""
+	scratchpadScheme := ""
+	sourceSchemes := ""
+	targetSchemes := ""
+	namespaceClaimKeys := ""
+	if scratchpadEnabled {
+		scratchpadScheme = configuredURIScheme(cfg.ScratchpadRootURI)
+		sourceSchemes = strings.Join(cfg.AttachmentSourceSchemes, ",")
+		targetSchemes = strings.Join(cfg.ScratchpadTargetSchemes, ",")
+		namespaceClaimKeys = strings.Join(namespaceKeys, ",")
+	}
+	logger.Printf(
+		"startup_config service=%q version=%q listen_addr=%q endpoint=%q region=%q",
+		sendGridServiceName,
+		sendGridVersion,
+		opts.HTTPAddr,
+		sendGridEndpoint,
+		cfg.Region,
+	)
+	logger.Printf(
+		"startup_auth enabled=%t use_id_token=%t",
+		strings.TrimSpace(opts.Oauth2Config) != "",
+		opts.UseIdToken,
+	)
+	logger.Printf(
+		"startup_scratchpad enabled=%t scheme=%q source_schemes=%q target_schemes=%q namespace_claim_keys=%q",
+		scratchpadEnabled,
+		scratchpadScheme,
+		sourceSchemes,
+		targetSchemes,
+		namespaceClaimKeys,
+	)
+	logger.Printf(
+		"startup_limits max_concurrent_sends=%d send_timeout=%q",
+		cfg.MaxConcurrentSends,
+		cfg.SendTimeout.String(),
+	)
+}
+
+func configuredURIScheme(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme)
+}
+
+func serveHTTPServer(logger *log.Logger, httpServer *http.Server, deps startupDependencies) *startupFailure {
+	listener, err := deps.listen("tcp", httpServer.Addr)
+	if err != nil {
+		return &startupFailure{stage: startupStageListener, err: fmt.Errorf("failed to bind HTTP listener: %w", err)}
+	}
+	defer listener.Close()
+
+	logger.Printf(
+		"startup_ready service=%q version=%q listen_addr=%q endpoint=%q",
+		sendGridServiceName,
+		sendGridVersion,
+		listener.Addr().String(),
+		sendGridEndpoint,
+	)
+	if err := deps.serve(httpServer, listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return &startupFailure{stage: startupStageServe, err: fmt.Errorf("HTTP server failed: %w", err)}
+	}
+	return nil
 }
 
 func hardenSendGridHTTPServer(server *http.Server) *http.Server {
@@ -184,9 +370,20 @@ func applyOptionDefaults(opts *Options) {
 	opts.JWTJWKSURL = strings.TrimSpace(opts.JWTJWKSURL)
 	opts.JWTAudience = strings.TrimSpace(opts.JWTAudience)
 	opts.JWTAlgorithms = strings.TrimSpace(opts.JWTAlgorithms)
-	opts.Region = strings.TrimSpace(opts.Region)
+	opts.Region = strings.ToLower(strings.TrimSpace(opts.Region))
 	if opts.Region == "" {
 		opts.Region = sendgridsvc.DefaultRegion
+	}
+	opts.ScratchpadRootURI = strings.TrimSpace(opts.ScratchpadRootURI)
+	opts.AttachmentSourceSchemes = strings.TrimSpace(opts.AttachmentSourceSchemes)
+	opts.ScratchpadTargetSchemes = strings.TrimSpace(opts.ScratchpadTargetSchemes)
+	opts.NamespaceClaimKeys = strings.TrimSpace(opts.NamespaceClaimKeys)
+	opts.SendTimeout = strings.TrimSpace(opts.SendTimeout)
+	if opts.MaxConcurrentSends == 0 {
+		opts.MaxConcurrentSends = sendgridsvc.DefaultMaxConcurrentSends
+	}
+	if opts.SendTimeout == "" {
+		opts.SendTimeout = sendgridsvc.DefaultSendTimeout.String()
 	}
 }
 
@@ -195,12 +392,15 @@ func serviceConfigFromOptions(opts Options) (sendgridsvc.Config, error) {
 	if err != nil {
 		return sendgridsvc.Config{}, fmt.Errorf("invalid --send-timeout %q: %w", opts.SendTimeout, err)
 	}
+	if timeout == 0 {
+		timeout = sendgridsvc.DefaultSendTimeout
+	}
 	return sendgridsvc.Config{
 		APIKeyRef:               scy.EncodedResource(opts.APIKeyRef),
-		Region:                  opts.Region,
+		Region:                  strings.ToLower(strings.TrimSpace(opts.Region)),
 		ScratchpadRootURI:       expandHome(opts.ScratchpadRootURI),
-		AttachmentSourceSchemes: splitCSV(opts.AttachmentSourceSchemes),
-		ScratchpadTargetSchemes: splitCSV(opts.ScratchpadTargetSchemes),
+		AttachmentSourceSchemes: splitLowerCSV(opts.AttachmentSourceSchemes),
+		ScratchpadTargetSchemes: splitLowerCSV(opts.ScratchpadTargetSchemes),
 		MaxConcurrentSends:      opts.MaxConcurrentSends,
 		SendTimeout:             timeout,
 	}, nil
@@ -231,6 +431,14 @@ func splitCSV(value string) []string {
 		result = append(result, part)
 	}
 	return result
+}
+
+func splitLowerCSV(value string) []string {
+	values := splitCSV(value)
+	for index := range values {
+		values[index] = strings.ToLower(values[index])
+	}
+	return splitCSV(strings.Join(values, ","))
 }
 
 func expandHome(value string) string {

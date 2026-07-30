@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +20,9 @@ import (
 	flags "github.com/jessevdk/go-flags"
 	sendgridauth "github.com/viant/mcp-toolbox/sendgrid/auth"
 	sendgridsvc "github.com/viant/mcp-toolbox/sendgrid/service"
+	mcpsrv "github.com/viant/mcp/server"
+	serverauth "github.com/viant/mcp/server/auth"
+	"github.com/viant/scy/cred"
 )
 
 func TestValidateAuthMode(t *testing.T) {
@@ -37,6 +44,440 @@ func TestValidateAuthMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseCommandLineRedactsParserErrors(t *testing.T) {
+	const marker = "parse-error-marker"
+	var (
+		opts    *Options
+		failure *startupFailure
+	)
+	parserOutput := captureStderr(t, func() {
+		opts, failure = parseCommandLine([]string{"--max-concurrent-sends", marker}, io.Discard)
+	})
+
+	if opts != nil {
+		t.Fatalf("options = %#v, want nil after parse failure", opts)
+	}
+	if parserOutput != "" {
+		t.Fatalf("parser wrote an unsafe diagnostic: %q", parserOutput)
+	}
+	if failure == nil || failure.stage != startupStageConfig {
+		t.Fatalf("failure = %#v, want config stage", failure)
+	}
+	if failure.Error() != "invalid command-line configuration" {
+		t.Fatalf("failure error = %q, want generic diagnostic", failure.Error())
+	}
+	if strings.Contains(failure.Error(), marker) {
+		t.Fatalf("classified failure exposed parse marker: %q", failure)
+	}
+
+	var output bytes.Buffer
+	logStartupFailure(log.New(&output, "", 0), failure)
+	logged := output.String()
+	if !strings.Contains(logged, `startup_failed service="sendgrid-mcp" version="0.1.0" stage=config error="invalid command-line configuration"`) {
+		t.Fatalf("missing classified startup failure:\n%s", logged)
+	}
+	if strings.Contains(logged, marker) {
+		t.Fatalf("startup failure exposed parse marker:\n%s", logged)
+	}
+}
+
+func TestParseCommandLineHelpRemainsUsable(t *testing.T) {
+	var (
+		help    bytes.Buffer
+		opts    *Options
+		failure *startupFailure
+	)
+	parserOutput := captureStderr(t, func() {
+		opts, failure = parseCommandLine([]string{"--help"}, &help)
+	})
+
+	if opts != nil || failure != nil {
+		t.Fatalf("help returned options=%#v failure=%#v", opts, failure)
+	}
+	if parserOutput != "" {
+		t.Fatalf("help wrote to stderr: %q", parserOutput)
+	}
+	if !strings.Contains(help.String(), "Usage:") || !strings.Contains(help.String(), "--region") {
+		t.Fatalf("help output is incomplete:\n%s", help.String())
+	}
+	if strings.Contains(help.String(), "startup_failed") {
+		t.Fatalf("help was treated as a startup failure:\n%s", help.String())
+	}
+}
+
+func TestStartupConfigLoggingNormalizesAndRedacts(t *testing.T) {
+	var output bytes.Buffer
+	logger := log.New(&output, "", 0)
+	deps := stubStartupDependencies()
+	deps.loadOAuthConfig = func(context.Context, string) (*cred.Oauth2Config, error) {
+		config := &cred.Oauth2Config{}
+		config.ClientID = "oauth-client-id-marker"
+		config.ClientSecret = "oauth-client-secret-marker"
+		config.Endpoint.AuthURL = "https://authorization-url-marker.example/auth"
+		config.Endpoint.TokenURL = "https://token-url-marker.example/token"
+		return config, nil
+	}
+
+	failure := runWithDependencies(context.Background(), Options{
+		APIKeyRef:               " file:///api-key-ref-marker|kms://api-kms-marker ",
+		Oauth2Config:            " file:///oauth-ref-marker|kms://oauth-kms-marker ",
+		UseIdToken:              true,
+		JWTIssuer:               " https://issuer-marker.example ",
+		JWTJWKSURL:              " https://jwks-marker.example/keys ",
+		JWTAudience:             " audience-marker ",
+		Region:                  " EU ",
+		ScratchpadRootURI:       " GS://scratchpad-root-marker/users/${userID} ",
+		AttachmentSourceSchemes: " ScratchPad, GS, scratchpad ",
+		ScratchpadTargetSchemes: " FILE, gs, file ",
+		NamespaceClaimKeys:      " sub, email,sub ",
+		MaxConcurrentSends:      9,
+		SendTimeout:             " 45s ",
+	}, logger, deps)
+	if failure != nil {
+		t.Fatalf("runWithDependencies failed: %v", failure)
+	}
+
+	logged := output.String()
+	want := strings.Join([]string{
+		`startup_config service="sendgrid-mcp" version="0.1.0" listen_addr="" endpoint="/mcp" region="eu"`,
+		`startup_auth enabled=true use_id_token=true`,
+		`startup_scratchpad enabled=true scheme="gs" source_schemes="scratchpad,gs" target_schemes="file,gs" namespace_claim_keys="sub,email"`,
+		`startup_limits max_concurrent_sends=9 send_timeout="45s"`,
+	}, "\n")
+	if got := strings.TrimSpace(logged); got != want {
+		t.Errorf("startup configuration log mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	for _, event := range []string{"startup_config", "startup_auth", "startup_scratchpad", "startup_limits"} {
+		if count := strings.Count(logged, event+" "); count != 1 {
+			t.Errorf("%s count = %d, want 1:\n%s", event, count, logged)
+		}
+	}
+	if strings.Contains(logged, "startup_ready") {
+		t.Errorf("empty listen address emitted ready log:\n%s", logged)
+	}
+	for _, removed := range []string{"api_key_ref_configured", "oauth_configured"} {
+		if strings.Contains(logged, removed) {
+			t.Errorf("startup log contains removed field %q:\n%s", removed, logged)
+		}
+	}
+	for _, secret := range []string{
+		"api-key-ref-marker",
+		"api-kms-marker",
+		"oauth-ref-marker",
+		"oauth-kms-marker",
+		"scratchpad-root-marker",
+		"oauth-client-id-marker",
+		"oauth-client-secret-marker",
+		"authorization-url-marker",
+		"token-url-marker",
+		"issuer-marker",
+		"jwks-marker",
+		"audience-marker",
+	} {
+		if strings.Contains(logged, secret) {
+			t.Errorf("startup log exposed %q:\n%s", secret, logged)
+		}
+	}
+}
+
+func TestStartupConfigLoggingEmitsDisabledScratchpad(t *testing.T) {
+	var output bytes.Buffer
+	failure := runWithDependencies(context.Background(), Options{
+		APIKeyRef: "configured-api-key-ref",
+	}, log.New(&output, "", 0), stubStartupDependencies())
+	if failure != nil {
+		t.Fatalf("runWithDependencies failed: %v", failure)
+	}
+
+	logged := output.String()
+	want := strings.Join([]string{
+		`startup_config service="sendgrid-mcp" version="0.1.0" listen_addr="" endpoint="/mcp" region="global"`,
+		`startup_auth enabled=false use_id_token=false`,
+		`startup_scratchpad enabled=false scheme="" source_schemes="" target_schemes="" namespace_claim_keys=""`,
+		`startup_limits max_concurrent_sends=4 send_timeout="1m0s"`,
+	}, "\n")
+	if got := strings.TrimSpace(logged); got != want {
+		t.Errorf("disabled scratchpad startup log mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	for _, event := range []string{"startup_config", "startup_auth", "startup_scratchpad", "startup_limits"} {
+		if count := strings.Count(logged, event+" "); count != 1 {
+			t.Errorf("%s count = %d, want 1:\n%s", event, count, logged)
+		}
+	}
+}
+
+func TestInvalidRegionStartupFailureIsRedacted(t *testing.T) {
+	const (
+		regionMarker   = "invalid-region-marker"
+		apiRefMarker   = "api-ref-marker"
+		kmsRefMarker   = "kms-ref-marker"
+		providerMarker = "provider-detail-marker"
+	)
+	deps := stubStartupDependencies()
+	deps.newSendGridService = func(_ context.Context, cfg sendgridsvc.Config) (*sendgridsvc.Service, error) {
+		if cfg.Region != regionMarker {
+			t.Fatalf("service region = %q, want %q", cfg.Region, regionMarker)
+		}
+		return nil, fmt.Errorf(
+			"invalid SendGrid region %q for %q via %s",
+			cfg.Region,
+			cfg.APIKeyRef,
+			providerMarker,
+		)
+	}
+
+	var output bytes.Buffer
+	logger := log.New(&output, "", 0)
+	failure := runWithDependencies(context.Background(), Options{
+		APIKeyRef: fmt.Sprintf(
+			"file:///%s|kms://%s",
+			apiRefMarker,
+			kmsRefMarker,
+		),
+		Region: regionMarker,
+	}, logger, deps)
+	if failure == nil || failure.stage != startupStageSendGrid {
+		t.Fatalf("failure = %#v, want sendgrid stage", failure)
+	}
+	if failure.Error() != "failed to initialize SendGrid service" {
+		t.Fatalf("failure error = %q, want generic diagnostic", failure.Error())
+	}
+	logStartupFailure(logger, failure)
+
+	logged := output.String()
+	if strings.Contains(logged, "startup_config") {
+		t.Fatalf("invalid SendGrid configuration emitted startup_config:\n%s", logged)
+	}
+	if !strings.Contains(logged, `stage=sendgrid error="failed to initialize SendGrid service"`) {
+		t.Fatalf("missing safe SendGrid startup failure:\n%s", logged)
+	}
+	for _, marker := range []string{regionMarker, apiRefMarker, kmsRefMarker, providerMarker} {
+		if strings.Contains(failure.Error()+"\n"+logged, marker) {
+			t.Fatalf("SendGrid startup failure exposed %q:\nerror=%s\nlog=%s", marker, failure, logged)
+		}
+	}
+}
+
+func TestServeHTTPServerListenerConflictDoesNotLogReady(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve listener: %v", err)
+	}
+	defer occupied.Close()
+
+	var output bytes.Buffer
+	deps := defaultStartupDependencies()
+	deps.serve = func(*http.Server, net.Listener) error {
+		t.Fatal("Serve was called after listener bind failed")
+		return nil
+	}
+	failure := serveHTTPServer(
+		log.New(&output, "", 0),
+		&http.Server{Addr: occupied.Addr().String(), Handler: http.NotFoundHandler()},
+		deps,
+	)
+	if failure == nil || failure.stage != startupStageListener {
+		t.Fatalf("failure = %#v, want listener stage", failure)
+	}
+	if strings.Contains(output.String(), "startup_ready") {
+		t.Fatalf("listener conflict emitted ready log:\n%s", output.String())
+	}
+}
+
+func TestServeHTTPServerLogsActualAddressAndHandlesErrServerClosed(t *testing.T) {
+	var output bytes.Buffer
+	var actualAddress string
+	deps := defaultStartupDependencies()
+	deps.serve = func(_ *http.Server, listener net.Listener) error {
+		actualAddress = listener.Addr().String()
+		return fmt.Errorf("wrapped shutdown: %w", http.ErrServerClosed)
+	}
+
+	failure := serveHTTPServer(
+		log.New(&output, "", 0),
+		&http.Server{Addr: "127.0.0.1:0", Handler: http.NotFoundHandler()},
+		deps,
+	)
+	if failure != nil {
+		t.Fatalf("serveHTTPServer returned failure for ErrServerClosed: %v", failure)
+	}
+	if actualAddress == "" || strings.HasSuffix(actualAddress, ":0") {
+		t.Fatalf("actual listener address = %q", actualAddress)
+	}
+	logged := output.String()
+	if !strings.Contains(logged, fmt.Sprintf(`startup_ready service=%q version=%q listen_addr=%q endpoint=%q`,
+		sendGridServiceName, sendGridVersion, actualAddress, sendGridEndpoint)) {
+		t.Fatalf("ready log does not contain actual listener address:\n%s", logged)
+	}
+	if strings.Contains(logged, `listen_addr="127.0.0.1:0"`) {
+		t.Fatalf("ready log contains requested ephemeral address instead of actual address:\n%s", logged)
+	}
+}
+
+func TestStartupFailureStageClassification(t *testing.T) {
+	validOptions := Options{APIKeyRef: "configured-api-key-ref", SendTimeout: "60s"}
+	oauthOptions := validOptions
+	oauthOptions.Oauth2Config = "configured-oauth-ref"
+	oauthOptions.UseIdToken = true
+
+	tests := []struct {
+		name          string
+		wantStage     startupStage
+		forbiddenText string
+		start         func(*log.Logger) *startupFailure
+	}{
+		{
+			name:          "config",
+			wantStage:     startupStageConfig,
+			forbiddenText: "config-secret-marker",
+			start: func(logger *log.Logger) *startupFailure {
+				opts := validOptions
+				opts.SendTimeout = "config-secret-marker"
+				return runWithDependencies(context.Background(), opts, logger, stubStartupDependencies())
+			},
+		},
+		{
+			name:      "sendgrid",
+			wantStage: startupStageSendGrid,
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.newSendGridService = func(context.Context, sendgridsvc.Config) (*sendgridsvc.Service, error) {
+					return nil, errors.New("SendGrid configuration rejected")
+				}
+				return runWithDependencies(context.Background(), validOptions, logger, deps)
+			},
+		},
+		{
+			name:          "oauth secret load or type",
+			wantStage:     startupStageOAuth,
+			forbiddenText: "oauth-secret-ref-marker",
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.loadOAuthConfig = func(context.Context, string) (*cred.Oauth2Config, error) {
+					return nil, errors.New("oauth-secret-ref-marker")
+				}
+				return runWithDependencies(context.Background(), oauthOptions, logger, deps)
+			},
+		},
+		{
+			name:          "oauth auth service",
+			wantStage:     startupStageOAuth,
+			forbiddenText: "oauth-client-secret-marker",
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.newAuthService = func(*serverauth.Config) (*serverauth.Service, error) {
+					return nil, errors.New("oauth-client-secret-marker")
+				}
+				return runWithDependencies(context.Background(), oauthOptions, logger, deps)
+			},
+		},
+		{
+			name:          "oidc",
+			wantStage:     startupStageOIDC,
+			forbiddenText: "https://unsafe-oidc-marker.example",
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.newOIDCVerifier = func(context.Context, sendgridauth.OIDCConfig) (sendgridauth.TokenVerifier, error) {
+					return nil, errors.New("https://unsafe-oidc-marker.example")
+				}
+				return runWithDependencies(context.Background(), oauthOptions, logger, deps)
+			},
+		},
+		{
+			name:      "server",
+			wantStage: startupStageServer,
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.newMCPServer = func(...mcpsrv.Option) (*mcpsrv.Server, error) {
+					return nil, errors.New("server construction failed")
+				}
+				return runWithDependencies(context.Background(), validOptions, logger, deps)
+			},
+		},
+		{
+			name:      "listener",
+			wantStage: startupStageListener,
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.listen = func(string, string) (net.Listener, error) {
+					return nil, errors.New("listener bind failed")
+				}
+				return serveHTTPServer(logger, &http.Server{Addr: "127.0.0.1:0"}, deps)
+			},
+		},
+		{
+			name:      "serve",
+			wantStage: startupStageServe,
+			start: func(logger *log.Logger) *startupFailure {
+				deps := stubStartupDependencies()
+				deps.serve = func(*http.Server, net.Listener) error {
+					return errors.New("accept failed")
+				}
+				return serveHTTPServer(logger, &http.Server{Addr: "127.0.0.1:0"}, deps)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			failure := test.start(log.New(&output, "", 0))
+			if failure == nil {
+				t.Fatal("startup unexpectedly succeeded")
+			}
+			if failure.stage != test.wantStage {
+				t.Fatalf("stage = %q, want %q (error: %v)", failure.stage, test.wantStage, failure)
+			}
+			if test.forbiddenText != "" && strings.Contains(failure.Error()+"\n"+output.String(), test.forbiddenText) {
+				t.Fatalf("startup failure exposed %q:\nerror=%s\nlog=%s", test.forbiddenText, failure, output.String())
+			}
+		})
+	}
+}
+
+func stubStartupDependencies() startupDependencies {
+	deps := defaultStartupDependencies()
+	deps.newSendGridService = func(context.Context, sendgridsvc.Config) (*sendgridsvc.Service, error) {
+		return nil, nil
+	}
+	deps.loadOAuthConfig = func(context.Context, string) (*cred.Oauth2Config, error) {
+		return &cred.Oauth2Config{}, nil
+	}
+	deps.newOIDCVerifier = func(context.Context, sendgridauth.OIDCConfig) (sendgridauth.TokenVerifier, error) {
+		return &commandTokenVerifier{claims: map[string]any{"sub": "startup-test"}}, nil
+	}
+	deps.serve = func(*http.Server, net.Listener) error {
+		return http.ErrServerClosed
+	}
+	return deps
+}
+
+func captureStderr(t *testing.T, action func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	previous := os.Stderr
+	os.Stderr = writer
+	defer func() {
+		os.Stderr = previous
+		_ = writer.Close()
+		_ = reader.Close()
+	}()
+
+	action()
+	os.Stderr = previous
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	captured, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	return string(captured)
 }
 
 func TestHardenSendGridHTTPServerConfiguresTimeouts(t *testing.T) {
