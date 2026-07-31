@@ -53,7 +53,7 @@ type Options struct {
 	Region                  string `long:"region" description:"SendGrid data residency region: global or eu"`
 	ScratchpadRootURI       string `long:"scratchpad-root-uri" description:"Per-user scratchpad root URI template"`
 	AttachmentSourceSchemes string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty denies sourceURL attachments"`
-	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Comma-separated allowed underlying scratchpad artifact schemes; required when scratchpad is enabled"`
+	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Optional comma-separated allowlist of underlying scratchpad artifact schemes; empty allows all registered AFS providers"`
 	NamespaceClaimKeys      string `long:"namespace-claim-keys" description:"Comma-separated identity claim lookup order (default: email,sub)"`
 	MaxConcurrentSends      int    `long:"max-concurrent-sends" description:"Maximum concurrent resolve/build/send operations" default:"4"`
 	SendTimeout             string `long:"send-timeout" description:"Timeout covering queueing, attachments, and provider request" default:"60s"`
@@ -268,7 +268,10 @@ func logStartupConfig(logger *log.Logger, opts Options, cfg sendgridsvc.Config, 
 	if scratchpadEnabled {
 		scratchpadScheme = configuredURIScheme(cfg.ScratchpadRootURI)
 		sourceSchemes = strings.Join(cfg.AttachmentSourceSchemes, ",")
-		targetSchemes = strings.Join(cfg.ScratchpadTargetSchemes, ",")
+		targetSchemes = "*"
+		if len(cfg.ScratchpadTargetSchemes) > 0 {
+			targetSchemes = strings.Join(cfg.ScratchpadTargetSchemes, ",")
+		}
 		namespaceClaimKeys = strings.Join(namespaceKeys, ",")
 	}
 	logger.Printf(

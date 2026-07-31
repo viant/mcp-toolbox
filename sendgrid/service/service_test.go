@@ -116,8 +116,6 @@ func TestNewServiceValidatesConfiguration(t *testing.T) {
 	invalidConcurrency.MaxConcurrentSends = -1
 	invalidTimeout := testConfig(t)
 	invalidTimeout.SendTimeout = -time.Second
-	scratchpadWithoutTargets := testConfig(t)
-	scratchpadWithoutTargets.AttachmentSourceSchemes = []string{"scratchpad"}
 
 	tests := []struct {
 		name string
@@ -130,11 +128,6 @@ func TestNewServiceValidatesConfiguration(t *testing.T) {
 		{name: "invalid region", cfg: invalidRegion, want: "expected global or eu"},
 		{name: "invalid concurrency", cfg: invalidConcurrency, want: "greater than zero"},
 		{name: "invalid timeout", cfg: invalidTimeout, want: "greater than zero"},
-		{
-			name: "scratchpad without target allowlist",
-			cfg:  scratchpadWithoutTargets,
-			want: "scratchpad target schemes are required",
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -158,6 +151,31 @@ func TestNewServiceValidatesConfiguration(t *testing.T) {
 	}
 	if service.cfg.MaxConcurrentSends != DefaultMaxConcurrentSends || service.cfg.SendTimeout != DefaultSendTimeout {
 		t.Fatalf("defaults were not applied: %#v", service.cfg)
+	}
+}
+
+func TestNewServiceAllowsUnrestrictedScratchpadTargets(t *testing.T) {
+	tests := []struct {
+		name          string
+		targetSchemes []string
+	}{
+		{name: "omitted"},
+		{name: "explicit empty", targetSchemes: []string{""}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.AttachmentSourceSchemes = []string{"scratchpad"}
+			cfg.ScratchpadTargetSchemes = test.targetSchemes
+
+			service, err := NewService(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("NewService rejected unrestricted scratchpad targets: %v", err)
+			}
+			if len(service.cfg.ScratchpadTargetSchemes) != 0 {
+				t.Fatalf("normalized target schemes = %#v, want empty", service.cfg.ScratchpadTargetSchemes)
+			}
+		})
 	}
 }
 
@@ -435,13 +453,32 @@ func TestSendRejectsDisallowedSourceScheme(t *testing.T) {
 	}
 }
 
+func TestScratchpadTargetAllowlistDoesNotEnableOuterSourceScheme(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ScratchpadTargetSchemes = []string{"file"}
+	fake := &fakeSender{}
+	service := newTestService(t, cfg, fake)
+	input := validInput()
+	input.Attachments = []EmailAttachment{{
+		Name:      "report.txt",
+		SourceURL: "scratchpad://artifact/report-1",
+	}}
+
+	_, err := service.Send(context.Background(), input)
+	if err == nil || !strings.Contains(err.Error(), `scheme "scratchpad" is not allowed`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.callCount() != 0 {
+		t.Fatal("provider was called when the outer scratchpad source scheme was disabled")
+	}
+}
+
 func TestSendResolvesScratchpadWithRequestUserIsolation(t *testing.T) {
 	rootDir := t.TempDir()
 	rootURI := "file://" + filepath.ToSlash(filepath.Join(rootDir, "scratchpad", "${userID}"))
 	cfg := testConfig(t)
 	cfg.ScratchpadRootURI = rootURI
 	cfg.AttachmentSourceSchemes = []string{"scratchpad"}
-	cfg.ScratchpadTargetSchemes = []string{"file"}
 
 	aliceContext := afsscratchpad.ContextWithUserID(context.Background(), "alice@example.com")
 	aliceScratchpad := afsscratchpad.New(
@@ -483,6 +520,17 @@ func TestSendResolvesScratchpadWithRequestUserIsolation(t *testing.T) {
 	message := fake.lastMessage()
 	if got, want := message.Attachments[0].Content, base64.StdEncoding.EncodeToString([]byte("alice report")); got != want {
 		t.Fatalf("attachment content = %q, want %q", got, want)
+	}
+
+	explicitEmptyConfig := cfg
+	explicitEmptyConfig.ScratchpadTargetSchemes = []string{""}
+	explicitEmptySender := &fakeSender{}
+	explicitEmptyService := newTestService(t, explicitEmptyConfig, explicitEmptySender)
+	if _, err := explicitEmptyService.Send(aliceContext, input); err != nil {
+		t.Fatalf("send with explicit empty target allowlist failed: %v", err)
+	}
+	if explicitEmptySender.callCount() != 1 {
+		t.Fatalf("provider calls with explicit empty target allowlist = %d, want 1", explicitEmptySender.callCount())
 	}
 
 	bobContext := afsscratchpad.ContextWithUserID(context.Background(), "bob@example.com")

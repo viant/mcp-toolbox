@@ -57,7 +57,6 @@ go run ./sendgrid/cmd/sendgrid-mcp \
   --use-id-token \
   --scratchpad-root-uri 'file://$HOME/.local/share/mcp-toolbox/scratchpad/${userID}' \
   --attachment-source-schemes scratchpad \
-  --scratchpad-target-schemes file,gs \
   --namespace-claim-keys sub,email
 ```
 
@@ -96,7 +95,7 @@ Important flags:
 | `--jwt-algorithms` | Comma-separated ID-token signing-algorithm allowlist | `RS256` |
 | `--scratchpad-root-uri` | Per-user scratchpad root containing `${userID}` | empty |
 | `--attachment-source-schemes` | Allowed attachment `sourceURL` schemes | none |
-| `--scratchpad-target-schemes` | Allowed underlying URLs for scratchpad artifacts | none |
+| `--scratchpad-target-schemes` | Optional allowlist for underlying scratchpad artifact URLs | all registered AFS provider schemes |
 | `--namespace-claim-keys` | Identity-claim lookup order | `email,sub` |
 | `--max-concurrent-sends` | Maximum concurrent resolve/build/send operations | `4` |
 | `--send-timeout` | Timeout covering queueing, attachments, and SendGrid | `60s` |
@@ -141,8 +140,13 @@ Attachment URL schemes are default-deny:
 - `dataBase64` attachments do not require a source scheme.
 - Every attachment `sourceURL` scheme must be listed in
   `--attachment-source-schemes`.
-- Enabling `scratchpad` requires an explicit `--scratchpad-target-schemes`
-  allowlist for the artifact's underlying source.
+- `--attachment-source-schemes scratchpad` independently permits outer
+  `scratchpad://` attachment URLs. Omitting `--scratchpad-target-schemes`, or
+  passing `--scratchpad-target-schemes ""`, allows their artifacts to use any
+  underlying `sourceURL` scheme supported by a registered AFS provider.
+- For optional hardening, pass a non-empty target allowlist such as
+  `--scratchpad-target-schemes file,gs`; artifact sources outside that list are
+  rejected.
 - A maximum of 10 attachments is accepted.
 - Decoded attachments are limited to 21,000,000 bytes in total.
 - The serialized SendGrid payload must be smaller than 29,000,000 bytes.

@@ -64,8 +64,6 @@ func NewService(ctx context.Context, cfg Config, opts ...Option) (*Service, erro
 		return nil, fmt.Errorf("max concurrent sends must be greater than zero")
 	case cfg.SendTimeout <= 0:
 		return nil, fmt.Errorf("send timeout must be greater than zero")
-	case containsScheme(cfg.AttachmentSourceSchemes, afsscratchpad.Scheme) && len(cfg.ScratchpadTargetSchemes) == 0:
-		return nil, fmt.Errorf("scratchpad target schemes are required when scratchpad attachment sources are enabled")
 	}
 	apiKey, err := loadAPIKey(ctx, cfg.APIKeyRef)
 	if err != nil {
@@ -142,15 +140,6 @@ func loadAPIKey(ctx context.Context, encoded scy.EncodedResource) (apiKey string
 		return "", fmt.Errorf("decrypted SendGrid API key is empty")
 	}
 	return apiKey, nil
-}
-
-func containsScheme(values []string, candidate string) bool {
-	for _, value := range values {
-		if value == candidate {
-			return true
-		}
-	}
-	return false
 }
 
 // Send validates and submits a message. Its timeout covers queueing, attachment

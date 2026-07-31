@@ -107,6 +107,51 @@ func TestParseCommandLineHelpRemainsUsable(t *testing.T) {
 	}
 }
 
+func TestParseCommandLineScratchpadTargetSchemes(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		wantTargets string
+		wantFailure bool
+	}{
+		{
+			name: "omitted with scratchpad source",
+			args: []string{"--attachment-source-schemes", "scratchpad"},
+		},
+		{
+			name: "explicit empty",
+			args: []string{"--attachment-source-schemes", "scratchpad", "--scratchpad-target-schemes", ""},
+		},
+		{
+			name:        "restricted",
+			args:        []string{"--attachment-source-schemes", "scratchpad", "--scratchpad-target-schemes", "file,gs"},
+			wantTargets: "file,gs",
+		},
+		{
+			name:        "bare flag",
+			args:        []string{"--scratchpad-target-schemes"},
+			wantFailure: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opts, failure := parseCommandLine(test.args, io.Discard)
+			if test.wantFailure {
+				if opts != nil || failure == nil || failure.stage != startupStageConfig {
+					t.Fatalf("parse result options=%#v failure=%#v, want config failure", opts, failure)
+				}
+				return
+			}
+			if failure != nil {
+				t.Fatalf("parse failed: %v", failure)
+			}
+			if opts == nil || opts.ScratchpadTargetSchemes != test.wantTargets {
+				t.Fatalf("target schemes = %q, want %q", opts.ScratchpadTargetSchemes, test.wantTargets)
+			}
+		})
+	}
+}
+
 func TestStartupConfigLoggingNormalizesAndRedacts(t *testing.T) {
 	var output bytes.Buffer
 	logger := log.New(&output, "", 0)
@@ -205,6 +250,48 @@ func TestStartupConfigLoggingEmitsDisabledScratchpad(t *testing.T) {
 		if count := strings.Count(logged, event+" "); count != 1 {
 			t.Errorf("%s count = %d, want 1:\n%s", event, count, logged)
 		}
+	}
+}
+
+func TestStartupConfigLoggingEmitsAllowAllScratchpadTargets(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "omitted",
+			args: []string{
+				"--api-key-ref", "configured-api-key-ref",
+				"--scratchpad-root-uri", "file:///scratchpad/${userID}",
+				"--attachment-source-schemes", "scratchpad",
+			},
+		},
+		{
+			name: "explicit empty",
+			args: []string{
+				"--api-key-ref", "configured-api-key-ref",
+				"--scratchpad-root-uri", "file:///scratchpad/${userID}",
+				"--attachment-source-schemes", "scratchpad",
+				"--scratchpad-target-schemes", "",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts, parseFailure := parseCommandLine(test.args, io.Discard)
+			if parseFailure != nil {
+				t.Fatalf("parse failed: %v", parseFailure)
+			}
+			var output bytes.Buffer
+			failure := runWithDependencies(context.Background(), *opts, log.New(&output, "", 0), stubStartupDependencies())
+			if failure != nil {
+				t.Fatalf("runWithDependencies failed: %v", failure)
+			}
+
+			want := `startup_scratchpad enabled=true scheme="file" source_schemes="scratchpad" target_schemes="*" namespace_claim_keys="email,sub"`
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("allow-all scratchpad startup log missing:\n%s", output.String())
+			}
+		})
 	}
 }
 
