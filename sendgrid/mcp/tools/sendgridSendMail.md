@@ -26,6 +26,14 @@ attachments over 21,000,000 bytes in total and serialized provider payloads at
 or above 29,000,000 bytes. Successful status `accepted` means SendGrid returned
 HTTP 202; it does not mean the message was delivered.
 
+Only for one logical serial hosted report-to-email delivery attempt, call this
+tool at most once. Immediately after issuing that call, treat the attempt as
+`EMAIL_ATTEMPTED` and stop regardless of success, error, timeout, or an
+ambiguous result. Do not automatically retry within that attempt. A new
+explicit user request, including an intentional resend, may start a new
+attempt. This attempt rule does not constrain ordinary non-report email, and
+one call may contain multiple approved recipients.
+
 Example:
 ```json
 {"from":"sender@example.com","fromName":"Example Service","to":["alice@example.com"],"subject":"Status Update","bodyText":"All green."}
