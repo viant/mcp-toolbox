@@ -1127,8 +1127,8 @@ github.com/vcaesar/screenshot v0.11.1 h1:GgPuN89XC4Yh38dLx4quPlSo3YiWWhwIria/j3L
 github.com/vcaesar/screenshot v0.11.1/go.mod h1:gJNwHBiP1v1v7i8TQ4yV1XJtcyn2I/OJL7OziVQkwjs=
 github.com/vcaesar/tt v0.20.1 h1:D/jUeeVCNbq3ad8M7hhtB3J9x5RZ6I1n1eZ0BJp7M+4=
 github.com/vcaesar/tt v0.20.1/go.mod h1:cH2+AwGAJm19Wa6xvEa+0r+sXDJBT0QgNQey6mwqLeU=
-github.com/viant/afs v1.30.1-0.20260707124824-0373fe4ae4cb h1:W7iN1WKagshu1XOInwOzGd1L3CYsMI0bxT2r85l29mQ=
-github.com/viant/afs v1.30.1-0.20260707124824-0373fe4ae4cb/go.mod h1:rScbFd9LJPGTM8HOI8Kjwee0AZ+MZMupAvFpPg+Qdj4=
+github.com/viant/afs v1.30.1-0.20260805181916-d2f22cbb570f h1:sKFnQAQKYwdN4zqAjz5OZRU5yWDIct93Gi8M7yxubYM=
+github.com/viant/afs v1.30.1-0.20260805181916-d2f22cbb570f/go.mod h1:rScbFd9LJPGTM8HOI8Kjwee0AZ+MZMupAvFpPg+Qdj4=
 github.com/viant/afsc v1.9.1 h1:BIus7fYyjM+MDgKuAzCBfoV4oVy2xTVhuFsQKUCPvkQ=
 github.com/viant/afsc v1.9.1/go.mod h1:FA/xVjaMM10qGByabP8anTVMH6N4eUsAeWm5xcEZJJA=
 github.com/viant/assertly v0.9.0/go.mod h1:aGifi++jvCrUaklKEKT0BU95igDNaqkvz+49uaYMPRU=
