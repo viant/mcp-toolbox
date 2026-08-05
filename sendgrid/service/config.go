@@ -20,6 +20,7 @@ const (
 // Config controls SendGrid delivery and attachment resolution.
 type Config struct {
 	APIKeyRef               scy.EncodedResource
+	CredentialDiagnostics   bool
 	Region                  string
 	ScratchpadRootURI       string
 	AttachmentSourceSchemes []string

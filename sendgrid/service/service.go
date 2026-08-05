@@ -42,6 +42,7 @@ func WithLimits(maxDecoded, maxPayload int64) Option {
 type Service struct {
 	cfg                       Config
 	apiKey                    string
+	credentialDiagnostic      *credentialDiagnostic
 	sender                    sender
 	resolver                  *attachmentResolver
 	sem                       chan struct{}
@@ -88,6 +89,9 @@ func NewService(ctx context.Context, cfg Config, opts ...Option) (*Service, erro
 		maxDecodedAttachmentBytes: DefaultMaxDecodedAttachmentBytes,
 		maxPayloadBytes:           DefaultMaxPayloadBytes,
 	}
+	if cfg.CredentialDiagnostics {
+		result.credentialDiagnostic = newCredentialDiagnostic(apiKey)
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(result)
@@ -95,6 +99,15 @@ func NewService(ctx context.Context, cfg Config, opts ...Option) (*Service, erro
 	}
 	result.resolver = newAttachmentResolver(cfg, fs, scratchpad, result.maxDecodedAttachmentBytes)
 	return result, nil
+}
+
+// CredentialDiagnostics returns stable, secret-safe API-key metadata when the
+// corresponding opt-in configuration is enabled. It never returns plaintext.
+func (s *Service) CredentialDiagnostics() string {
+	if s == nil {
+		return ""
+	}
+	return s.credentialDiagnostic.String()
 }
 
 func loadAPIKey(ctx context.Context, encoded scy.EncodedResource) (apiKey string, resultErr error) {
@@ -191,6 +204,9 @@ func (s *Service) Send(ctx context.Context, input *SendEmailInput) (*SendEmailOu
 		message := fmt.Sprintf("SendGrid request failed with status %d", response.StatusCode)
 		if body := sanitizeProviderText(response.Body, s.apiKey); body != "" {
 			message += ": " + body
+		}
+		if diagnostic := s.CredentialDiagnostics(); diagnostic != "" {
+			message += "; " + diagnostic
 		}
 		return nil, &ProviderError{StatusCode: response.StatusCode, Message: message}
 	}

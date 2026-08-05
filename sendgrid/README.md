@@ -86,6 +86,8 @@ Important flags:
 | --- | --- | --- |
 | `--addr` | HTTP listen address; an empty value disables HTTP | empty |
 | `--api-key-ref` | Encrypted SendGrid API-key resource | required |
+| `--credential-diagnostics` | Backward-compatible enable flag; diagnostics are already enabled by default in the CLI | not set |
+| `--disable-credential-diagnostics` | Disable secret-safe API-key metadata in startup logs and rejected provider responses | not set (diagnostics enabled) |
 | `--region` | SendGrid data-residency endpoint: `global` or `eu` | `global` |
 | `--oauth2config` | OAuth2/BFF configuration as a `scy.EncodedResource` | required with active HTTP |
 | `--use-id-token` | Use and verify the ID token for caller identity | required with active HTTP |
@@ -132,6 +134,91 @@ that KMS implementation has been registered in the built server.
 To rotate the API key, run `scy secure` again for the destination or publish a
 new secret version, then restart `sendgrid-mcp`. The decrypted key remains
 private to the service process and is redacted from provider errors.
+
+### Temporary default-on credential diagnostics
+
+Credential diagnostics are temporarily enabled by default for testing. The
+server writes the following stable format to its startup log and appends the
+identical diagnostic to errors for provider responses other than HTTP 202:
+
+```text
+credential_diagnostics loaded=true prefix_valid=true length=<bytes> fingerprint=sha256:<16 lowercase hex characters>
+```
+
+The fingerprint is calculated from the exact decrypted value used by the
+SendGrid SDK after `strings.TrimSpace` normalization. It is the first 16
+hexadecimal characters of the full SHA-256 digest. No characters from the API
+key are included. Nevertheless, the fingerprint, length, and prefix result are
+stable metadata that can correlate the same credential across logs and tool
+results. Restrict access to those outputs. To disable generation and emission
+explicitly, pass the opt-out flag:
+
+```bash
+go run ./sendgrid/cmd/sendgrid-mcp \
+  --api-key-ref "file://${HOME}/.secret/sendgrid-api-key.enc|blowfish://default" \
+  --disable-credential-diagnostics
+```
+
+Omitting `--disable-credential-diagnostics` retains the temporary enabled
+default. The legacy `--credential-diagnostics` flag remains accepted for
+backward compatibility and also leaves diagnostics enabled; it is otherwise a
+no-op while the CLI default is enabled. If both flags are supplied,
+`--disable-credential-diagnostics` takes precedence and no diagnostic metadata
+is generated or emitted. Programmatic users of `service.Config` are unaffected:
+its zero value keeps credential diagnostics disabled, and callers must set
+`CredentialDiagnostics: true` explicitly to enable them.
+
+To compare a candidate key safely, run the following in an interactive shell.
+The key is read without terminal echo and is sent to the Go program over stdin;
+it is not placed in shell history, command arguments, the environment, or a
+plaintext file. The program uses the same Go `strings.TrimSpace` operation as
+the server:
+
+```bash
+fingerprint_dir=$(mktemp -d)
+fingerprint_program="${fingerprint_dir}/main.go"
+trap 'unset sendgrid_api_key; rm -rf "$fingerprint_dir"' EXIT
+
+cat >"$fingerprint_program" <<'EOF'
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"strings"
+)
+
+func main() {
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		log.Fatal("failed to read key")
+	}
+	key := strings.TrimSpace(string(raw))
+	if key == "" {
+		log.Fatal("key is empty")
+	}
+	digest := sha256.Sum256([]byte(key))
+	fmt.Printf(
+		"credential_diagnostics loaded=true prefix_valid=%t length=%d fingerprint=sha256:%s\n",
+		strings.HasPrefix(key, "SG."),
+		len(key),
+		hex.EncodeToString(digest[:])[:16],
+	)
+}
+EOF
+
+printf 'SendGrid API key: ' >&2
+IFS= read -r -s sendgrid_api_key
+printf '\n' >&2
+printf '%s' "$sendgrid_api_key" | go run "$fingerprint_program"
+unset sendgrid_api_key
+rm -rf "$fingerprint_dir"
+trap - EXIT
+```
 
 ## Attachments and scratchpad
 

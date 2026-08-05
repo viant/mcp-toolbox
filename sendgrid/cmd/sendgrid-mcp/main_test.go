@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +24,7 @@ import (
 	sendgridsvc "github.com/viant/mcp-toolbox/sendgrid/service"
 	mcpsrv "github.com/viant/mcp/server"
 	serverauth "github.com/viant/mcp/server/auth"
+	"github.com/viant/scy"
 	"github.com/viant/scy/cred"
 )
 
@@ -250,6 +253,56 @@ func TestStartupConfigLoggingEmitsDisabledScratchpad(t *testing.T) {
 		if count := strings.Count(logged, event+" "); count != 1 {
 			t.Errorf("%s count = %d, want 1:\n%s", event, count, logged)
 		}
+	}
+}
+
+func TestStartupCredentialDiagnosticsLogging(t *testing.T) {
+	const apiKey = "SG.startup-diagnostic-test-key"
+	apiKeyRef := encryptedCommandAPIKeyRef(t, " \t"+apiKey+"\r\n")
+	digest := sha256.Sum256([]byte(apiKey))
+	diagnostic := fmt.Sprintf(
+		"credential_diagnostics loaded=true prefix_valid=true length=%d fingerprint=sha256:%s",
+		len(apiKey),
+		hex.EncodeToString(digest[:])[:16],
+	)
+
+	for _, test := range []struct {
+		name     string
+		disabled bool
+	}{
+		{name: "enabled by default"},
+		{name: "explicitly disabled", disabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deps := stubStartupDependencies()
+			deps.newSendGridService = func(ctx context.Context, cfg sendgridsvc.Config) (*sendgridsvc.Service, error) {
+				return sendgridsvc.NewService(ctx, cfg)
+			}
+			var output bytes.Buffer
+			failure := runWithDependencies(context.Background(), Options{
+				APIKeyRef:                    string(apiKeyRef),
+				DisableCredentialDiagnostics: test.disabled,
+			}, log.New(&output, "", 0), deps)
+			if failure != nil {
+				t.Fatalf("runWithDependencies failed: %v", failure)
+			}
+
+			logged := output.String()
+			if strings.Contains(logged, apiKey) {
+				t.Fatalf("startup log exposed the raw key:\n%s", logged)
+			}
+			if !test.disabled {
+				if count := strings.Count(logged, diagnostic+"\n"); count != 1 {
+					t.Fatalf("credential diagnostic count = %d, want 1:\n%s", count, logged)
+				}
+				return
+			}
+			for _, metadata := range []string{"credential_diagnostics", "loaded=", "prefix_valid=", "length=", "fingerprint="} {
+				if strings.Contains(logged, metadata) {
+					t.Fatalf("disabled startup diagnostics exposed %q:\n%s", metadata, logged)
+				}
+			}
+		})
 	}
 }
 
@@ -688,19 +741,20 @@ func TestServiceConfigFromOptions(t *testing.T) {
 	t.Setenv("SENDGRID_API_KEY", " SG.test ")
 	t.Setenv("HOME", filepath.Join(string(os.PathSeparator), "tmp", "sendgrid-home"))
 	opts := Options{
-		APIKeyRef:               "file:///tmp/sendgrid-api-key.enc|blowfish://default",
-		Region:                  "global",
-		ScratchpadRootURI:       "file://$HOME/scratchpad/${userID}",
-		AttachmentSourceSchemes: "scratchpad,gs,scratchpad",
-		ScratchpadTargetSchemes: "file,gs",
-		MaxConcurrentSends:      3,
-		SendTimeout:             "45s",
+		APIKeyRef:                    "file:///tmp/sendgrid-api-key.enc|blowfish://default",
+		Region:                       "global",
+		ScratchpadRootURI:            "file://$HOME/scratchpad/${userID}",
+		AttachmentSourceSchemes:      "scratchpad,gs,scratchpad",
+		ScratchpadTargetSchemes:      "file,gs",
+		MaxConcurrentSends:           3,
+		SendTimeout:                  "45s",
+		DisableCredentialDiagnostics: false,
 	}
 	cfg, err := serviceConfigFromOptions(opts)
 	if err != nil {
 		t.Fatalf("serviceConfigFromOptions failed: %v", err)
 	}
-	if string(cfg.APIKeyRef) != opts.APIKeyRef || cfg.Region != "global" || cfg.MaxConcurrentSends != 3 || cfg.SendTimeout != 45*time.Second {
+	if string(cfg.APIKeyRef) != opts.APIKeyRef || !cfg.CredentialDiagnostics || cfg.Region != "global" || cfg.MaxConcurrentSends != 3 || cfg.SendTimeout != 45*time.Second {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 	if len(cfg.AttachmentSourceSchemes) != 2 || cfg.AttachmentSourceSchemes[0] != "scratchpad" || cfg.AttachmentSourceSchemes[1] != "gs" {
@@ -708,6 +762,15 @@ func TestServiceConfigFromOptions(t *testing.T) {
 	}
 	if cfg.ScratchpadRootURI != "file:///tmp/sendgrid-home/scratchpad/${userID}" {
 		t.Fatalf("scratchpad root = %q", cfg.ScratchpadRootURI)
+	}
+	disabledOpts := opts
+	disabledOpts.DisableCredentialDiagnostics = true
+	disabledCfg, err := serviceConfigFromOptions(disabledOpts)
+	if err != nil {
+		t.Fatalf("serviceConfigFromOptions with diagnostics disabled failed: %v", err)
+	}
+	if disabledCfg.CredentialDiagnostics {
+		t.Fatal("disabled CLI diagnostics mapped to enabled service diagnostics")
 	}
 
 	opts.SendTimeout = "invalid"
@@ -736,6 +799,7 @@ func TestOptionsParseIndependentSendGridFlags(t *testing.T) {
 	args := []string{
 		"--addr", ":7792",
 		"--api-key-ref", "file:///tmp/sendgrid-api-key.enc|blowfish://default",
+		"--disable-credential-diagnostics",
 		"--oauth2config", "oauth.enc",
 		"--use-id-token",
 		"--jwt-issuer", "https://issuer.example",
@@ -751,10 +815,69 @@ func TestOptionsParseIndependentSendGridFlags(t *testing.T) {
 		t.Fatalf("parse options: %v", err)
 	}
 	if opts.HTTPAddr != ":7792" || opts.APIKeyRef != "file:///tmp/sendgrid-api-key.enc|blowfish://default" ||
-		opts.Oauth2Config != "oauth.enc" || !opts.UseIdToken || opts.Region != "eu" ||
+		opts.Oauth2Config != "oauth.enc" || !opts.UseIdToken || !opts.DisableCredentialDiagnostics || opts.Region != "eu" ||
 		opts.JWTIssuer != "https://issuer.example" || opts.JWTJWKSURL != "https://issuer.example/jwks" ||
 		opts.JWTAudience != "sendgrid-client" || opts.JWTAlgorithms != "RS256,RS512" ||
 		opts.NamespaceClaimKeys != "sub,email" || opts.MaxConcurrentSends != 7 || opts.SendTimeout != "30s" {
 		t.Fatalf("unexpected options: %#v", opts)
 	}
+}
+
+func TestCredentialDiagnosticsCLICompatibilityAndPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		args         []string
+		wantPositive bool
+		wantDisabled bool
+		wantEnabled  bool
+	}{
+		{name: "omitted defaults enabled", wantEnabled: true},
+		{
+			name:         "legacy positive accepted and enabled",
+			args:         []string{"--credential-diagnostics"},
+			wantPositive: true,
+			wantEnabled:  true,
+		},
+		{
+			name:         "disable flag disables",
+			args:         []string{"--disable-credential-diagnostics"},
+			wantDisabled: true,
+		},
+		{
+			name:         "disable takes precedence over positive",
+			args:         []string{"--credential-diagnostics", "--disable-credential-diagnostics"},
+			wantPositive: true,
+			wantDisabled: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts, failure := parseCommandLine(test.args, io.Discard)
+			if failure != nil || opts == nil {
+				t.Fatalf("parse options failed: %v", failure)
+			}
+			if opts.CredentialDiagnostics != test.wantPositive {
+				t.Fatalf("credential-diagnostics = %t, want %t", opts.CredentialDiagnostics, test.wantPositive)
+			}
+			if opts.DisableCredentialDiagnostics != test.wantDisabled {
+				t.Fatalf("disable-credential-diagnostics = %t, want %t", opts.DisableCredentialDiagnostics, test.wantDisabled)
+			}
+			cfg, err := serviceConfigFromOptions(*opts)
+			if err != nil {
+				t.Fatalf("serviceConfigFromOptions failed: %v", err)
+			}
+			if cfg.CredentialDiagnostics != test.wantEnabled {
+				t.Fatalf("effective credential diagnostics = %t, want %t", cfg.CredentialDiagnostics, test.wantEnabled)
+			}
+		})
+	}
+}
+
+func encryptedCommandAPIKeyRef(t *testing.T, value string) scy.EncodedResource {
+	t.Helper()
+	target := "file://" + filepath.ToSlash(filepath.Join(t.TempDir(), "sendgrid-api-key.enc"))
+	resource := scy.NewResource(nil, target, "blowfish://default")
+	if err := scy.New().Store(context.Background(), scy.NewSecret(value, resource)); err != nil {
+		t.Fatalf("encrypt test API key: %v", err)
+	}
+	return scy.EncodedResource(target + "|blowfish://default")
 }

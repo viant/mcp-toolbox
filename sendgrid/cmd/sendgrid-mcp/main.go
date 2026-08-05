@@ -42,21 +42,23 @@ const (
 
 // Options defines CLI flags for the independent SendGrid MCP server.
 type Options struct {
-	HTTPAddr                string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
-	APIKeyRef               string `long:"api-key-ref" description:"Encrypted scy resource for the SendGrid API key (<source>|<kms-key>)"`
-	Oauth2Config            string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration (scy EncodedResource)"`
-	UseIdToken              bool   `short:"i" long:"use-id-token" description:"Use ID token instead of access token for identity scoping"`
-	JWTIssuer               string `long:"jwt-issuer" description:"Expected ID-token issuer; defaults to OIDC discovery"`
-	JWTJWKSURL              string `long:"jwt-jwks-url" description:"Trusted JWKS URL; defaults to OIDC discovery"`
-	JWTAudience             string `long:"jwt-audience" description:"Expected ID-token audience; defaults to OAuth client ID"`
-	JWTAlgorithms           string `long:"jwt-algorithms" description:"Comma-separated allowed ID-token signing algorithms" default:"RS256"`
-	Region                  string `long:"region" description:"SendGrid data residency region: global or eu"`
-	ScratchpadRootURI       string `long:"scratchpad-root-uri" description:"Per-user scratchpad root URI template"`
-	AttachmentSourceSchemes string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty denies sourceURL attachments"`
-	ScratchpadTargetSchemes string `long:"scratchpad-target-schemes" description:"Optional comma-separated allowlist of underlying scratchpad artifact schemes; empty allows all registered AFS providers"`
-	NamespaceClaimKeys      string `long:"namespace-claim-keys" description:"Comma-separated identity claim lookup order (default: email,sub)"`
-	MaxConcurrentSends      int    `long:"max-concurrent-sends" description:"Maximum concurrent resolve/build/send operations" default:"4"`
-	SendTimeout             string `long:"send-timeout" description:"Timeout covering queueing, attachments, and provider request" default:"60s"`
+	HTTPAddr                     string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
+	APIKeyRef                    string `long:"api-key-ref" description:"Encrypted scy resource for the SendGrid API key (<source>|<kms-key>)"`
+	CredentialDiagnostics        bool   `long:"credential-diagnostics" description:"Enable secret-safe API-key metadata (enabled by default; retained for compatibility)"`
+	DisableCredentialDiagnostics bool   `long:"disable-credential-diagnostics" description:"Disable secret-safe API-key metadata in startup logs and rejected provider responses"`
+	Oauth2Config                 string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration (scy EncodedResource)"`
+	UseIdToken                   bool   `short:"i" long:"use-id-token" description:"Use ID token instead of access token for identity scoping"`
+	JWTIssuer                    string `long:"jwt-issuer" description:"Expected ID-token issuer; defaults to OIDC discovery"`
+	JWTJWKSURL                   string `long:"jwt-jwks-url" description:"Trusted JWKS URL; defaults to OIDC discovery"`
+	JWTAudience                  string `long:"jwt-audience" description:"Expected ID-token audience; defaults to OAuth client ID"`
+	JWTAlgorithms                string `long:"jwt-algorithms" description:"Comma-separated allowed ID-token signing algorithms" default:"RS256"`
+	Region                       string `long:"region" description:"SendGrid data residency region: global or eu"`
+	ScratchpadRootURI            string `long:"scratchpad-root-uri" description:"Per-user scratchpad root URI template"`
+	AttachmentSourceSchemes      string `long:"attachment-source-schemes" description:"Comma-separated allowed attachment sourceURL schemes; empty denies sourceURL attachments"`
+	ScratchpadTargetSchemes      string `long:"scratchpad-target-schemes" description:"Optional comma-separated allowlist of underlying scratchpad artifact schemes; empty allows all registered AFS providers"`
+	NamespaceClaimKeys           string `long:"namespace-claim-keys" description:"Comma-separated identity claim lookup order (default: email,sub)"`
+	MaxConcurrentSends           int    `long:"max-concurrent-sends" description:"Maximum concurrent resolve/build/send operations" default:"4"`
+	SendTimeout                  string `long:"send-timeout" description:"Timeout covering queueing, attachments, and provider request" default:"60s"`
 }
 
 func main() {
@@ -179,7 +181,7 @@ func runWithDependencies(ctx context.Context, opts Options, logger *log.Logger, 
 	if err != nil {
 		return &startupFailure{stage: startupStageSendGrid, err: errors.New("failed to initialize SendGrid service")}
 	}
-	logStartupConfig(logger, opts, cfg, namespaceKeys)
+	logStartupConfig(logger, opts, cfg, namespaceKeys, service)
 
 	options := []mcpsrv.Option{
 		mcpsrv.WithImplementation(schema.Implementation{Name: sendGridServiceName, Version: sendGridVersion}),
@@ -259,7 +261,7 @@ func loadOAuthConfig(ctx context.Context, value string) (*cred.Oauth2Config, err
 	return oauthConfig, nil
 }
 
-func logStartupConfig(logger *log.Logger, opts Options, cfg sendgridsvc.Config, namespaceKeys []string) {
+func logStartupConfig(logger *log.Logger, opts Options, cfg sendgridsvc.Config, namespaceKeys []string, service *sendgridsvc.Service) {
 	scratchpadEnabled := strings.TrimSpace(cfg.ScratchpadRootURI) != ""
 	scratchpadScheme := ""
 	sourceSchemes := ""
@@ -300,6 +302,9 @@ func logStartupConfig(logger *log.Logger, opts Options, cfg sendgridsvc.Config, 
 		cfg.MaxConcurrentSends,
 		cfg.SendTimeout.String(),
 	)
+	if diagnostic := service.CredentialDiagnostics(); diagnostic != "" {
+		logger.Print(diagnostic)
+	}
 }
 
 func configuredURIScheme(value string) string {
@@ -400,6 +405,7 @@ func serviceConfigFromOptions(opts Options) (sendgridsvc.Config, error) {
 	}
 	return sendgridsvc.Config{
 		APIKeyRef:               scy.EncodedResource(opts.APIKeyRef),
+		CredentialDiagnostics:   !opts.DisableCredentialDiagnostics,
 		Region:                  strings.ToLower(strings.TrimSpace(opts.Region)),
 		ScratchpadRootURI:       expandHome(opts.ScratchpadRootURI),
 		AttachmentSourceSchemes: splitLowerCSV(opts.AttachmentSourceSchemes),

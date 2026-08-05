@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -187,6 +190,56 @@ func TestNewServiceLoadsEncryptedAPIKey(t *testing.T) {
 	}
 	if service.apiKey != testAPIKey {
 		t.Fatalf("decrypted API key was not retained by the service")
+	}
+}
+
+func TestCredentialDiagnosticFormatAndPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "valid prefix", key: "SG.valid-prefix-test-key"},
+		{name: "invalid prefix", key: "not-a-sendgrid-key"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := newCredentialDiagnostic(test.key).String()
+			want := expectedCredentialDiagnostic(test.key)
+			if got != want {
+				t.Fatalf("credential diagnostic = %q, want %q", got, want)
+			}
+			if strings.Contains(got, test.key) {
+				t.Fatalf("credential diagnostic exposed the raw key: %q", got)
+			}
+		})
+	}
+}
+
+func TestCredentialDiagnosticUsesNormalizedSDKAPIKey(t *testing.T) {
+	const rawAPIKey = " \t\nSG.normalized-test-key\r\n "
+	normalizedAPIKey := strings.TrimSpace(rawAPIKey)
+	cfg := testConfig(t)
+	cfg.APIKeyRef = encryptedAPIKeyRef(t, rawAPIKey)
+	cfg.CredentialDiagnostics = true
+
+	service, err := NewService(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewService failed: %v", err)
+	}
+	sdk, ok := service.sender.(*sdkSender)
+	if !ok {
+		t.Fatalf("sender type = %T, want *sdkSender", service.sender)
+	}
+	if service.apiKey != normalizedAPIKey || sdk.apiKey != normalizedAPIKey {
+		t.Fatal("service, diagnostic, and SDK did not share the normalized API key")
+	}
+	got := service.CredentialDiagnostics()
+	want := expectedCredentialDiagnostic(normalizedAPIKey)
+	if got != want {
+		t.Fatalf("credential diagnostic = %q, want %q", got, want)
+	}
+	if strings.Contains(got, normalizedAPIKey) {
+		t.Fatalf("credential diagnostic exposed the raw key: %q", got)
 	}
 }
 
@@ -573,6 +626,46 @@ func TestSendProviderFailuresAreSanitized(t *testing.T) {
 	if strings.Contains(providerErr.Error(), "\n") {
 		t.Fatalf("provider error contains newline: %q", providerErr.Error())
 	}
+	for _, metadata := range []string{"credential_diagnostics", "loaded=", "prefix_valid=", "length=", "fingerprint="} {
+		if strings.Contains(providerErr.Error(), metadata) {
+			t.Fatalf("disabled credential diagnostics exposed %q: %v", metadata, providerErr)
+		}
+	}
+}
+
+func TestSendUnauthorizedIncludesOptInCredentialDiagnostic(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.CredentialDiagnostics = true
+	fake := &fakeSender{response: &providerResponse{
+		StatusCode: http.StatusUnauthorized,
+		Body:       "bad key " + testAPIKey,
+		Headers:    http.Header{},
+	}}
+	service := newTestService(t, cfg, fake)
+
+	_, err := service.Send(context.Background(), validInput())
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("expected ProviderError, got %v", err)
+	}
+	diagnostic := expectedCredentialDiagnostic(testAPIKey)
+	if providerErr.StatusCode != http.StatusUnauthorized || !strings.HasSuffix(providerErr.Error(), "; "+diagnostic) {
+		t.Fatalf("unauthorized error does not contain the exact diagnostic: %v", providerErr)
+	}
+	if strings.Contains(providerErr.Error(), testAPIKey) {
+		t.Fatalf("unauthorized error exposed the raw key: %v", providerErr)
+	}
+}
+
+func expectedCredentialDiagnostic(apiKey string) string {
+	digest := sha256.Sum256([]byte(apiKey))
+	fingerprint := "sha256:" + hex.EncodeToString(digest[:])[:16]
+	return fmt.Sprintf(
+		"credential_diagnostics loaded=true prefix_valid=%t length=%d fingerprint=%s",
+		strings.HasPrefix(apiKey, "SG."),
+		len(apiKey),
+		fingerprint,
+	)
 }
 
 func TestSendSemaphoreHonorsContextAndReleasesCapacity(t *testing.T) {
