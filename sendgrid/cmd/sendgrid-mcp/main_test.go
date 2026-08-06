@@ -267,11 +267,12 @@ func TestStartupCredentialDiagnosticsLogging(t *testing.T) {
 	)
 
 	for _, test := range []struct {
-		name     string
-		disabled bool
+		name    string
+		opts    Options
+		enabled bool
 	}{
-		{name: "enabled by default"},
-		{name: "explicitly disabled", disabled: true},
+		{name: "disabled by default"},
+		{name: "explicitly enabled", opts: Options{CredentialDiagnostics: true}, enabled: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			deps := stubStartupDependencies()
@@ -279,10 +280,9 @@ func TestStartupCredentialDiagnosticsLogging(t *testing.T) {
 				return sendgridsvc.NewService(ctx, cfg)
 			}
 			var output bytes.Buffer
-			failure := runWithDependencies(context.Background(), Options{
-				APIKeyRef:                    string(apiKeyRef),
-				DisableCredentialDiagnostics: test.disabled,
-			}, log.New(&output, "", 0), deps)
+			opts := test.opts
+			opts.APIKeyRef = string(apiKeyRef)
+			failure := runWithDependencies(context.Background(), opts, log.New(&output, "", 0), deps)
 			if failure != nil {
 				t.Fatalf("runWithDependencies failed: %v", failure)
 			}
@@ -291,7 +291,7 @@ func TestStartupCredentialDiagnosticsLogging(t *testing.T) {
 			if strings.Contains(logged, apiKey) {
 				t.Fatalf("startup log exposed the raw key:\n%s", logged)
 			}
-			if !test.disabled {
+			if test.enabled {
 				if count := strings.Count(logged, diagnostic+"\n"); count != 1 {
 					t.Fatalf("credential diagnostic count = %d, want 1:\n%s", count, logged)
 				}
@@ -741,14 +741,14 @@ func TestServiceConfigFromOptions(t *testing.T) {
 	t.Setenv("SENDGRID_API_KEY", " SG.test ")
 	t.Setenv("HOME", filepath.Join(string(os.PathSeparator), "tmp", "sendgrid-home"))
 	opts := Options{
-		APIKeyRef:                    "file:///tmp/sendgrid-api-key.enc|blowfish://default",
-		Region:                       "global",
-		ScratchpadRootURI:            "file://$HOME/scratchpad/${userID}",
-		AttachmentSourceSchemes:      "scratchpad,gs,scratchpad",
-		ScratchpadTargetSchemes:      "file,gs",
-		MaxConcurrentSends:           3,
-		SendTimeout:                  "45s",
-		DisableCredentialDiagnostics: false,
+		APIKeyRef:               "file:///tmp/sendgrid-api-key.enc|blowfish://default",
+		CredentialDiagnostics:   true,
+		Region:                  "global",
+		ScratchpadRootURI:       "file://$HOME/scratchpad/${userID}",
+		AttachmentSourceSchemes: "scratchpad,gs,scratchpad",
+		ScratchpadTargetSchemes: "file,gs",
+		MaxConcurrentSends:      3,
+		SendTimeout:             "45s",
 	}
 	cfg, err := serviceConfigFromOptions(opts)
 	if err != nil {
@@ -771,6 +771,13 @@ func TestServiceConfigFromOptions(t *testing.T) {
 	}
 	if disabledCfg.CredentialDiagnostics {
 		t.Fatal("disabled CLI diagnostics mapped to enabled service diagnostics")
+	}
+	defaultCfg, err := serviceConfigFromOptions(Options{SendTimeout: "45s"})
+	if err != nil {
+		t.Fatalf("serviceConfigFromOptions with default diagnostics failed: %v", err)
+	}
+	if defaultCfg.CredentialDiagnostics {
+		t.Fatal("default CLI diagnostics mapped to enabled service diagnostics")
 	}
 
 	opts.SendTimeout = "invalid"
@@ -831,9 +838,9 @@ func TestCredentialDiagnosticsCLICompatibilityAndPrecedence(t *testing.T) {
 		wantDisabled bool
 		wantEnabled  bool
 	}{
-		{name: "omitted defaults enabled", wantEnabled: true},
+		{name: "omitted defaults disabled"},
 		{
-			name:         "legacy positive accepted and enabled",
+			name:         "positive flag enables",
 			args:         []string{"--credential-diagnostics"},
 			wantPositive: true,
 			wantEnabled:  true,

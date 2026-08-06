@@ -44,7 +44,7 @@ const (
 type Options struct {
 	HTTPAddr                     string `short:"a" long:"addr" description:"HTTP listen address (empty disables HTTP)"`
 	APIKeyRef                    string `long:"api-key-ref" description:"Encrypted scy resource for the SendGrid API key (<source>|<kms-key>)"`
-	CredentialDiagnostics        bool   `long:"credential-diagnostics" description:"Enable secret-safe API-key metadata (enabled by default; retained for compatibility)"`
+	CredentialDiagnostics        bool   `long:"credential-diagnostics" description:"Enable secret-safe API-key metadata in startup logs and rejected provider responses"`
 	DisableCredentialDiagnostics bool   `long:"disable-credential-diagnostics" description:"Disable secret-safe API-key metadata in startup logs and rejected provider responses"`
 	Oauth2Config                 string `short:"o" long:"oauth2config" description:"Path to JSON OAuth2 configuration (scy EncodedResource)"`
 	UseIdToken                   bool   `short:"i" long:"use-id-token" description:"Use ID token instead of access token for identity scoping"`
@@ -405,7 +405,7 @@ func serviceConfigFromOptions(opts Options) (sendgridsvc.Config, error) {
 	}
 	return sendgridsvc.Config{
 		APIKeyRef:               scy.EncodedResource(opts.APIKeyRef),
-		CredentialDiagnostics:   !opts.DisableCredentialDiagnostics,
+		CredentialDiagnostics:   opts.CredentialDiagnostics && !opts.DisableCredentialDiagnostics,
 		Region:                  strings.ToLower(strings.TrimSpace(opts.Region)),
 		ScratchpadRootURI:       expandHome(opts.ScratchpadRootURI),
 		AttachmentSourceSchemes: splitLowerCSV(opts.AttachmentSourceSchemes),

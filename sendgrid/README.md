@@ -86,8 +86,8 @@ Important flags:
 | --- | --- | --- |
 | `--addr` | HTTP listen address; an empty value disables HTTP | empty |
 | `--api-key-ref` | Encrypted SendGrid API-key resource | required |
-| `--credential-diagnostics` | Backward-compatible enable flag; diagnostics are already enabled by default in the CLI | not set |
-| `--disable-credential-diagnostics` | Disable secret-safe API-key metadata in startup logs and rejected provider responses | not set (diagnostics enabled) |
+| `--credential-diagnostics` | Enable secret-safe API-key metadata in startup logs and rejected provider responses | `false` |
+| `--disable-credential-diagnostics` | Explicitly disable secret-safe API-key metadata in startup logs and rejected provider responses | `false` |
 | `--region` | SendGrid data-residency endpoint: `global` or `eu` | `global` |
 | `--oauth2config` | OAuth2/BFF configuration as a `scy.EncodedResource` | required with active HTTP |
 | `--use-id-token` | Use and verify the ID token for caller identity | required with active HTTP |
@@ -135,11 +135,11 @@ To rotate the API key, run `scy secure` again for the destination or publish a
 new secret version, then restart `sendgrid-mcp`. The decrypted key remains
 private to the service process and is redacted from provider errors.
 
-### Temporary default-on credential diagnostics
+### Opt-in credential diagnostics
 
-Credential diagnostics are temporarily enabled by default for testing. The
-server writes the following stable format to its startup log and appends the
-identical diagnostic to errors for provider responses other than HTTP 202:
+When credential diagnostics are enabled, the server writes the following stable
+format to its startup log and appends the identical diagnostic to errors for
+provider responses other than HTTP 202:
 
 ```text
 credential_diagnostics loaded=true prefix_valid=true length=<bytes> fingerprint=sha256:<16 lowercase hex characters>
@@ -150,22 +150,21 @@ SendGrid SDK after `strings.TrimSpace` normalization. It is the first 16
 hexadecimal characters of the full SHA-256 digest. No characters from the API
 key are included. Nevertheless, the fingerprint, length, and prefix result are
 stable metadata that can correlate the same credential across logs and tool
-results. Restrict access to those outputs. To disable generation and emission
-explicitly, pass the opt-out flag:
+results. Restrict access to those outputs. Credential diagnostics are disabled
+by default. To enable generation and emission, pass the opt-in flag:
 
 ```bash
 go run ./sendgrid/cmd/sendgrid-mcp \
   --api-key-ref "file://${HOME}/.secret/sendgrid-api-key.enc|blowfish://default" \
-  --disable-credential-diagnostics
+  --credential-diagnostics
 ```
 
-Omitting `--disable-credential-diagnostics` retains the temporary enabled
-default. The legacy `--credential-diagnostics` flag remains accepted for
-backward compatibility and also leaves diagnostics enabled; it is otherwise a
-no-op while the CLI default is enabled. If both flags are supplied,
+Omitting both diagnostic flags leaves diagnostics disabled.
+`--disable-credential-diagnostics` remains available as an explicit opt-out. If
+both flags are supplied,
 `--disable-credential-diagnostics` takes precedence and no diagnostic metadata
-is generated or emitted. Programmatic users of `service.Config` are unaffected:
-its zero value keeps credential diagnostics disabled, and callers must set
+is generated or emitted. The `service.Config` zero value also keeps credential
+diagnostics disabled, and programmatic callers must set
 `CredentialDiagnostics: true` explicitly to enable them.
 
 To compare a candidate key safely, run the following in an interactive shell.
