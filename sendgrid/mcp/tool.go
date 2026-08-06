@@ -11,6 +11,7 @@ import (
 	"github.com/viant/jsonrpc"
 	"github.com/viant/mcp-protocol/schema"
 	protoserver "github.com/viant/mcp-protocol/server"
+	sendgridauth "github.com/viant/mcp-toolbox/sendgrid/auth"
 	sendgridsvc "github.com/viant/mcp-toolbox/sendgrid/service"
 	nsprov "github.com/viant/mcp/server/namespace"
 )
@@ -30,8 +31,16 @@ func registerTools(base *protoserver.DefaultHandler, handler *Handler) error {
 			if err != nil {
 				return nil, jsonrpc.NewError(schema.Unauthorized, IdentityNamespaceRequiredMessage, nil)
 			}
+			effectiveInput := cloneInput(input)
+			if effectiveInput != nil && strings.TrimSpace(effectiveInput.From) == "" {
+				from, err := resolveVerifiedEmail(ctx)
+				if err != nil {
+					return nil, jsonrpc.NewError(jsonrpc.InvalidParams, err.Error(), nil)
+				}
+				effectiveInput.From = from
+			}
 			ctx = afsscratchpad.ContextWithUserID(ctx, identity)
-			output, err := handler.service.Send(ctx, input)
+			output, err := handler.service.Send(ctx, effectiveInput)
 			if err != nil {
 				var validationErr *sendgridsvc.ValidationError
 				if errors.As(err, &validationErr) {
@@ -42,6 +51,27 @@ func registerTools(base *protoserver.DefaultHandler, handler *Handler) error {
 			return successResult(output), nil
 		},
 	)
+}
+
+func cloneInput(input *sendgridsvc.SendEmailInput) *sendgridsvc.SendEmailInput {
+	if input == nil {
+		return nil
+	}
+	copy := *input
+	return &copy
+}
+
+func resolveVerifiedEmail(ctx context.Context) (string, error) {
+	claims, ok := sendgridauth.VerifiedClaimsFromContext(ctx)
+	if !ok {
+		return "", errors.New("verified caller email claim is required when from is omitted")
+	}
+	email, ok := claims["email"].(string)
+	email = strings.TrimSpace(email)
+	if !ok || email == "" {
+		return "", errors.New("verified caller email claim is required when from is omitted")
+	}
+	return email, nil
 }
 
 func resolveIdentity(ctx context.Context, provider nsprov.Provider) (string, error) {

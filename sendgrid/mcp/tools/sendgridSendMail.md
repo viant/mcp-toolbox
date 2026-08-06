@@ -1,12 +1,14 @@
 Send an email through Twilio SendGrid.
 
 The MCP caller must have a configured non-empty identity claim. That identity is
-also used to resolve per-user scratchpad attachments. The sender address is
-provided by the caller and must already be verified by the configured SendGrid
-account.
+also used to resolve per-user scratchpad attachments. When the caller omits the
+sender address, the server uses the verified OIDC `email` claim. A caller may
+explicitly provide a different sender address; SendGrid still decides whether
+that address is accepted by the configured account.
 
 Inputs:
-- `from` (required): bare sender email address.
+- `from` (optional): bare sender email address. When omitted, the verified OIDC
+  `email` claim is used.
 - `fromName` (optional): sender display name.
 - `to` (required): one or more recipient email addresses.
 - `subject` (required): subject line.
@@ -36,7 +38,7 @@ one call may contain multiple approved recipients.
 
 Example:
 ```json
-{"from":"sender@example.com","fromName":"Example Service","to":["alice@example.com"],"subject":"Status Update","bodyText":"All green."}
+{"to":["alice@example.com"],"subject":"Status Update","bodyText":"All green."}
 ```
 
 Example with a scratchpad artifact:

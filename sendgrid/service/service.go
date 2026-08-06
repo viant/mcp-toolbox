@@ -211,10 +211,11 @@ func (s *Service) Send(ctx context.Context, input *SendEmailInput) (*SendEmailOu
 		return nil, &ProviderError{StatusCode: response.StatusCode, Message: message}
 	}
 	return &SendEmailOutput{
-		Status:     "accepted",
-		Provider:   "sendgrid",
-		StatusCode: response.StatusCode,
-		MessageID:  response.Headers.Get("X-Message-Id"),
+		Status:       "accepted",
+		Provider:     "sendgrid",
+		StatusCode:   response.StatusCode,
+		MessageID:    response.Headers.Get("X-Message-Id"),
+		ResolvedFrom: strings.TrimSpace(input.From),
 	}, nil
 }
 

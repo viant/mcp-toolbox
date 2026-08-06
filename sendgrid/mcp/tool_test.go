@@ -80,6 +80,44 @@ func TestResolveIdentityUsesConfiguredClaimOrder(t *testing.T) {
 	}
 }
 
+func TestResolveVerifiedEmail(t *testing.T) {
+	ctx := sendgridauth.ContextWithVerifiedClaims(context.Background(), map[string]any{
+		"email": "  alice@example.com  ",
+		"sub":   "alice-subject",
+	})
+	email, err := resolveVerifiedEmail(ctx)
+	if err != nil {
+		t.Fatalf("resolveVerifiedEmail failed: %v", err)
+	}
+	if email != "alice@example.com" {
+		t.Fatalf("email = %q, want alice@example.com", email)
+	}
+
+	for _, ctx := range []context.Context{
+		context.Background(),
+		sendgridauth.ContextWithVerifiedClaims(context.Background(), map[string]any{"sub": "alice-subject"}),
+	} {
+		if _, err := resolveVerifiedEmail(ctx); err == nil {
+			t.Fatal("expected missing verified email failure")
+		}
+	}
+}
+
+func TestCloneInputKeepsCallerInputUnchanged(t *testing.T) {
+	original := &sendgridsvc.SendEmailInput{From: "", To: []string{"alice@example.com"}}
+	copy := cloneInput(original)
+	copy.From = "sender@example.com"
+	if original.From != "" {
+		t.Fatalf("clone modified caller input: %#v", original)
+	}
+}
+
+func TestCloneInputAllowsNilValidation(t *testing.T) {
+	if cloneInput(nil) != nil {
+		t.Fatal("nil input must remain nil so the service can return its validation error")
+	}
+}
+
 func TestSendGridToolReturnsValidationErrorForAuthenticatedCaller(t *testing.T) {
 	service, err := sendgridsvc.NewService(context.Background(), sendgridsvc.Config{
 		APIKeyRef: testAPIKeyRef(t),
@@ -116,16 +154,18 @@ func TestSendGridToolReturnsValidationErrorForAuthenticatedCaller(t *testing.T) 
 
 func TestSuccessResultMatchesAdvertisedOutputSchema(t *testing.T) {
 	output := &sendgridsvc.SendEmailOutput{
-		Status:     "accepted",
-		Provider:   "sendgrid",
-		StatusCode: 202,
-		MessageID:  "provider-id",
+		Status:       "accepted",
+		Provider:     "sendgrid",
+		StatusCode:   202,
+		MessageID:    "provider-id",
+		ResolvedFrom: "sender@example.com",
 	}
 	result := successResult(output)
 	if result.StructuredContent["status"] != "accepted" ||
 		result.StructuredContent["provider"] != "sendgrid" ||
 		result.StructuredContent["statusCode"] != float64(202) ||
-		result.StructuredContent["messageId"] != "provider-id" {
+		result.StructuredContent["messageId"] != "provider-id" ||
+		result.StructuredContent["resolvedFrom"] != "sender@example.com" {
 		t.Fatalf("unexpected structured content: %#v", result.StructuredContent)
 	}
 	if _, wrapped := result.StructuredContent["result"]; wrapped {

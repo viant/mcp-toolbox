@@ -341,6 +341,9 @@ func TestSendBuildsMessageAndReturnsAccepted(t *testing.T) {
 	if output.Status != "accepted" || output.Provider != "sendgrid" || output.StatusCode != http.StatusAccepted || output.MessageID != "provider-123" {
 		t.Fatalf("unexpected output: %#v", output)
 	}
+	if output.ResolvedFrom != input.From {
+		t.Fatalf("ResolvedFrom = %q, want %q", output.ResolvedFrom, input.From)
+	}
 	message := fake.lastMessage()
 	if message == nil {
 		t.Fatal("provider did not receive a message")

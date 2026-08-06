@@ -4,7 +4,7 @@ import "fmt"
 
 // SendEmailInput is the public MCP input for an outbound SendGrid message.
 type SendEmailInput struct {
-	From        string            `json:"from" description:"sender email address; it must be verified by SendGrid"`
+	From        string            `json:"from,omitempty" description:"optional bare sender email address; when omitted, the MCP server uses the verified caller email claim"`
 	FromName    string            `json:"fromName,omitempty" description:"optional sender display name"`
 	To          []string          `json:"to" description:"recipient email addresses"`
 	Subject     string            `json:"subject"`
@@ -24,10 +24,11 @@ type EmailAttachment struct {
 
 // SendEmailOutput reports provider acceptance, not final delivery.
 type SendEmailOutput struct {
-	Status     string `json:"status"`
-	Provider   string `json:"provider"`
-	StatusCode int    `json:"statusCode"`
-	MessageID  string `json:"messageId,omitempty"`
+	Status       string `json:"status"`
+	Provider     string `json:"provider"`
+	StatusCode   int    `json:"statusCode"`
+	MessageID    string `json:"messageId,omitempty"`
+	ResolvedFrom string `json:"resolvedFrom"`
 }
 
 // ValidationError identifies a caller-correctable tool input error.
