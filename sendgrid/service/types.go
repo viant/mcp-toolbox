@@ -4,14 +4,15 @@ import "fmt"
 
 // SendEmailInput is the public MCP input for an outbound SendGrid message.
 type SendEmailInput struct {
-	From        string            `json:"from,omitempty" description:"optional bare sender email address; when omitted, the MCP server uses the verified caller email claim"`
-	FromName    string            `json:"fromName,omitempty" description:"optional sender display name"`
-	To          []string          `json:"to" description:"recipient email addresses"`
-	Subject     string            `json:"subject"`
-	BodyText    string            `json:"bodyText,omitempty"`
-	BodyHTML    string            `json:"bodyHtml,omitempty"`
-	Importance  string            `json:"importance,omitempty" description:"Low, Normal, or High"`
-	Attachments []EmailAttachment `json:"attachments,omitempty"`
+	From          string            `json:"from,omitempty" description:"optional bare sender email address; when omitted, the MCP server uses the verified caller email claim"`
+	FromName      string            `json:"fromName,omitempty" description:"optional sender display name"`
+	To            []string          `json:"to,omitempty" description:"optional recipient email addresses; at least one recipient must be supplied through to or toCurrentUser"`
+	ToCurrentUser bool              `json:"toCurrentUser,omitempty" description:"add the verified OIDC caller email as a recipient"`
+	Subject       string            `json:"subject"`
+	BodyText      string            `json:"bodyText,omitempty"`
+	BodyHTML      string            `json:"bodyHtml,omitempty"`
+	Importance    string            `json:"importance,omitempty" description:"Low, Normal, or High"`
+	Attachments   []EmailAttachment `json:"attachments,omitempty"`
 }
 
 // EmailAttachment accepts either inline base64 data or an AFS/scratchpad URL.
@@ -24,11 +25,12 @@ type EmailAttachment struct {
 
 // SendEmailOutput reports provider acceptance, not final delivery.
 type SendEmailOutput struct {
-	Status       string `json:"status"`
-	Provider     string `json:"provider"`
-	StatusCode   int    `json:"statusCode"`
-	MessageID    string `json:"messageId,omitempty"`
-	ResolvedFrom string `json:"resolvedFrom"`
+	Status       string   `json:"status"`
+	Provider     string   `json:"provider"`
+	StatusCode   int      `json:"statusCode"`
+	MessageID    string   `json:"messageId,omitempty"`
+	ResolvedFrom string   `json:"resolvedFrom"`
+	ResolvedTo   []string `json:"resolvedTo"`
 }
 
 // ValidationError identifies a caller-correctable tool input error.

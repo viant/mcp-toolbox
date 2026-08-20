@@ -242,8 +242,11 @@ artifacts between callers.
 
 ## Tool
 
-The server exposes `sendgridSendMail`. At least one of `bodyText` or `bodyHtml`
-is required. `importance` accepts `Low`, `Normal`, or `High`.
+The server exposes `sendgridSendMail`. At least one recipient source is
+required: explicit addresses in `to`, the verified OIDC caller email through
+`toCurrentUser: true`, or both. The server combines both sources and removes
+case-insensitive duplicates before validation. At least one of `bodyText` or
+`bodyHtml` is required. `importance` accepts `Low`, `Normal`, or `High`.
 
 Example with a scratchpad attachment:
 
@@ -266,4 +269,5 @@ Example with a scratchpad attachment:
 ```
 
 A successful call returns `status: accepted` after SendGrid responds with HTTP
-202. Acceptance does not guarantee final delivery.
+202, together with the resolved sender and recipient addresses. Acceptance does
+not guarantee final delivery.

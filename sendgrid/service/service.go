@@ -216,7 +216,16 @@ func (s *Service) Send(ctx context.Context, input *SendEmailInput) (*SendEmailOu
 		StatusCode:   response.StatusCode,
 		MessageID:    response.Headers.Get("X-Message-Id"),
 		ResolvedFrom: strings.TrimSpace(input.From),
+		ResolvedTo:   resolvedRecipients(input.To),
 	}, nil
+}
+
+func resolvedRecipients(recipients []string) []string {
+	result := make([]string, len(recipients))
+	for i, recipient := range recipients {
+		result[i] = strings.TrimSpace(recipient)
+	}
+	return result
 }
 
 func validateInput(input *SendEmailInput) error {

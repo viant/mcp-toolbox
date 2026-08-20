@@ -32,12 +32,8 @@ func registerTools(base *protoserver.DefaultHandler, handler *Handler) error {
 				return nil, jsonrpc.NewError(schema.Unauthorized, IdentityNamespaceRequiredMessage, nil)
 			}
 			effectiveInput := cloneInput(input)
-			if effectiveInput != nil && strings.TrimSpace(effectiveInput.From) == "" {
-				from, err := resolveVerifiedEmail(ctx)
-				if err != nil {
-					return nil, jsonrpc.NewError(jsonrpc.InvalidParams, err.Error(), nil)
-				}
-				effectiveInput.From = from
+			if err := resolveCallerEnvelope(ctx, effectiveInput); err != nil {
+				return nil, jsonrpc.NewError(jsonrpc.InvalidParams, err.Error(), nil)
 			}
 			ctx = afsscratchpad.ContextWithUserID(ctx, identity)
 			output, err := handler.service.Send(ctx, effectiveInput)
@@ -58,18 +54,65 @@ func cloneInput(input *sendgridsvc.SendEmailInput) *sendgridsvc.SendEmailInput {
 		return nil
 	}
 	copy := *input
+	copy.To = append([]string(nil), input.To...)
+	copy.Attachments = append([]sendgridsvc.EmailAttachment(nil), input.Attachments...)
 	return &copy
+}
+
+func resolveCallerEnvelope(ctx context.Context, input *sendgridsvc.SendEmailInput) error {
+	if input == nil {
+		return nil
+	}
+	resolveFrom := strings.TrimSpace(input.From) == ""
+	if !resolveFrom && !input.ToCurrentUser {
+		return nil
+	}
+	email, err := resolveVerifiedEmail(ctx)
+	if err != nil {
+		switch {
+		case input.ToCurrentUser:
+			return errors.New("verified caller email claim is required when toCurrentUser is true")
+		default:
+			return errors.New("verified caller email claim is required when from is omitted")
+		}
+	}
+	if resolveFrom {
+		input.From = email
+	}
+	if input.ToCurrentUser {
+		input.To = uniqueRecipients(append(input.To, email))
+		input.ToCurrentUser = false
+	}
+	return nil
+}
+
+func uniqueRecipients(recipients []string) []string {
+	result := make([]string, 0, len(recipients))
+	for _, candidate := range recipients {
+		candidate = strings.TrimSpace(candidate)
+		duplicate := false
+		for _, recipient := range result {
+			if strings.EqualFold(recipient, candidate) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			result = append(result, candidate)
+		}
+	}
+	return result
 }
 
 func resolveVerifiedEmail(ctx context.Context) (string, error) {
 	claims, ok := sendgridauth.VerifiedClaimsFromContext(ctx)
 	if !ok {
-		return "", errors.New("verified caller email claim is required when from is omitted")
+		return "", errors.New("verified caller email claim is required")
 	}
 	email, ok := claims["email"].(string)
 	email = strings.TrimSpace(email)
 	if !ok || email == "" {
-		return "", errors.New("verified caller email claim is required when from is omitted")
+		return "", errors.New("verified caller email claim is required")
 	}
 	return email, nil
 }

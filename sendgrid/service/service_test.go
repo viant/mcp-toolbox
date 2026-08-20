@@ -344,6 +344,9 @@ func TestSendBuildsMessageAndReturnsAccepted(t *testing.T) {
 	if output.ResolvedFrom != input.From {
 		t.Fatalf("ResolvedFrom = %q, want %q", output.ResolvedFrom, input.From)
 	}
+	if len(output.ResolvedTo) != len(input.To) || output.ResolvedTo[0] != input.To[0] || output.ResolvedTo[1] != input.To[1] {
+		t.Fatalf("ResolvedTo = %#v, want %#v", output.ResolvedTo, input.To)
+	}
 	message := fake.lastMessage()
 	if message == nil {
 		t.Fatal("provider did not receive a message")
@@ -385,6 +388,12 @@ func TestSendValidatesInputsBeforeProvider(t *testing.T) {
 		{name: "missing from", mutate: func(in *SendEmailInput) { in.From = "" }, want: "from is required"},
 		{name: "invalid from", mutate: func(in *SendEmailInput) { in.From = "Sender <sender@example.com>" }, want: "bare email"},
 		{name: "missing to", mutate: func(in *SendEmailInput) { in.To = nil }, want: "at least one"},
+		{name: "too many recipients", mutate: func(in *SendEmailInput) {
+			in.To = make([]string, MaxRecipients+1)
+			for i := range in.To {
+				in.To[i] = fmt.Sprintf("recipient-%d@example.com", i)
+			}
+		}, want: "at most"},
 		{name: "invalid recipient", mutate: func(in *SendEmailInput) { in.To = []string{"bad"} }, want: "valid bare email"},
 		{name: "missing subject", mutate: func(in *SendEmailInput) { in.Subject = "" }, want: "subject is required"},
 		{name: "missing body", mutate: func(in *SendEmailInput) { in.BodyText = ""; in.BodyHTML = "" }, want: "bodyText or bodyHtml"},
